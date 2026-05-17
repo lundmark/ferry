@@ -1,4 +1,5 @@
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[must_use]
 pub enum FileState {
     InSync,
     LocalChanged,
@@ -11,19 +12,23 @@ pub enum FileState {
 
 /// Pure classification. Inputs are hashes; `None` means file does not exist (local/remote)
 /// or has never been synced (known).
+///
+/// Caller contract: never invoke with `local == None && remote == None`. A path that
+/// exists in neither place should be pruned from the union walk, not classified.
+#[must_use]
 pub fn classify(local: Option<&str>, remote: Option<&str>, known: Option<&str>) -> FileState {
     match (local, remote, known) {
         (None, None, _) => unreachable!("called with no file present"),
         (Some(_), None, _) => FileState::LocalOnly,
         (None, Some(_), _) => FileState::RemoteOnly,
-        (Some(l), Some(r), Some(k)) if l == r && r == k => FileState::InSync,
-        (Some(l), Some(r), Some(k)) if l != k && r == k => FileState::LocalChanged,
-        (Some(l), Some(r), Some(k)) if l == k && r != k => FileState::RemoteChanged,
-        (Some(l), Some(r), Some(k)) if l != k && r != k => {
-            if l == r { FileState::InSync } else { FileState::BothChanged }
-        }
         (Some(_), Some(_), None) => FileState::Untracked,
-        _ => unreachable!(),
+        (Some(l), Some(r), Some(k)) => match (l == k, r == k, l == r) {
+            (true,  true,  _    ) => FileState::InSync,
+            (false, true,  _    ) => FileState::LocalChanged,
+            (true,  false, _    ) => FileState::RemoteChanged,
+            (false, false, true ) => FileState::InSync,     // both moved, same target
+            (false, false, false) => FileState::BothChanged,
+        }
     }
 }
 
