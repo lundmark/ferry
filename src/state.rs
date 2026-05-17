@@ -47,18 +47,27 @@ mod tests {
     #[test] fn untracked_differ() { assert_eq!(classify(Some("a"), Some("b"), None), FileState::Untracked); }
 }
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+pub const STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct StateFile {
     pub version: u32,
     #[serde(default)]
     pub files: BTreeMap<String, FileRecord>,
     #[serde(default)]
     pub server_supports_mdtm: Option<bool>,
+}
+
+impl Default for StateFile {
+    fn default() -> Self {
+        Self { version: STATE_VERSION, files: BTreeMap::new(), server_supports_mdtm: None }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -71,19 +80,34 @@ pub struct FileRecord {
 
 impl StateFile {
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
-        if !path.exists() {
-            return Ok(Self { version: 1, ..Default::default() });
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(anyhow::Error::new(e)
+                .context(format!("reading state file {}", path.display()))),
+        };
+        let parsed: Self = serde_json::from_str(&text)
+            .with_context(|| format!("parsing state file {}", path.display()))?;
+        if parsed.version != STATE_VERSION {
+            anyhow::bail!(
+                "state file {} has version {} but this binary only understands version {}",
+                path.display(), parsed.version, STATE_VERSION,
+            );
         }
-        let text = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&text)?)
+        Ok(parsed)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating state dir {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, text)
+            .with_context(|| format!("writing state file temp {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming state file into place at {}", path.display()))?;
         Ok(())
     }
 }
@@ -97,7 +121,8 @@ mod state_file_tests {
     fn round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        let mut s = StateFile { version: 1, ..Default::default() };
+        let mut s = StateFile::default();
+        s.server_supports_mdtm = Some(true);
         s.files.insert("src/x.html".into(), FileRecord {
             sha256: "abc".into(),
             size: 42,
@@ -112,7 +137,21 @@ mod state_file_tests {
     #[test]
     fn missing_file_returns_default() {
         let s = StateFile::load_or_default(Path::new("/nonexistent/zedftp/state.json")).unwrap();
-        assert_eq!(s.version, 1);
+        assert_eq!(s.version, STATE_VERSION);
         assert!(s.files.is_empty());
+    }
+
+    #[test]
+    fn default_uses_current_version() {
+        assert_eq!(StateFile::default().version, STATE_VERSION);
+    }
+
+    #[test]
+    fn rejects_unknown_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"version": 99, "files": {}}"#).unwrap();
+        let err = StateFile::load_or_default(&path).unwrap_err();
+        assert!(err.to_string().contains("version 99"), "got: {err}");
     }
 }
