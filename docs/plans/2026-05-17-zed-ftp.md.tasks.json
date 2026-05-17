@@ -1,0 +1,23 @@
+{
+  "planPath": "docs/plans/2026-05-17-zed-ftp.md",
+  "tasks": [
+    {"id": 4,  "subject": "Task 1: Bootstrap Cargo project", "status": "pending"},
+    {"id": 5,  "subject": "Task 2: CLI skeleton with clap subcommands", "status": "pending", "blockedBy": [4]},
+    {"id": 6,  "subject": "Task 3: Config module (.zed-ftp.toml parsing)", "status": "pending", "blockedBy": [5]},
+    {"id": 7,  "subject": "Task 4: Classification logic (pure function)", "status": "pending", "blockedBy": [5]},
+    {"id": 8,  "subject": "Task 5: State file load/save with serde_json", "status": "pending", "blockedBy": [7]},
+    {"id": 9,  "subject": "Task 6: SHA-256 file hashing", "status": "pending", "blockedBy": [5]},
+    {"id": 10, "subject": "Task 7: Gitignore-style path matcher", "status": "pending", "blockedBy": [5]},
+    {"id": 11, "subject": "Task 8: FTP wrapper with testcontainers integration test", "status": "pending", "blockedBy": [5]},
+    {"id": 12, "subject": "Task 9: status command", "status": "pending", "blockedBy": [6, 8, 9, 10, 11]},
+    {"id": 13, "subject": "Task 10: pull command", "status": "pending", "blockedBy": [12]},
+    {"id": 14, "subject": "Task 11: push command with atomic upload", "status": "pending", "blockedBy": [13]},
+    {"id": 15, "subject": "Task 12: sync command", "status": "pending", "blockedBy": [13, 14]},
+    {"id": 16, "subject": "Task 13: Exit code mapping", "status": "pending", "blockedBy": [15]},
+    {"id": 17, "subject": "Task 14: init command (basic, --no-validate)", "status": "pending", "blockedBy": [6]},
+    {"id": 18, "subject": "Task 15: init validates existing local files vs remote", "status": "pending", "blockedBy": [17, 11]},
+    {"id": 19, "subject": "Task 16: MDTM/SIZE fast-path optimization", "status": "pending", "blockedBy": [15]},
+    {"id": 20, "subject": "Task 17: tasks.json template + README + smoke test", "status": "pending", "blockedBy": [19, 18]}
+  ],
+  "lastUpdated": "2026-05-17T00:00:00Z"
+}
