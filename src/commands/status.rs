@@ -3,7 +3,7 @@ use crate::ftp::Ftp;
 use crate::hash::{hash_bytes, hash_file};
 use crate::ignored::Matcher;
 use crate::state::{classify, StateFile};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -73,8 +73,11 @@ fn walk_local(
     matcher: &Matcher,
     out: &mut BTreeSet<String>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading local dir {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry
+            .with_context(|| format!("walking local dir {}", dir.display()))?;
         let path = entry.path();
         let is_dir = path.is_dir();
         if matcher.is_ignored(&path, is_dir) {
@@ -108,7 +111,9 @@ fn walk_remote(
     } else {
         format!("{}/{}", root.trim_end_matches('/'), sub)
     };
-    for entry in ftp.list(&dir)? {
+    let entries = ftp.list(&dir)
+        .with_context(|| format!("walking remote dir {dir}"))?;
+    for entry in entries {
         if entry.name == "." || entry.name == ".." {
             continue;
         }
