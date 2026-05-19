@@ -43,4 +43,14 @@ mod tests {
         assert!(mat.is_ignored(Path::new("/work/server.log"), false));
         assert!(!mat.is_ignored(Path::new("/work/keep.log"), false));
     }
+
+    #[test]
+    fn directory_only_pattern_requires_is_dir() {
+        // `build/` matches the directory itself only when is_dir is true,
+        // but files beneath it always match via parent walk.
+        let mat = m(&["build/"]);
+        assert!(!mat.is_ignored(Path::new("/work/build"), false));
+        assert!(mat.is_ignored(Path::new("/work/build"), true));
+        assert!(mat.is_ignored(Path::new("/work/build/out.o"), false));
+    }
 }
