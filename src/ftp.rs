@@ -86,4 +86,35 @@ impl Ftp {
             .with_context(|| format!("ftp rm {path}"))?;
         Ok(())
     }
+
+    /// Create a remote directory. Returns Ok if the directory was created OR
+    /// already exists. Other errors are propagated.
+    ///
+    /// FTP servers reply 550 for both "already exists" and real failures, and
+    /// suppaftp does not distinguish them. To make this idempotent we fall back
+    /// to listing the parent directory after a failed mkdir: if the leaf is
+    /// present we treat the call as success, otherwise we surface the original
+    /// error with context.
+    pub fn mkdir(&mut self, path: &str) -> Result<()> {
+        match self.inner.mkdir(path) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let (parent, leaf) = match path.rsplit_once('/') {
+                    Some((p, l)) => (if p.is_empty() { "/" } else { p }, l),
+                    None => ("/", path),
+                };
+                if let Ok(lines) = self.inner.list(Some(parent)) {
+                    let exists = lines.iter().any(|line| {
+                        suppaftp::list::File::from_posix_line(line)
+                            .map(|f| f.is_directory() && f.name() == leaf)
+                            .unwrap_or(false)
+                    });
+                    if exists {
+                        return Ok(());
+                    }
+                }
+                Err(anyhow::Error::from(e)).with_context(|| format!("ftp mkdir {path}"))
+            }
+        }
+    }
 }
