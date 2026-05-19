@@ -12,6 +12,16 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 ignore = "0.4"
+suppaftp = "6"
 
 [dev-dependencies]
 tempfile = "3"
+testcontainers = { version = "0.20", features = ["blocking"] }
+
+[[bin]]
+name = "zed-ftp"
+path = "src/main.rs"
+
+[lib]
+name = "zed_ftp"
+path = "src/lib.rs"

@@ -1,8 +1,3 @@
-mod config;
-mod hash;
-mod ignored;
-mod state;
-
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
