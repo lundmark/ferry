@@ -1,0 +1,247 @@
+//! `zed-ftp push` — one-way upload from the local mirror to remote.
+//!
+//! Push is asymmetric with pull by design: it only ever writes remote files;
+//! it never deletes a remote file because the local mirror is missing it. A
+//! locally-missing file is treated as "not yours to delete" — `rm` is its
+//! own deliberate command.
+
+use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::config::Config;
+use crate::ftp::Ftp;
+use crate::hash::hash_bytes;
+use crate::ignored::Matcher;
+use crate::state::{classify, FileRecord, FileState, StateFile};
+use anyhow::{Context, Result};
+use chrono::Utc;
+use std::collections::BTreeSet;
+use std::path::Path;
+
+pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
+    let cfg = Config::load(config_path)?;
+    let local_root = cfg.paths.local_root.clone();
+    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let mut state = StateFile::load_or_default(&state_path)?;
+
+    let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
+
+    let mut ftp = Ftp::connect(
+        &cfg.connection.host,
+        cfg.connection.port,
+        &cfg.connection.user,
+        &cfg.connection.password,
+        cfg.connection.passive,
+    )?;
+
+    let mut local_paths: BTreeSet<String> = BTreeSet::new();
+    walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
+    let mut remote_paths: BTreeSet<String> = BTreeSet::new();
+    walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+
+    // Determine which relative paths to consider. With explicit args, we
+    // restrict to those (still applying classify+decide). Without args we
+    // walk every path that `status` would consider.
+    let targets: Vec<String> = if paths.is_empty() {
+        let mut all: BTreeSet<String> = BTreeSet::new();
+        all.extend(local_paths.iter().cloned());
+        all.extend(remote_paths.iter().cloned());
+        for k in state.files.keys() {
+            all.insert(k.clone());
+        }
+        all.into_iter().collect()
+    } else {
+        let mut out = Vec::new();
+        for p in paths {
+            let rel = normalize_rel(p);
+            if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
+                anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
+            }
+            if matcher.is_ignored(&local_root.join(&rel), false) {
+                eprintln!("skip (ignored by .zed-ftp.toml): {rel}");
+                continue;
+            }
+            out.push(rel);
+        }
+        out
+    };
+
+    let mut had_conflict = false;
+
+    for rel in &targets {
+        let on_local = local_paths.contains(rel);
+        let on_remote = remote_paths.contains(rel);
+
+        if !on_local && !on_remote {
+            // Stale state entry or path that exists on neither side. Nothing
+            // to push.
+            eprintln!("skip (not on local or remote): {rel}");
+            continue;
+        }
+
+        // Read local bytes once (we need them for both hashing and upload),
+        // but only when there's actually a local file to consider.
+        let local_bytes = if on_local {
+            Some(
+                std::fs::read(local_root.join(rel))
+                    .with_context(|| format!("reading local {}", local_root.join(rel).display()))?,
+            )
+        } else {
+            None
+        };
+        let local_hash = local_bytes.as_deref().map(hash_bytes);
+
+        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+        // Hash the remote by downloading. classify() needs a hash to compare;
+        // there's no cheap server-side hash, and trusting size+mtime alone
+        // can produce false negatives.
+        let remote_hash = if on_remote {
+            Some(hash_bytes(
+                &ftp.download(&remote_path)
+                    .with_context(|| format!("downloading {remote_path} for hash"))?,
+            ))
+        } else {
+            None
+        };
+
+        let known = state.files.get(rel).map(|r| r.sha256.as_str());
+        let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
+
+        match st {
+            FileState::InSync => {
+                // Nothing to upload. Local matches remote.
+            }
+            FileState::RemoteOnly => {
+                // Push is one-way: don't delete the remote file just because
+                // the local mirror is missing it. The user can `rm` deliberately.
+            }
+            FileState::LocalOnly | FileState::LocalChanged => {
+                let bytes = local_bytes
+                    .as_deref()
+                    .expect("local_bytes set when on_local is true");
+                let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
+                upload_remote_atomic(&mut ftp, &remote_path, bytes)?;
+                update_state_after_push(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
+                println!("pushed {rel}");
+            }
+            FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
+                // Untracked = both sides have a file but no record of a prior sync.
+                // Design action matrix treats this as "as if both-changed": refuse
+                // without --force so the user makes an explicit choice.
+                if force {
+                    let bytes = local_bytes
+                        .as_deref()
+                        .expect("local_bytes set when on_local is true");
+                    let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
+                    eprintln!("overwriting remote with local (--force): {rel}");
+                    upload_remote_atomic(&mut ftp, &remote_path, bytes)?;
+                    update_state_after_push(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
+                } else {
+                    eprintln!(
+                        "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
+                        st
+                    );
+                    had_conflict = true;
+                }
+            }
+        }
+    }
+
+    // Save state even if we hit a conflict — partial progress is still
+    // worth persisting (e.g. clean LocalChanged pushes that succeeded
+    // before the conflict file).
+    state.save(&state_path)?;
+
+    if had_conflict {
+        anyhow::bail!("push aborted: one or more files have remote changes (use --force to overwrite)");
+    }
+
+    Ok(())
+}
+
+/// Normalize a user-supplied path argument into the relative form used as
+/// state-file keys: forward slashes, no leading `./`.
+fn normalize_rel(p: &str) -> String {
+    let s = p.replace('\\', "/");
+    s.trim_start_matches("./").to_string()
+}
+
+/// Upload `bytes` to `remote_path` via a sibling `.tmp.zedftp` file and FTP
+/// rename so readers never observe a half-written file. The temp file is
+/// removed on any failure before the rename.
+fn upload_remote_atomic(ftp: &mut Ftp, remote_path: &str, bytes: &[u8]) -> Result<()> {
+    ensure_remote_parents(ftp, remote_path)?;
+    let tmp = format!("{remote_path}.tmp.zedftp");
+    if let Err(e) = ftp.upload_bytes(&tmp, bytes)
+        .with_context(|| format!("uploading temp {tmp}"))
+    {
+        let _ = ftp.rm(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = ftp.rename(&tmp, remote_path)
+        .with_context(|| format!("renaming {tmp} -> {remote_path}"))
+    {
+        let _ = ftp.rm(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Walk the prefix segments of `remote_path` and `mkdir` each one. Tolerates
+/// already-existing directories via `Ftp::mkdir`'s built-in idempotency.
+fn ensure_remote_parents(ftp: &mut Ftp, remote_path: &str) -> Result<()> {
+    // Find the last '/'; everything before it is the directory portion.
+    let Some(dir_end) = remote_path.rfind('/') else {
+        // No slash, no parent to create.
+        return Ok(());
+    };
+    let dir = &remote_path[..dir_end];
+    if dir.is_empty() {
+        // File at root, e.g. "/foo.txt" → dir = "" → nothing to create.
+        return Ok(());
+    }
+    // Walk prefixes: e.g. "/a/b/c" → "/a", "/a/b", "/a/b/c".
+    // We skip the leading empty segment so absolute paths work.
+    let mut segments = dir.split('/').peekable();
+    let leading_slash = dir.starts_with('/');
+    let mut acc = String::new();
+    // Consume the empty leading segment for absolute paths.
+    if leading_slash {
+        let _ = segments.next();
+    }
+    for seg in segments {
+        if seg.is_empty() {
+            // Defensive: skip empty segments from double slashes.
+            continue;
+        }
+        if leading_slash || !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(seg);
+        ftp.mkdir(&acc)?;
+    }
+    Ok(())
+}
+
+/// Refresh the state entry for `rel` after a successful upload+rename.
+/// `new_hash` is the hash of the local bytes we just pushed; `size` is the
+/// byte count we already have in hand (no extra round-trip).
+fn update_state_after_push(
+    state: &mut StateFile,
+    rel: &str,
+    ftp: &mut Ftp,
+    remote_path: &str,
+    new_hash: &str,
+    size: u64,
+) -> Result<()> {
+    let remote_mtime = ftp.mtime(remote_path)
+        .with_context(|| format!("fetching mtime for {remote_path}"))?;
+    state.files.insert(
+        rel.to_string(),
+        FileRecord {
+            sha256: new_hash.to_string(),
+            size,
+            remote_mtime,
+            last_synced: Utc::now(),
+        },
+    );
+    Ok(())
+}
