@@ -1,9 +1,10 @@
+use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::{hash_bytes, hash_file};
 use crate::ignored::Matcher;
 use crate::state::{classify, StateFile};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -59,74 +60,5 @@ pub fn run(config_path: &Path) -> Result<()> {
         println!("{:>14}\t{}", format!("{:?}", st), rel);
     }
 
-    Ok(())
-}
-
-fn remote_join(root: &str, rel: &str) -> String {
-    let root = root.trim_end_matches('/');
-    format!("{}/{}", root, rel)
-}
-
-fn walk_local(
-    root: &Path,
-    dir: &Path,
-    matcher: &Matcher,
-    out: &mut BTreeSet<String>,
-) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("reading local dir {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry
-            .with_context(|| format!("walking local dir {}", dir.display()))?;
-        let path = entry.path();
-        let is_dir = path.is_dir();
-        if matcher.is_ignored(&path, is_dir) {
-            continue;
-        }
-        if is_dir {
-            // Skip the state directory itself.
-            if path.file_name().and_then(|s| s.to_str()) == Some(".zed-ftp") {
-                continue;
-            }
-            walk_local(root, &path, matcher, out)?;
-        } else {
-            let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
-            // normalize separators on windows; not strictly needed on linux but keeps state portable
-            #[cfg(windows)]
-            let rel = rel.replace('\\', "/");
-            out.insert(rel);
-        }
-    }
-    Ok(())
-}
-
-fn walk_remote(
-    ftp: &mut Ftp,
-    root: &str,
-    sub: &str,
-    out: &mut BTreeSet<String>,
-) -> Result<()> {
-    let dir = if sub.is_empty() {
-        root.trim_end_matches('/').to_string()
-    } else {
-        format!("{}/{}", root.trim_end_matches('/'), sub)
-    };
-    let entries = ftp.list(&dir)
-        .with_context(|| format!("walking remote dir {dir}"))?;
-    for entry in entries {
-        if entry.name == "." || entry.name == ".." {
-            continue;
-        }
-        let child_sub = if sub.is_empty() {
-            entry.name.clone()
-        } else {
-            format!("{}/{}", sub, entry.name)
-        };
-        if entry.is_dir {
-            walk_remote(ftp, root, &child_sub, out)?;
-        } else {
-            out.insert(child_sub);
-        }
-    }
     Ok(())
 }
