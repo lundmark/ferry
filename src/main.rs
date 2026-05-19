@@ -43,7 +43,10 @@ fn main() -> anyhow::Result<()> {
             let cfg = cli.config.unwrap_or_else(|| std::path::PathBuf::from(".zed-ftp.toml"));
             zed_ftp::commands::push::run(&cfg, &paths, force)?;
         }
-        Cmd::Sync { .. }    => println!("sync stub"),
+        Cmd::Sync { force } => {
+            let cfg = cli.config.unwrap_or_else(|| std::path::PathBuf::from(".zed-ftp.toml"));
+            zed_ftp::commands::sync::run(&cfg, force)?;
+        }
     }
     Ok(())
 }
