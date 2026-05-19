@@ -49,7 +49,19 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
         }
         all.into_iter().collect()
     } else {
-        paths.iter().map(|p| normalize_rel(p)).collect()
+        let mut out = Vec::new();
+        for p in paths {
+            let rel = normalize_rel(p);
+            if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
+                anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
+            }
+            if matcher.is_ignored(&local_root.join(&rel), false) {
+                eprintln!("skip (ignored by .zed-ftp.toml): {rel}");
+                continue;
+            }
+            out.push(rel);
+        }
+        out
     };
 
     let mut had_conflict = false;
@@ -94,34 +106,27 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                 // Pull is one-way: we don't delete local files because the
                 // remote is missing them. Skip.
             }
-            FileState::RemoteOnly | FileState::RemoteChanged | FileState::Untracked => {
+            FileState::RemoteOnly | FileState::RemoteChanged => {
                 let bytes = remote_bytes
                     .as_deref()
                     .expect("remote_bytes set when on_remote is true");
+                let new_hash = remote_hash.as_deref().expect("remote_hash matches remote_bytes");
                 write_local_atomic(&local_root.join(rel), bytes)?;
-                update_state_after_pull(
-                    &mut state,
-                    rel,
-                    &mut ftp,
-                    &remote_path,
-                    remote_hash.as_deref().unwrap(),
-                )?;
+                update_state_after_pull(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
                 println!("pulled {rel}");
             }
-            FileState::LocalChanged | FileState::BothChanged => {
+            FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
+                // Untracked = both sides have a file but no record of a prior sync.
+                // Design action matrix treats this as "as if both-changed": refuse
+                // without --force so the user makes an explicit choice.
                 if force {
                     let bytes = remote_bytes
                         .as_deref()
                         .expect("remote_bytes set when on_remote is true");
+                    let new_hash = remote_hash.as_deref().expect("remote_hash matches remote_bytes");
                     eprintln!("overwriting local with remote (--force): {rel}");
                     write_local_atomic(&local_root.join(rel), bytes)?;
-                    update_state_after_pull(
-                        &mut state,
-                        rel,
-                        &mut ftp,
-                        &remote_path,
-                        remote_hash.as_deref().unwrap(),
-                    )?;
+                    update_state_after_pull(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
@@ -183,18 +188,18 @@ fn tmp_path(path: &Path) -> PathBuf {
 }
 
 /// Refresh the state entry for `rel` after a successful download+write.
-/// `new_hash` is the hash of the remote bytes we just wrote locally.
+/// `new_hash` is the hash of the remote bytes we just wrote locally;
+/// `size` is the byte count we already have in hand (no extra round-trip).
 fn update_state_after_pull(
     state: &mut StateFile,
     rel: &str,
     ftp: &mut Ftp,
     remote_path: &str,
     new_hash: &str,
+    size: u64,
 ) -> Result<()> {
     let remote_mtime = ftp.mtime(remote_path)
         .with_context(|| format!("fetching mtime for {remote_path}"))?;
-    let size = ftp.size(remote_path)
-        .with_context(|| format!("fetching size for {remote_path}"))?;
     state.files.insert(
         rel.to_string(),
         FileRecord {
