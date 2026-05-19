@@ -149,7 +149,13 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
     state.save(&state_path)?;
 
     if had_conflict {
-        anyhow::bail!("push aborted: one or more files have remote changes (use --force to overwrite)");
+        // Tag as `Exit::Conflict` so `main()` returns exit code 2 — Zed's
+        // tasks.json uses that to surface a "needs --force" message rather
+        // than a generic failure.
+        return Err(crate::error::Exit::Conflict(
+            "push aborted: one or more files have remote changes (use --force to overwrite)".into(),
+        )
+        .into());
     }
 
     Ok(())

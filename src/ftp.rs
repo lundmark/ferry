@@ -17,8 +17,13 @@ pub struct Entry {
 
 impl Ftp {
     pub fn connect(host: &str, port: u16, user: &str, pass: &str, passive: bool) -> Result<Self> {
-        let mut s = FtpStream::connect((host, port)).context("ftp connect")?;
-        s.login(user, pass).context("ftp login")?;
+        // Connect + login failures become `Exit::Auth` so the process exits 3
+        // (config/auth) rather than 1. The underlying suppaftp message is
+        // preserved in the payload so the user still sees the real cause.
+        let mut s = FtpStream::connect((host, port))
+            .map_err(|e| crate::error::Exit::Auth(format!("ftp connect {host}:{port}: {e}")))?;
+        s.login(user, pass)
+            .map_err(|e| crate::error::Exit::Auth(format!("ftp login as {user}: {e}")))?;
         s.transfer_type(suppaftp::types::FileType::Binary)
             .context("ftp set binary transfer type")?;
         s.set_mode(if passive { suppaftp::Mode::Passive } else { suppaftp::Mode::Active });
