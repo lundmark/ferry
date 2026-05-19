@@ -111,8 +111,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                     .as_deref()
                     .expect("remote_bytes set when on_remote is true");
                 let new_hash = remote_hash.as_deref().expect("remote_hash matches remote_bytes");
-                write_local_atomic(&local_root.join(rel), bytes)?;
-                update_state_after_pull(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
+                download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, bytes, new_hash)?;
                 println!("pulled {rel}");
             }
             FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
@@ -125,8 +124,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                         .expect("remote_bytes set when on_remote is true");
                     let new_hash = remote_hash.as_deref().expect("remote_hash matches remote_bytes");
                     eprintln!("overwriting local with remote (--force): {rel}");
-                    write_local_atomic(&local_root.join(rel), bytes)?;
-                    update_state_after_pull(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
+                    download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, bytes, new_hash)?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
@@ -155,6 +153,24 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
 fn normalize_rel(p: &str) -> String {
     let s = p.replace('\\', "/");
     s.trim_start_matches("./").to_string()
+}
+
+/// Write `bytes` to `local_path` atomically (via temp + rename) and refresh
+/// the corresponding state entry. Shared with the sync command — both pull
+/// and sync need exactly this "write + record the new hash" sequence on the
+/// remote-wins branch.
+pub fn download_one(
+    ftp: &mut Ftp,
+    state: &mut StateFile,
+    local_path: &Path,
+    rel: &str,
+    remote_path: &str,
+    bytes: &[u8],
+    new_hash: &str,
+) -> Result<()> {
+    write_local_atomic(local_path, bytes)?;
+    update_state_after_pull(state, rel, ftp, remote_path, new_hash, bytes.len() as u64)?;
+    Ok(())
 }
 
 /// Write `bytes` to `path` via a sibling `.tmp.zedftp` file and `rename` so

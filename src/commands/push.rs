@@ -118,8 +118,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                     .as_deref()
                     .expect("local_bytes set when on_local is true");
                 let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
-                upload_remote_atomic(&mut ftp, &remote_path, bytes)?;
-                update_state_after_push(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
+                upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash)?;
                 println!("pushed {rel}");
             }
             FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
@@ -132,8 +131,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                         .expect("local_bytes set when on_local is true");
                     let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
                     eprintln!("overwriting remote with local (--force): {rel}");
-                    upload_remote_atomic(&mut ftp, &remote_path, bytes)?;
-                    update_state_after_push(&mut state, rel, &mut ftp, &remote_path, new_hash, bytes.len() as u64)?;
+                    upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash)?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
@@ -162,6 +160,23 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
 fn normalize_rel(p: &str) -> String {
     let s = p.replace('\\', "/");
     s.trim_start_matches("./").to_string()
+}
+
+/// Upload `bytes` to `remote_path` atomically (via temp + rename) and refresh
+/// the corresponding state entry. Shared with the sync command — both push
+/// and sync need exactly this "upload + record the new hash" sequence on the
+/// local-wins branch.
+pub fn upload_one(
+    ftp: &mut Ftp,
+    state: &mut StateFile,
+    rel: &str,
+    remote_path: &str,
+    bytes: &[u8],
+    new_hash: &str,
+) -> Result<()> {
+    upload_remote_atomic(ftp, remote_path, bytes)?;
+    update_state_after_push(state, rel, ftp, remote_path, new_hash, bytes.len() as u64)?;
+    Ok(())
 }
 
 /// Upload `bytes` to `remote_path` via a sibling `.tmp.zedftp` file and FTP
