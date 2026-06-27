@@ -42,12 +42,7 @@ fn run() -> i32 {
     let cli = Cli::parse();
     let cfg = cli.config.unwrap_or_else(|| std::path::PathBuf::from(".zed-ftp.toml"));
     let result: anyhow::Result<()> = match cli.cmd {
-        // Task 14 will wire the real implementation; until then keep the
-        // existing placeholder so the binary still does something on `init`.
-        Cmd::Init { .. } => {
-            println!("init stub");
-            Ok(())
-        }
+        Cmd::Init { no_validate } => zed_ftp::commands::init::run(&cfg, no_validate),
         Cmd::Status => zed_ftp::commands::status::run(&cfg),
         Cmd::Pull { paths, force } => zed_ftp::commands::pull::run(&cfg, &paths, force),
         Cmd::Push { paths, force } => zed_ftp::commands::push::run(&cfg, &paths, force),
