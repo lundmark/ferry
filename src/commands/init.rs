@@ -1,21 +1,37 @@
 //! `zed-ftp init` — interactive first-time setup.
 //!
-//! Task 14 only implements the basic / `--no-validate` flow: prompt for
-//! credentials, write `.zed-ftp.toml`, and append the `.zed-ftp.toml` and
-//! `.zed-ftp/` entries to `.gitignore`. We do **not** connect to FTP here —
-//! Task 15 will add the existing-files validation pass (walk + classify +
-//! resolve). For now `--no-validate` is implied even when the flag is absent.
+//! Two flows depending on `--no-validate`:
+//!
+//! - `--no-validate` (cheap path): prompt for credentials, write
+//!   `.zed-ftp.toml`, update `.gitignore`. No FTP contact.
+//! - default (validating path): same as above, plus connect to the remote,
+//!   walk local + remote, classify every file into in-sync / local-only /
+//!   remote-only / differs, prompt for each differs, and seed
+//!   `.zed-ftp/state.json` with the trusted entries.
 //!
 //! Stdin handling: we use plain `read_line` for the visible prompts. For the
 //! password we use `rpassword::read_password()` when stdin is a TTY (so the
 //! input is masked in normal use) and fall back to a plain `read_line` when
 //! it isn't (so integration tests can pipe answers in via `Stdio::piped()`).
 
+use crate::commands::pull::download_one;
+use crate::commands::push::upload_one;
+use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::ftp::Ftp;
+use crate::hash::{hash_bytes, hash_file};
+use crate::ignored::Matcher;
+use crate::state::StateFile;
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub fn run(config_path: &Path, _no_validate: bool) -> Result<()> {
+/// The ignore defaults written into a freshly-rendered `.zed-ftp.toml`. Kept
+/// here as a single source of truth so the validation pass uses the same
+/// matcher the rest of the binary will use on subsequent commands.
+const DEFAULT_IGNORE: &[&str] = &[".git/", ".zed-ftp/", "node_modules/", "target/", "*.log"];
+
+pub fn run(config_path: &Path, no_validate: bool) -> Result<()> {
     // 1. Refuse if the target config already exists. We don't want to clobber
     //    a working setup; the user can edit or remove it explicitly.
     if config_path.exists() {
@@ -61,7 +77,25 @@ pub fn run(config_path: &Path, _no_validate: bool) -> Result<()> {
         config_path.display()
     )?;
 
-    // 4. Compose and write the config. We hand-roll the TOML rather than
+    // 4. Validation pass (default behavior — skipped with --no-validate).
+    //    We do this BEFORE writing the config so a connect/auth failure
+    //    aborts cleanly without leaving a half-baked setup behind. The
+    //    state file is written by validate_and_resolve itself once it's
+    //    happy with what it found.
+    if !no_validate {
+        validate_and_resolve(
+            &host,
+            port,
+            &user,
+            &password,
+            Path::new(&local_root),
+            &remote_root,
+            &mut stdin,
+            &mut stdout,
+        )?;
+    }
+
+    // 5. Compose and write the config. We hand-roll the TOML rather than
     //    going through serde so we control quoting (the `Config` type only
     //    derives `Deserialize` today) and can include a friendly comment
     //    header for users who open the file by hand.
@@ -76,21 +110,208 @@ pub fn run(config_path: &Path, _no_validate: bool) -> Result<()> {
     std::fs::write(config_path, &cfg_text)
         .with_context(|| format!("writing {}", config_path.display()))?;
 
-    // 5. .gitignore. We always touch the .gitignore in the current working
+    // 6. .gitignore. We always touch the .gitignore in the current working
     //    directory rather than next to the config file: most users run
     //    `zed-ftp init` from their project root and that's where their git
     //    repo's .gitignore lives. Only add entries that aren't already
     //    present so reruns / hand-edited gitignores stay clean.
     update_gitignore(Path::new(".gitignore"))?;
 
-    // 6. Task 15 will replace this with a real connect + validate. For now,
-    //    point the user at `status` so they can confirm the credentials work.
     writeln!(
         stdout,
         "\nWrote {}.\nRun `zed-ftp status` to verify connection.",
         config_path.display()
     )?;
     Ok(())
+}
+
+/// Connect to the remote, hash both sides, classify each path into one of
+/// four buckets, prompt the user to resolve `differs`, and seed
+/// `<local_root>/.zed-ftp/state.json` with the entries we now trust.
+///
+/// Stays generic over the I/O handles so tests can drive it with scripted
+/// stdin/stdout. The local root is taken as a `Path` here because we need it
+/// for filesystem operations rather than re-parsing the user's string.
+#[allow(clippy::too_many_arguments)]
+fn validate_and_resolve<R: BufRead, W: Write>(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    local_root: &Path,
+    remote_root: &str,
+    stdin: &mut R,
+    stdout: &mut W,
+) -> Result<()> {
+    // The ignore set mirrors what render_config will write into the new
+    // .zed-ftp.toml so the validation pass agrees with every subsequent
+    // command on which files are in scope.
+    let patterns: Vec<String> = DEFAULT_IGNORE.iter().map(|s| (*s).to_string()).collect();
+    let matcher = Matcher::new(&patterns, local_root)
+        .context("building ignore matcher for validation")?;
+
+    // Passive mode matches the `Connection::passive` default in config.rs;
+    // using anything else here would make the validation pass behave
+    // differently from later `status`/`push`/etc. runs.
+    let mut ftp = Ftp::connect(host, port, user, password, true)?;
+
+    let mut local_paths: BTreeSet<String> = BTreeSet::new();
+    if local_root.is_dir() {
+        walk_local(local_root, local_root, &matcher, &mut local_paths)
+            .with_context(|| format!("walking local root {}", local_root.display()))?;
+    }
+    let mut remote_paths: BTreeSet<String> = BTreeSet::new();
+    walk_remote(&mut ftp, remote_root, "", &mut remote_paths)
+        .with_context(|| format!("walking remote root {remote_root}"))?;
+
+    // Categorize. We deliberately do NOT use state::classify here — there's
+    // no prior state, so the meaningful split is just the four buckets the
+    // init flow cares about. For each in-sync file we keep the agreed-on
+    // hash + remote size so we can seed state without re-downloading later.
+    struct InSync {
+        rel: String,
+        hash: String,
+        size: u64,
+    }
+    let mut in_sync: Vec<InSync> = Vec::new();
+    let mut local_only_count: usize = 0;
+    let mut remote_only_count: usize = 0;
+    let mut differs: Vec<String> = Vec::new();
+
+    let union: BTreeSet<&String> = local_paths.iter().chain(remote_paths.iter()).collect();
+    for rel in union {
+        let on_local = local_paths.contains(rel);
+        let on_remote = remote_paths.contains(rel);
+        match (on_local, on_remote) {
+            (true, false) => local_only_count += 1,
+            (false, true) => remote_only_count += 1,
+            (true, true) => {
+                let lh = hash_file(&local_root.join(rel))?;
+                let remote_path = remote_join(remote_root, rel);
+                let rb = ftp
+                    .download(&remote_path)
+                    .with_context(|| format!("downloading {remote_path} for hash"))?;
+                let rh = hash_bytes(&rb);
+                if lh == rh {
+                    in_sync.push(InSync {
+                        rel: rel.clone(),
+                        hash: rh,
+                        size: rb.len() as u64,
+                    });
+                } else {
+                    differs.push(rel.clone());
+                }
+            }
+            (false, false) => unreachable!("path appeared in union but neither side"),
+        }
+    }
+
+    writeln!(
+        stdout,
+        "\nFound {} files in sync, {} local-only, {} remote-only, {} differing.",
+        in_sync.len(),
+        local_only_count,
+        remote_only_count,
+        differs.len(),
+    )?;
+
+    // Build the state file we're about to seed. In-sync entries go in
+    // unconditionally; differs entries go in only if the chosen resolution
+    // produces a known-good hash on BOTH sides (p/P). 'k' and 's' leave the
+    // file in an indeterminate state and we don't pretend otherwise.
+    let mut state = StateFile::default();
+
+    for entry in &in_sync {
+        let remote_path = remote_join(remote_root, &entry.rel);
+        // We still need a fresh mtime — `mdtm` is a single command, so this
+        // is a much cheaper round-trip than re-downloading would have been.
+        let mtime = ftp
+            .mtime(&remote_path)
+            .with_context(|| format!("fetching mtime for {remote_path}"))?;
+        state.files.insert(
+            entry.rel.clone(),
+            crate::state::FileRecord {
+                sha256: entry.hash.clone(),
+                size: entry.size,
+                remote_mtime: mtime,
+                last_synced: chrono::Utc::now(),
+            },
+        );
+    }
+
+    // Resolve each differ interactively. The default on empty/EOF is 'k'
+    // (keep unsynced) so accidentally running init through a non-interactive
+    // shell can never silently mutate either side.
+    for rel in &differs {
+        writeln!(stdout, "\ndiffers: {rel}")?;
+        write!(stdout, "[k]eep unsynced  [p]ush local  [P]ull remote  [s]kip: ")?;
+        stdout.flush()?;
+        let choice = read_single_char(stdin).unwrap_or('k');
+
+        match choice {
+            'p' => {
+                let local_path = local_root.join(rel);
+                let bytes = std::fs::read(&local_path)
+                    .with_context(|| format!("reading local {}", local_path.display()))?;
+                let new_hash = hash_bytes(&bytes);
+                let remote_path = remote_join(remote_root, rel);
+                upload_one(&mut ftp, &mut state, rel, &remote_path, &bytes, &new_hash)?;
+                writeln!(stdout, "pushed {rel}")?;
+            }
+            'P' => {
+                let remote_path = remote_join(remote_root, rel);
+                let bytes = ftp
+                    .download(&remote_path)
+                    .with_context(|| format!("downloading {remote_path}"))?;
+                let new_hash = hash_bytes(&bytes);
+                let local_path = local_root.join(rel);
+                download_one(
+                    &mut ftp,
+                    &mut state,
+                    &local_path,
+                    rel,
+                    &remote_path,
+                    &bytes,
+                    &new_hash,
+                )?;
+                writeln!(stdout, "pulled {rel}")?;
+            }
+            's' => {
+                writeln!(stdout, "skipped {rel}")?;
+            }
+            _ => {
+                // 'k' or any unrecognized input — leave both sides alone and
+                // do not record a state entry. Subsequent `status` will
+                // classify this as Untracked.
+                writeln!(stdout, "keeping {rel} unsynced")?;
+            }
+        }
+    }
+
+    // Persist the seeded state. We skip writing if there's nothing to
+    // record AND the file doesn't already exist — no point creating an
+    // empty file just to demonstrate the directory exists. (If the user
+    // had a prior state.json we'd overwrite it; but init refuses to run
+    // when the config exists, so reaching here implies a fresh setup.)
+    if !state.files.is_empty() {
+        let state_path: PathBuf = local_root.join(".zed-ftp").join("state.json");
+        state.save(&state_path)
+            .with_context(|| format!("writing state file {}", state_path.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Read one character from `stdin`, ignoring leading whitespace, then drain
+/// the rest of the line so the next prompt starts cleanly. Returns `None`
+/// on EOF before any non-whitespace character.
+fn read_single_char<R: BufRead>(stdin: &mut R) -> Option<char> {
+    let mut line = String::new();
+    let n = stdin.read_line(&mut line).ok()?;
+    if n == 0 {
+        return None;
+    }
+    line.chars().find(|c| !c.is_whitespace())
 }
 
 fn prompt<R: BufRead, W: Write>(
@@ -146,8 +367,13 @@ fn render_config(
     remote_root: &str,
     local_root: &str,
 ) -> String {
-    // The ignore defaults here match the spec in Task 14. They're a
-    // reasonable baseline for most projects; users can edit later.
+    // The ignore defaults here mirror DEFAULT_IGNORE so the validation pass
+    // and the written config agree on what's in scope.
+    let ignore_list: String = DEFAULT_IGNORE
+        .iter()
+        .map(|s| toml_string(s))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "# zed-ftp configuration — generated by `zed-ftp init`.\n\
          # The password is stored in plaintext; keep this file out of git.\n\
@@ -163,13 +389,14 @@ fn render_config(
          remote_root = {remote_root}\n\
          \n\
          [sync]\n\
-         ignore = [\".git/\", \".zed-ftp/\", \"node_modules/\", \"target/\", \"*.log\"]\n",
+         ignore = [{ignore_list}]\n",
         host = toml_string(host),
         port = port,
         user = toml_string(user),
         password = toml_string(password),
         remote_root = toml_string(remote_root),
         local_root = toml_string(local_root),
+        ignore_list = ignore_list,
     )
 }
 

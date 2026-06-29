@@ -1,6 +1,8 @@
-//! Integration tests for `zed-ftp init`. These do NOT require Docker — the
-//! basic init flow (Task 14) doesn't touch FTP. Task 15 will add the
-//! connect+validate path and gate it on `--no-validate`.
+//! Integration tests for `zed-ftp init`. The non-ignored tests do NOT
+//! require Docker — they cover the `--no-validate` flow which doesn't
+//! touch FTP. The `#[ignore]`d test at the bottom exercises the full
+//! validation flow against a vsftpd container; run with:
+//!     cargo test --test init_integration -- --ignored
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -44,6 +46,114 @@ fn init_writes_config_and_updates_gitignore() {
     let gi = std::fs::read_to_string(&gi_path).unwrap();
     assert!(gi.contains(".zed-ftp.toml"));
     assert!(gi.contains(".zed-ftp/"));
+}
+
+/// Exercises the full validating init flow against a real FTP server.
+/// Mirrors the container setup pattern in `tests/ftp_integration.rs`.
+///
+/// Layout under test:
+/// - remote: `shared.txt` ("X"), `remote_only.txt` ("R"), `differs.txt` ("remote-version")
+/// - local:  `shared.txt` ("X"), `local_only.txt` ("L"), `differs.txt` ("local-version")
+///
+/// We answer 'k' to the `differs.txt` prompt, so neither side is touched
+/// and only `shared.txt` ends up seeded into `.zed-ftp/state.json`.
+#[test]
+#[ignore]
+fn validates_existing_local_against_remote() {
+    use testcontainers::{
+        core::{IntoContainerPort, WaitFor},
+        runners::SyncRunner,
+        GenericImage, ImageExt,
+    };
+    use zed_ftp::ftp::Ftp;
+
+    // Spin up the FTP server. Same image + creds as tests/ftp_integration.rs
+    // so we share the pattern reviewers already know.
+    let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
+        .with_exposed_port(21.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("vsftpd"))
+        .with_env_var("USERS", "test|testpw|/home/test");
+    let container = img.start().unwrap();
+    let port = container.get_host_port_ipv4(21.tcp()).unwrap();
+    let host = "127.0.0.1";
+
+    // Pre-upload the remote fixtures.
+    {
+        let mut ftp = Ftp::connect(host, port, "test", "testpw", true).unwrap();
+        ftp.upload_bytes("/shared.txt", b"X").unwrap();
+        ftp.upload_bytes("/remote_only.txt", b"R").unwrap();
+        ftp.upload_bytes("/differs.txt", b"remote-version").unwrap();
+    }
+
+    // Local mirror.
+    let dir = tempfile::tempdir().unwrap();
+    let local_root = dir.path();
+    std::fs::write(local_root.join("shared.txt"), b"X").unwrap();
+    std::fs::write(local_root.join("local_only.txt"), b"L").unwrap();
+    std::fs::write(local_root.join("differs.txt"), b"local-version").unwrap();
+
+    let cfg_path = local_root.join(".zed-ftp.toml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+        .args(["init", "--config", cfg_path.to_str().unwrap()])
+        .current_dir(local_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Prompt order: host, port (default 21), user, password, remote_root,
+    // local_root (default "."), then a 'k' for the single differing file.
+    // The local_root we pass is "." so the binary walks the cwd (= local_root).
+    let answers = format!(
+        "{host}\n{port}\ntest\ntestpw\n/\n.\nk\n",
+        host = host,
+        port = port,
+    );
+    child.stdin.as_mut().unwrap().write_all(answers.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "init did not succeed; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Config landed on disk.
+    assert!(cfg_path.exists(), ".zed-ftp.toml should have been written");
+
+    // State file should exist and contain ONLY shared.txt.
+    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_text = std::fs::read_to_string(&state_path)
+        .expect(".zed-ftp/state.json should have been seeded");
+    assert!(state_text.contains("shared.txt"), "state missing shared.txt: {state_text}");
+    assert!(
+        !state_text.contains("local_only.txt"),
+        "local-only entry must not be seeded: {state_text}",
+    );
+    assert!(
+        !state_text.contains("remote_only.txt"),
+        "remote-only entry must not be seeded: {state_text}",
+    );
+    assert!(
+        !state_text.contains("differs.txt"),
+        "kept differs entry must not be seeded: {state_text}",
+    );
+
+    // Local files unchanged.
+    assert_eq!(std::fs::read(local_root.join("shared.txt")).unwrap(), b"X");
+    assert_eq!(std::fs::read(local_root.join("local_only.txt")).unwrap(), b"L");
+    assert_eq!(
+        std::fs::read(local_root.join("differs.txt")).unwrap(),
+        b"local-version",
+    );
+
+    // Remote files unchanged.
+    let mut ftp = Ftp::connect(host, port, "test", "testpw", true).unwrap();
+    assert_eq!(ftp.download("/shared.txt").unwrap(), b"X");
+    assert_eq!(ftp.download("/remote_only.txt").unwrap(), b"R");
+    assert_eq!(ftp.download("/differs.txt").unwrap(), b"remote-version");
 }
 
 #[test]
