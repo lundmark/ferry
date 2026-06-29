@@ -5,6 +5,7 @@
 //! locally-missing file is treated as "not yours to delete" — `rm` is its
 //! own deliberate command.
 
+use crate::commands::remote_hash;
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -90,14 +91,11 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
         let local_hash = local_bytes.as_deref().map(hash_bytes);
 
         let remote_path = remote_join(&cfg.paths.remote_root, rel);
-        // Hash the remote by downloading. classify() needs a hash to compare;
-        // there's no cheap server-side hash, and trusting size+mtime alone
-        // can produce false negatives.
+        // Hash the remote, using the MDTM/SIZE fast path when possible.
+        // Push only needs the hash for classification — never the bytes —
+        // so request `want_bytes=false`.
         let remote_hash = if on_remote {
-            Some(hash_bytes(
-                &ftp.download(&remote_path)
-                    .with_context(|| format!("downloading {remote_path} for hash"))?,
-            ))
+            Some(remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false)?.sha256)
         } else {
             None
         };

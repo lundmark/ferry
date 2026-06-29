@@ -1,7 +1,8 @@
+use crate::commands::remote_hash;
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
-use crate::hash::{hash_bytes, hash_file};
+use crate::hash::hash_file;
 use crate::ignored::Matcher;
 use crate::state::{classify, StateFile};
 use anyhow::Result;
@@ -12,7 +13,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let state_path = local_root.join(".zed-ftp").join("state.json");
-    let state = StateFile::load_or_default(&state_path)?;
+    let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
 
@@ -30,12 +31,16 @@ pub fn run(config_path: &Path) -> Result<()> {
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
     walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
 
-    let mut all: BTreeSet<&String> = local_paths.iter().chain(remote_paths.iter()).collect();
+    // Collect into owned Strings so we can mutably borrow `state` inside
+    // the loop (the MDTM cache lives there).
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    all.extend(local_paths.iter().cloned());
+    all.extend(remote_paths.iter().cloned());
     for k in state.files.keys() {
-        all.insert(k);
+        all.insert(k.clone());
     }
 
-    for rel in all {
+    for rel in &all {
         let on_local = local_paths.contains(rel);
         let on_remote = remote_paths.contains(rel);
         if !on_local && !on_remote {
@@ -48,10 +53,11 @@ pub fn run(config_path: &Path) -> Result<()> {
         } else {
             None
         };
+        // Use the MDTM/SIZE fast path where possible — status only needs
+        // the hash for classification, never the bytes.
         let remote_hash = if on_remote {
             let remote_path = remote_join(&cfg.paths.remote_root, rel);
-            let bytes = ftp.download(&remote_path)?;
-            Some(hash_bytes(&bytes))
+            Some(remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false)?.sha256)
         } else {
             None
         };
@@ -59,6 +65,10 @@ pub fn run(config_path: &Path) -> Result<()> {
         let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
         println!("{:>14}\t{}", format!("{:?}", st), rel);
     }
+
+    // Persist any cached `server_supports_mdtm` decision so subsequent runs
+    // skip the MDTM probe entirely on servers that don't support it.
+    state.save(&state_path)?;
 
     Ok(())
 }

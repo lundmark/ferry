@@ -5,10 +5,11 @@
 //! way an accidentally-empty remote (or an interrupted upload by someone
 //! else) cannot wipe your working tree.
 
+use crate::commands::remote_hash;
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
-use crate::hash::{hash_bytes, hash_file};
+use crate::hash::hash_file;
 use crate::ignored::Matcher;
 use crate::state::{classify, FileRecord, FileState, StateFile};
 use anyhow::{Context, Result};
@@ -83,20 +84,26 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
             None
         };
         let remote_path = remote_join(&cfg.paths.remote_root, rel);
-        // Download once per file we might act on. We still need the bytes
-        // for the actual write, so keeping them avoids a second round-trip.
-        let remote_bytes = if on_remote {
-            Some(
-                ftp.download(&remote_path)
-                    .with_context(|| format!("downloading {remote_path}"))?,
-            )
+        // Use the MDTM/SIZE fast path: skip downloading entirely when the
+        // server's (mtime, size) match the cached state — that case is
+        // exactly the InSync branch below, which doesn't need the bytes.
+        // When the fast path can't fire we ask for bytes (`want_bytes=true`)
+        // so we have them in hand for the actual local write.
+        let rh = if on_remote {
+            Some(remote_hash::compute(
+                &mut ftp,
+                &mut state,
+                rel,
+                &remote_path,
+                true,
+            )?)
         } else {
             None
         };
-        let remote_hash = remote_bytes.as_deref().map(hash_bytes);
+        let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
 
         let known = state.files.get(rel).map(|r| r.sha256.as_str());
-        let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
+        let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
 
         match st {
             FileState::InSync => {
@@ -107,11 +114,21 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                 // remote is missing them. Skip.
             }
             FileState::RemoteOnly | FileState::RemoteChanged => {
-                let bytes = remote_bytes
-                    .as_deref()
-                    .expect("remote_bytes set when on_remote is true");
-                let new_hash = remote_hash.as_deref().expect("remote_hash matches remote_bytes");
-                download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, bytes, new_hash)?;
+                // We need the actual remote bytes to write locally. If the
+                // fast path fired (from_cache=true), we got here with the
+                // hash but no bytes — which can only happen if state has a
+                // record AND it matches AND yet classify said the remote
+                // changed. That implies the local file diverged from `known`
+                // while remote matches `known` (LocalChanged) — not this
+                // branch. So in practice rh.bytes is Some here. Defensive
+                // fallback: if bytes are missing, fetch them now.
+                let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
+                let bytes_owned: Vec<u8> = match &rh_inner.bytes {
+                    Some(b) => b.clone(),
+                    None => ftp.download(&remote_path)
+                        .with_context(|| format!("downloading {remote_path}"))?,
+                };
+                download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, &bytes_owned, &rh_inner.sha256)?;
                 println!("pulled {rel}");
             }
             FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
@@ -119,12 +136,14 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                 // Design action matrix treats this as "as if both-changed": refuse
                 // without --force so the user makes an explicit choice.
                 if force {
-                    let bytes = remote_bytes
-                        .as_deref()
-                        .expect("remote_bytes set when on_remote is true");
-                    let new_hash = remote_hash.as_deref().expect("remote_hash matches remote_bytes");
+                    let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
+                    let bytes_owned: Vec<u8> = match &rh_inner.bytes {
+                        Some(b) => b.clone(),
+                        None => ftp.download(&remote_path)
+                            .with_context(|| format!("downloading {remote_path}"))?,
+                    };
                     eprintln!("overwriting local with remote (--force): {rel}");
-                    download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, bytes, new_hash)?;
+                    download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, &bytes_owned, &rh_inner.sha256)?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
