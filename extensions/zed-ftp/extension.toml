@@ -1,0 +1,14 @@
+id = "zed-ftp"
+name = "Zed FTP"
+version = "0.1.0"
+schema_version = 1
+authors = ["Simon Lundmark <simon@dagg.ai>"]
+description = "Auto-pull files from an FTP server when opened. Attaches a minimal language server to C files that shells out to `zed-ftp pull` on textDocument/didOpen."
+repository = "https://github.com/simon/zed_ftp"
+
+# Attach the LSP to Zed's built-in C language. C headers (.h) are covered
+# because Zed maps .h to the C language by default. If you also want C++
+# coverage, add "C++" to the languages list here.
+[language_servers.zed-ftp-lsp]
+name = "Zed FTP LSP"
+languages = ["C"]

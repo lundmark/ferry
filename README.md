@@ -57,6 +57,23 @@ Zed, open the command palette and run `task: spawn` to pick one of:
 The per-file tasks use Zed's `$ZED_RELATIVE_FILE` variable so they operate on
 whichever buffer is active.
 
+## Auto-pull on open (Zed extension)
+
+For a hands-off workflow where opening a file automatically pulls the current
+remote version, install the companion extension at
+[`extensions/zed-ftp/`](extensions/zed-ftp/README.md). It attaches a minimal
+language server to `.c`/`.h` files that shells out to `zed-ftp pull --force`
+on `textDocument/didOpen`. Install with:
+
+```sh
+cargo install --path .          # installs both zed-ftp and zed-ftp-lsp
+cd extensions/zed-ftp
+zed --dev-extension .            # or use the Extensions palette
+```
+
+See the extension's README for behaviour details and the "brief flash of
+stale content" caveat inherent to the approach.
+
 ## Security
 
 **`.zed-ftp.toml` stores your FTP password in plaintext.** `init` automatically

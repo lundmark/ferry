@@ -1,0 +1,14 @@
+[package]
+name = "zed_ftp_extension"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pin to whatever version the current Zed release ships. Extensions are
+# built with `wasm32-wasip1` (previously `wasm32-wasi`). See:
+# https://zed.dev/docs/extensions/developing-extensions
+zed_extension_api = "0.6"
