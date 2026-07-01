@@ -15,6 +15,9 @@ sha2 = "0.10"
 ignore = "0.4"
 suppaftp = "6"
 rpassword = "7"
+lsp-server = "0.8"
+lsp-types = "0.97"
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -23,6 +26,10 @@ testcontainers = { version = "0.20", features = ["blocking"] }
 [[bin]]
 name = "zed-ftp"
 path = "src/main.rs"
+
+[[bin]]
+name = "zed-ftp-lsp"
+path = "src/bin/zed-ftp-lsp.rs"
 
 [lib]
 name = "zed_ftp"
