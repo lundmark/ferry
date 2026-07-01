@@ -202,6 +202,115 @@ fn normalize_rel(p: &str) -> String {
     s.trim_start_matches("./").to_string()
 }
 
+/// Fast single-file pull that bypasses the local + remote tree walks used
+/// by `run()`. Intended for hook / LSP use where you already know the file
+/// you want and can't afford to O(tree) on every editor tool call.
+///
+/// Behaviour matches `run()` for a single path: hashes the local copy (if
+/// present), fetches remote hash (with MDTM fast-path), classifies, and
+/// downloads when the remote wins. Refuses on conflict without `force`
+/// exactly like `run()` does.
+///
+/// Returns `Ok(true)` if a download was performed, `Ok(false)` if no
+/// action was needed (InSync / LocalOnly / conflict-with-force-skipped).
+pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
+    let cfg = Config::load(config_path)?;
+    let local_root = cfg.paths.local_root.clone();
+    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let mut state = StateFile::load_or_default(&state_path)?;
+
+    let mut ftp = Ftp::connect(
+        &cfg.connection.host,
+        cfg.connection.port,
+        &cfg.connection.user,
+        &cfg.connection.password,
+        cfg.connection.passive,
+    )?;
+
+    let local_path = local_root.join(rel);
+    let local_hash = if local_path.exists() {
+        Some(hash_file(&local_path)?)
+    } else {
+        None
+    };
+
+    let remote_path = remote_join(&cfg.paths.remote_root, rel);
+    // Probe remote existence via SIZE; treat any SIZE error as "not present"
+    // so brand-new local files or typo'd rels don't blow up the hook.
+    let remote_exists = ftp.size(&remote_path).is_ok();
+    if !remote_exists && local_hash.is_none() {
+        anyhow::bail!("neither local nor remote has {rel}");
+    }
+
+    let rh = if remote_exists {
+        Some(crate::commands::remote_hash::compute(
+            &mut ftp,
+            &mut state,
+            rel,
+            &remote_path,
+            true,
+        )?)
+    } else {
+        None
+    };
+    let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
+    let known = state.files.get(rel).map(|r| r.sha256.as_str());
+    let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
+
+    let mut wrote = false;
+    match st {
+        FileState::InSync | FileState::LocalOnly => {}
+        FileState::RemoteOnly | FileState::RemoteChanged => {
+            let rh_inner = rh.as_ref().expect("rh set when remote_exists");
+            let bytes = match &rh_inner.bytes {
+                Some(b) => b.clone(),
+                None => ftp
+                    .download(&remote_path)
+                    .with_context(|| format!("downloading {remote_path}"))?,
+            };
+            download_one(
+                &mut ftp,
+                &mut state,
+                &local_path,
+                rel,
+                &remote_path,
+                &bytes,
+                &rh_inner.sha256,
+            )?;
+            wrote = true;
+        }
+        FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
+            if force {
+                let rh_inner = rh.as_ref().expect("rh set when remote_exists");
+                let bytes = match &rh_inner.bytes {
+                    Some(b) => b.clone(),
+                    None => ftp
+                        .download(&remote_path)
+                        .with_context(|| format!("downloading {remote_path}"))?,
+                };
+                download_one(
+                    &mut ftp,
+                    &mut state,
+                    &local_path,
+                    rel,
+                    &remote_path,
+                    &bytes,
+                    &rh_inner.sha256,
+                )?;
+                wrote = true;
+            } else {
+                return Err(crate::error::Exit::Conflict(format!(
+                    "conflict ({st:?}) on {rel}: local changes present; pass --force to override",
+                ))
+                .into());
+            }
+        }
+    }
+
+    state.save(&state_path)?;
+    Ok(wrote)
+}
+
 /// Write `bytes` to `local_path` atomically (via temp + rename) and refresh
 /// the corresponding state entry. Shared with the sync command — both pull
 /// and sync need exactly this "write + record the new hash" sequence on the

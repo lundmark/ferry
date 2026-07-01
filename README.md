@@ -57,6 +57,46 @@ Zed, open the command palette and run `task: spawn` to pick one of:
 The per-file tasks use Zed's `$ZED_RELATIVE_FILE` variable so they operate on
 whichever buffer is active.
 
+## Claude Code / Codex hook
+
+For LLM agents (Claude Code, Codex, etc.) that read and edit files on your
+behalf, register `zed-ftp hook` as a `PreToolUse` hook so every Read/Edit
+tool call auto-pulls the file from FTP first. There's a configurable
+cooldown (default 3600s) so a hot LLM turn doesn't hammer the server.
+
+Example Claude Code `~/.claude/settings.json` (or project-local
+`.claude/settings.local.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [{"type": "command", "command": "zed-ftp hook"}]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [{"type": "command", "command": "zed-ftp hook --cooldown 3600"}]
+      }
+    ]
+  }
+}
+```
+
+See [`examples/claude-code-settings.json`](examples/claude-code-settings.json)
+for a copy-pasteable version. The hook exits 0 whether it pulled, skipped
+by cooldown, or errored — the LLM's tool call is never blocked.
+
+Behaviour:
+- Reads the tool envelope on stdin; extracts `tool_input.file_path`.
+- Walks upward to find `.zed-ftp.toml`; if not in a zed-ftp project, no-op.
+- Compares `state.files[rel].last_synced` against the cooldown window; if
+  fresh enough, skips the pull.
+- Otherwise runs a fast single-file pull (bypasses the tree walk).
+- On failure, logs to stderr (which the LLM host surfaces to you) but
+  never denies the tool call.
+
 ## Auto-pull on open (Zed extension)
 
 For a hands-off workflow where opening a file automatically pulls the current
