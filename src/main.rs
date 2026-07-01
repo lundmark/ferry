@@ -17,6 +17,9 @@ struct Cli {
 enum Cmd {
     /// Interactive setup; validates existing local files vs remote.
     Init { #[arg(long)] no_validate: bool },
+    /// List a remote directory (connectivity smoke test). PATH is relative
+    /// to `paths.remote_root` from the config; empty lists the root itself.
+    Ls { path: Option<String> },
     /// Show per-file sync state vs remote.
     Status,
     /// Download remote -> local.
@@ -43,6 +46,7 @@ fn run() -> i32 {
     let cfg = cli.config.unwrap_or_else(|| std::path::PathBuf::from(".zed-ftp.toml"));
     let result: anyhow::Result<()> = match cli.cmd {
         Cmd::Init { no_validate } => zed_ftp::commands::init::run(&cfg, no_validate),
+        Cmd::Ls { path } => zed_ftp::commands::ls::run(&cfg, path.as_deref()),
         Cmd::Status => zed_ftp::commands::status::run(&cfg),
         Cmd::Pull { paths, force } => zed_ftp::commands::pull::run(&cfg, &paths, force),
         Cmd::Push { paths, force } => zed_ftp::commands::push::run(&cfg, &paths, force),

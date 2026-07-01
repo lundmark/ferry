@@ -50,19 +50,41 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
         }
         all.into_iter().collect()
     } else {
-        let mut out = Vec::new();
+        // Expand each arg against the walked sets. A literal file match
+        // (`src/index.html`) becomes one target; a directory prefix
+        // (`src` or `src/`) becomes every leaf beneath it.
+        let mut out: BTreeSet<String> = BTreeSet::new();
         for p in paths {
             let rel = normalize_rel(p);
-            if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
+            if Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
                 anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
             }
-            if matcher.is_ignored(&local_root.join(&rel), false) {
-                eprintln!("skip (ignored by .zed-ftp.toml): {rel}");
+            if rel.is_empty() {
+                anyhow::bail!("refusing empty path arg");
+            }
+            // Exact file match on either side?
+            if local_paths.contains(&rel) || remote_paths.contains(&rel) {
+                if matcher.is_ignored(&local_root.join(&rel), false) {
+                    eprintln!("skip (ignored by .zed-ftp.toml): {rel}");
+                } else {
+                    out.insert(rel);
+                }
                 continue;
             }
-            out.push(rel);
+            // Treat as a directory prefix. Match anything starting with `rel/`.
+            let prefix = if rel.ends_with('/') { rel.clone() } else { format!("{rel}/") };
+            let mut expanded = 0usize;
+            for path in local_paths.iter().chain(remote_paths.iter()) {
+                if path.starts_with(&prefix) && !matcher.is_ignored(&local_root.join(path), false) {
+                    out.insert(path.clone());
+                    expanded += 1;
+                }
+            }
+            if expanded == 0 {
+                eprintln!("skip (no files matched on local or remote): {rel}");
+            }
         }
-        out
+        out.into_iter().collect()
     };
 
     let mut had_conflict = false;

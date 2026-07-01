@@ -1,4 +1,5 @@
 pub mod init;
+pub mod ls;
 pub mod pull;
 pub mod push;
 pub mod remote_hash;
