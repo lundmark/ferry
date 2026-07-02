@@ -33,36 +33,54 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
         cfg.connection.passive,
     )?;
 
+    // Scope the walks to the paths we actually care about. Bare `push`
+    // walks the whole tree; `push <folder>` walks only that subtree,
+    // `push <file>` skips the walks entirely.
     let mut local_paths: BTreeSet<String> = BTreeSet::new();
-    walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
-    walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
-
-    // Determine which relative paths to consider. With explicit args, we
-    // restrict to those (still applying classify+decide). Without args we
-    // walk every path that `status` would consider.
-    let targets: Vec<String> = if paths.is_empty() {
-        let mut all: BTreeSet<String> = BTreeSet::new();
-        all.extend(local_paths.iter().cloned());
-        all.extend(remote_paths.iter().cloned());
-        for k in state.files.keys() {
-            all.insert(k.clone());
-        }
-        all.into_iter().collect()
+    if paths.is_empty() {
+        walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
+        walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
     } else {
-        let mut out = Vec::new();
         for p in paths {
             let rel = normalize_rel(p);
             if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
                 anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
             }
-            if matcher.is_ignored(&local_root.join(&rel), false) {
-                eprintln!("skip (ignored by .zed-ftp.toml): {rel}");
-                continue;
+            let rel_no_slash = rel.trim_end_matches('/');
+            let local_full = local_root.join(rel_no_slash);
+            if local_full.is_dir() {
+                walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;
+            } else if local_full.is_file() {
+                local_paths.insert(rel_no_slash.to_string());
             }
-            out.push(rel);
+            match walk_remote(&mut ftp, &cfg.paths.remote_root, rel_no_slash, &mut remote_paths) {
+                Ok(()) => {}
+                Err(_) => {
+                    let remote_path = remote_join(&cfg.paths.remote_root, rel_no_slash);
+                    if ftp.size(&remote_path).is_ok() {
+                        remote_paths.insert(rel_no_slash.to_string());
+                    }
+                }
+            }
         }
-        out
+    }
+
+    // Build the target set. With explicit args, restrict targets to the
+    // union of files under those args (via scoped walks above) — this
+    // gives folder-expansion semantics matching `pull`.
+    let targets: Vec<String> = {
+        let mut all: BTreeSet<String> = BTreeSet::new();
+        all.extend(local_paths.iter().cloned());
+        all.extend(remote_paths.iter().cloned());
+        if paths.is_empty() {
+            for k in state.files.keys() {
+                all.insert(k.clone());
+            }
+        }
+        all.into_iter()
+            .filter(|rel| !matcher.is_ignored(&local_root.join(rel), false))
+            .collect()
     };
 
     let mut had_conflict = false;

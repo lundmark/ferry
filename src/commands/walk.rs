@@ -48,6 +48,15 @@ pub fn walk_local(
 }
 
 /// Walk the remote tree, populating `out` with relative paths beneath `root`.
+///
+/// Per-directory listing failures are logged to stderr but do not abort the
+/// walk. This is defensive against decades-old FTP trees with dangling
+/// symlinks, permission-denied subfolders, and other cruft — one bad
+/// subdirectory shouldn't kill the whole operation.
+///
+/// The top-level call still returns Err if the starting directory itself
+/// fails to list — that's a real "the target doesn't exist" signal that
+/// callers need.
 pub fn walk_remote(
     ftp: &mut Ftp,
     root: &str,
@@ -59,10 +68,36 @@ pub fn walk_remote(
     } else {
         format!("{}/{}", root.trim_end_matches('/'), sub)
     };
-    let entries = ftp.list(&dir)
-        .with_context(|| format!("walking remote dir {dir}"))?;
+    walk_remote_inner(ftp, root, sub, &dir, out, /* top_level = */ true)
+}
+
+fn walk_remote_inner(
+    ftp: &mut Ftp,
+    root: &str,
+    sub: &str,
+    dir: &str,
+    out: &mut BTreeSet<String>,
+    top_level: bool,
+) -> Result<()> {
+    let entries = match ftp.list(dir) {
+        Ok(e) => e,
+        Err(e) if top_level => {
+            return Err(e).with_context(|| format!("walking remote dir {dir}"));
+        }
+        Err(e) => {
+            eprintln!("warning: skipping remote dir {dir}: {e:#}");
+            return Ok(());
+        }
+    };
     for entry in entries {
         if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        // Server-supplied names must not contain path separators — a
+        // malicious or corrupt listing could otherwise steer the walk
+        // outside `root`. Skip suspicious entries with a warning.
+        if entry.name.contains('/') || entry.name == ".." || entry.name.is_empty() {
+            eprintln!("warning: skipping suspicious remote entry {:?} in {dir}", entry.name);
             continue;
         }
         let child_sub = if sub.is_empty() {
@@ -71,7 +106,8 @@ pub fn walk_remote(
             format!("{}/{}", sub, entry.name)
         };
         if entry.is_dir {
-            walk_remote(ftp, root, &child_sub, out)?;
+            let child_dir = format!("{}/{}", dir.trim_end_matches('/'), entry.name);
+            let _ = walk_remote_inner(ftp, root, &child_sub, &child_dir, out, false);
         } else {
             out.insert(child_sub);
         }

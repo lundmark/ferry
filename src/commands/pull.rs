@@ -33,10 +33,47 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
         cfg.connection.passive,
     )?;
 
+    // Scope the walks to the paths we actually care about. Without args we
+    // must walk everything (bare `pull`). With args we only walk within
+    // each arg's subtree — critical for large FTP trees where a full walk
+    // takes minutes and can trip over dangling symlinks.
     let mut local_paths: BTreeSet<String> = BTreeSet::new();
-    walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
-    walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+    if paths.is_empty() {
+        walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
+        walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+    } else {
+        for p in paths {
+            let rel = normalize_rel(p);
+            if Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
+                anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
+            }
+            if rel.is_empty() {
+                anyhow::bail!("refusing empty path arg");
+            }
+            let rel_no_slash = rel.trim_end_matches('/');
+            // Local: recurse into directory, or record file directly.
+            let local_full = local_root.join(rel_no_slash);
+            if local_full.is_dir() {
+                walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;
+            } else if local_full.is_file() {
+                local_paths.insert(rel_no_slash.to_string());
+            }
+            // Remote: try walking the subtree. If the top-level list fails
+            // it may be a file (or missing) — fall back to a SIZE probe.
+            match walk_remote(&mut ftp, &cfg.paths.remote_root, rel_no_slash, &mut remote_paths) {
+                Ok(()) => {}
+                Err(_) => {
+                    let remote_path = remote_join(&cfg.paths.remote_root, rel_no_slash);
+                    if ftp.size(&remote_path).is_ok() {
+                        remote_paths.insert(rel_no_slash.to_string());
+                    } else {
+                        eprintln!("skip (not on remote): {rel_no_slash}");
+                    }
+                }
+            }
+        }
+    }
 
     // Determine which relative paths to consider. With explicit args, we
     // restrict to those (still applying classify+decide). Without args we
