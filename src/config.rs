@@ -48,9 +48,19 @@ impl Config {
         let text = std::fs::read_to_string(path).map_err(|e| {
             crate::error::Exit::Config(format!("reading {}: {e}", path.display()))
         })?;
-        let cfg: Config = toml::from_str(&text).map_err(|e| {
+        let mut cfg: Config = toml::from_str(&text).map_err(|e| {
             crate::error::Exit::Config(format!("parsing {}: {e}", path.display()))
         })?;
+        // Resolve local_root relative to the config file's directory. Without
+        // this, invoking zed-ftp from a different CWD (as the Claude Code
+        // hook does) makes `local_root = "."` point at the wrong tree.
+        if cfg.paths.local_root.is_relative() {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    cfg.paths.local_root = parent.join(&cfg.paths.local_root);
+                }
+            }
+        }
         Ok(cfg)
     }
 }
@@ -79,6 +89,50 @@ mod tests {
         assert!(cfg.connection.passive);
         assert_eq!(cfg.paths.remote_root, "/var/www/site");
         assert_eq!(cfg.sync.ignore.len(), 2);
+    }
+
+    #[test]
+    fn local_root_resolves_relative_to_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join(".zed-ftp.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+                [connection]
+                host = "h"
+                user = "u"
+                password = "p"
+                [paths]
+                local_root  = "."
+                remote_root = "/"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        // "." + config-parent should resolve to the config's directory,
+        // regardless of what the current cwd is.
+        assert_eq!(cfg.paths.local_root, dir.path().join("."));
+    }
+
+    #[test]
+    fn absolute_local_root_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join(".zed-ftp.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+                [connection]
+                host = "h"
+                user = "u"
+                password = "p"
+                [paths]
+                local_root  = "/somewhere/else"
+                remote_root = "/"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        assert_eq!(cfg.paths.local_root, PathBuf::from("/somewhere/else"));
     }
 
     #[test]
