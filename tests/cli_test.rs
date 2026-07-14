@@ -8,9 +8,55 @@ fn bin() -> Command {
 fn help_lists_subcommands() {
     let out = bin().arg("--help").output().unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
-    for cmd in ["init", "status", "pull", "push", "sync"] {
+    for cmd in ["init", "status", "pull", "push", "sync", "rm"] {
         assert!(stdout.contains(cmd), "missing subcommand: {cmd}");
     }
+}
+
+#[test]
+fn rm_requires_at_least_one_path() {
+    // Bare `rm` must refuse rather than delete anything. The distinctive
+    // message (not clap's "unrecognized subcommand") proves our own guard
+    // fired, and it must happen before any config/connection work.
+    let out = bin().arg("rm").output().unwrap();
+    assert!(!out.status.success(), "bare rm should exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("at least one path"),
+        "expected 'at least one path' guard; stderr={stderr}",
+    );
+}
+
+#[test]
+fn rm_rejects_unsafe_paths() {
+    // A `..` path must be refused before we touch the server. Provide a valid
+    // config so we get past config-load and reach path validation.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join(".zed-ftp.toml");
+    std::fs::write(
+        &cfg_path,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let out = bin()
+        .args(["rm", "../escape", "--config"])
+        .arg(&cfg_path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "rm ../escape should exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing path"),
+        "expected 'refusing path' guard; stderr={stderr}",
+    );
 }
 
 #[test]

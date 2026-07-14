@@ -4,6 +4,7 @@ pub mod ls;
 pub mod pull;
 pub mod push;
 pub mod remote_hash;
+pub mod rm;
 pub mod status;
 pub mod sync;
 pub mod walk;

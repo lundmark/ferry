@@ -92,6 +92,15 @@ impl Ftp {
         Ok(())
     }
 
+    /// Remove a remote directory. The server requires it to be empty; callers
+    /// that want a recursive delete must remove the contents first and invoke
+    /// `rmdir` bottom-up.
+    pub fn rmdir(&mut self, path: &str) -> Result<()> {
+        self.inner.rmdir(path)
+            .with_context(|| format!("ftp rmdir {path}"))?;
+        Ok(())
+    }
+
     /// Create a remote directory. Returns Ok if the directory was created OR
     /// already exists. Other errors are propagated.
     ///

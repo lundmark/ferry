@@ -6,7 +6,7 @@
 //! own deliberate command.
 
 use crate::commands::remote_hash;
-use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::commands::walk::{remote_join, safe_rel, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
@@ -43,23 +43,19 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
         walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
     } else {
         for p in paths {
-            let rel = normalize_rel(p);
-            if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
-                anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
-            }
-            let rel_no_slash = rel.trim_end_matches('/');
-            let local_full = local_root.join(rel_no_slash);
+            let rel_no_slash = safe_rel(p)?;
+            let local_full = local_root.join(&rel_no_slash);
             if local_full.is_dir() {
                 walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;
             } else if local_full.is_file() {
-                local_paths.insert(rel_no_slash.to_string());
+                local_paths.insert(rel_no_slash.clone());
             }
-            match walk_remote(&mut ftp, &cfg.paths.remote_root, rel_no_slash, &mut remote_paths) {
+            match walk_remote(&mut ftp, &cfg.paths.remote_root, &rel_no_slash, &mut remote_paths) {
                 Ok(()) => {}
                 Err(_) => {
-                    let remote_path = remote_join(&cfg.paths.remote_root, rel_no_slash);
+                    let remote_path = remote_join(&cfg.paths.remote_root, &rel_no_slash);
                     if ftp.size(&remote_path).is_ok() {
-                        remote_paths.insert(rel_no_slash.to_string());
+                        remote_paths.insert(rel_no_slash.clone());
                     }
                 }
             }
@@ -175,13 +171,6 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Normalize a user-supplied path argument into the relative form used as
-/// state-file keys: forward slashes, no leading `./`.
-fn normalize_rel(p: &str) -> String {
-    let s = p.replace('\\', "/");
-    s.trim_start_matches("./").to_string()
 }
 
 /// Upload `bytes` to `remote_path` atomically (via temp + rename) and refresh

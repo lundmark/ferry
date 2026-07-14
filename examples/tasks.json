@@ -14,6 +14,13 @@
     "reveal": "on_error"
   },
   {
+    "label": "FTP: delete current file",
+    "command": "zed-ftp",
+    "args": ["rm", "$ZED_RELATIVE_FILE"],
+    "use_new_terminal": false,
+    "reveal": "on_error"
+  },
+  {
     "label": "FTP: status",
     "command": "zed-ftp",
     "args": ["status"],

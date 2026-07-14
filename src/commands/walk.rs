@@ -11,6 +11,23 @@ pub fn remote_join(root: &str, rel: &str) -> String {
     format!("{}/{}", root, rel)
 }
 
+/// Normalize and validate a user-supplied path argument into the relative form
+/// used as state-file keys: forward slashes, no leading `./`, no trailing `/`.
+///
+/// Rejects paths that are empty, absolute, or contain a `..` segment — these
+/// could escape the sync roots. Shared by `push` and `rm` so both enforce the
+/// same containment rule.
+pub fn safe_rel(p: &str) -> Result<String> {
+    let s = p.replace('\\', "/");
+    let rel = s.trim_start_matches("./").to_string();
+    if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
+        anyhow::bail!(
+            "refusing path {p:?}: must be a relative path under local_root with no '..' segments"
+        );
+    }
+    Ok(rel.trim_end_matches('/').to_string())
+}
+
 /// Walk the local mirror, populating `out` with relative paths (forward-slash
 /// separated). Skips files matched by the ignore matcher and the `.zed-ftp`
 /// state directory.
@@ -113,4 +130,33 @@ fn walk_remote_inner(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_rel_normalizes_and_strips_dot_slash_and_trailing_slash() {
+        assert_eq!(safe_rel("./src/x.html").unwrap(), "src/x.html");
+        assert_eq!(safe_rel("src/old/").unwrap(), "src/old");
+        assert_eq!(safe_rel("notes.txt").unwrap(), "notes.txt");
+    }
+
+    #[test]
+    fn safe_rel_rejects_empty() {
+        assert!(safe_rel("").is_err());
+        assert!(safe_rel("./").is_err());
+    }
+
+    #[test]
+    fn safe_rel_rejects_absolute() {
+        assert!(safe_rel("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn safe_rel_rejects_parent_segments() {
+        assert!(safe_rel("../escape").is_err());
+        assert!(safe_rel("a/../../b").is_err());
+    }
 }

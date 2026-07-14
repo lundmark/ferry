@@ -36,6 +36,10 @@ enum Cmd {
     Push { paths: Vec<String>, #[arg(long)] force: bool },
     /// Pull then push; refuses on conflict unless --force.
     Sync { #[arg(long)] force: bool },
+    /// Delete files on the remote server and the local mirror (and drop their
+    /// state records). Requires explicit paths; pass --recursive to delete a
+    /// directory subtree.
+    Rm { paths: Vec<String>, #[arg(long)] recursive: bool },
 }
 
 /// Exit codes (consumed by Zed's `tasks.json`):
@@ -60,6 +64,7 @@ fn run() -> i32 {
         Cmd::Pull { paths, force } => zed_ftp::commands::pull::run(&cfg, &paths, force),
         Cmd::Push { paths, force } => zed_ftp::commands::push::run(&cfg, &paths, force),
         Cmd::Sync { force } => zed_ftp::commands::sync::run(&cfg, force),
+        Cmd::Rm { paths, recursive } => zed_ftp::commands::rm::run(&cfg, &paths, recursive),
     };
     match result {
         Ok(()) => 0,

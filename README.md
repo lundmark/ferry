@@ -1,7 +1,7 @@
 # zed-ftp
 
 A small Rust CLI that gives [Zed](https://zed.dev) editor users an FTP sync
-workflow — `push`, `pull`, `sync`, `status`, and `init` — designed to be
+workflow — `push`, `pull`, `sync`, `status`, `rm`, and `init` — designed to be
 triggered from `.zed/tasks.json` so you can map them to keybindings or the
 command palette.
 
@@ -51,11 +51,18 @@ Zed, open the command palette and run `task: spawn` to pick one of:
 
 - `FTP: push current file`
 - `FTP: pull current file`
+- `FTP: delete current file`
 - `FTP: status`
 - `FTP: sync all`
 
 The per-file tasks use Zed's `$ZED_RELATIVE_FILE` variable so they operate on
 whichever buffer is active.
+
+`FTP: delete current file` runs `zed-ftp rm`, which removes the file on the
+server **and** the local copy (and drops its sync record). It is deliberately
+destructive and does not prompt, so it only ever acts on the paths you name —
+a bare `rm` with no path is refused. To delete a whole directory subtree, run
+`zed-ftp rm --recursive <dir>` from a terminal.
 
 ## Claude Code / Codex hook
 
