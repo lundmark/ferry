@@ -1,5 +1,5 @@
 [package]
-name = "zed-ftp"
+name = "ferry"
 version = "0.1.0"
 edition = "2024"
 
@@ -24,13 +24,13 @@ tempfile = "3"
 testcontainers = { version = "0.20", features = ["blocking"] }
 
 [[bin]]
-name = "zed-ftp"
+name = "ferry"
 path = "src/main.rs"
 
 [[bin]]
-name = "zed-ftp-lsp"
-path = "src/bin/zed-ftp-lsp.rs"
+name = "ferry-lsp"
+path = "src/bin/ferry-lsp.rs"
 
 [lib]
-name = "zed_ftp"
+name = "ferry"
 path = "src/lib.rs"

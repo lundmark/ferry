@@ -1,6 +1,6 @@
-//! `zed-ftp ls [PATH]` — minimal remote listing for connectivity smoke tests.
+//! `ferry ls [PATH]` — minimal remote listing for connectivity smoke tests.
 //!
-//! Reads only `[connection]` + `[paths]` from `.zed-ftp.toml`; doesn't touch
+//! Reads only `[connection]` + `[paths]` from `.ferry.toml`; doesn't touch
 //! state, doesn't walk local. PATH is optional: empty means list the
 //! configured `remote_root`.
 

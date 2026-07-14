@@ -5,7 +5,7 @@ use testcontainers::{
     runners::SyncRunner,
     Container, GenericImage, ImageExt,
 };
-use zed_ftp::ftp::Ftp;
+use ferry::ftp::Ftp;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -18,7 +18,7 @@ fn start_ftp() -> (String, u16, Container<GenericImage>) {
 }
 
 fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".zed-ftp.toml");
+    let cfg_path = local_root.join(".ferry.toml");
     let cfg = format!(
         r#"
 [connection]
@@ -41,7 +41,7 @@ remote_root = "/"
 }
 
 fn run_rm(cfg_path: &std::path::Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zed-ftp"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ferry"));
     cmd.arg("--config").arg(cfg_path).arg("rm");
     for a in args {
         cmd.arg(a);
@@ -63,13 +63,13 @@ fn rm_deletes_file_remote_local_and_state() {
     std::fs::write(local_root.join("notes.txt"), bytes).unwrap();
 
     // Seed a state entry so we can prove rm drops it.
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "notes.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: "whatever".into(),
             size: bytes.len() as u64,
             remote_mtime: now,
@@ -90,7 +90,7 @@ fn rm_deletes_file_remote_local_and_state() {
     assert!(ftp.size("/notes.txt").is_err(), "remote file should be gone");
     assert!(!local_root.join("notes.txt").exists(), "local file should be gone");
     let new_state =
-        zed_ftp::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
+        ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
     assert!(!new_state.files.contains_key("notes.txt"), "state entry should be dropped");
 }
 

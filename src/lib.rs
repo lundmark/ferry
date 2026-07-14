@@ -4,6 +4,7 @@ pub mod error;
 pub mod ftp;
 pub mod hash;
 pub mod ignored;
+pub mod names;
 pub mod state;
 
 pub use error::Exit;

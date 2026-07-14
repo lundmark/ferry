@@ -5,8 +5,8 @@ use testcontainers::{
     runners::SyncRunner,
     Container, GenericImage, ImageExt,
 };
-use zed_ftp::ftp::Ftp;
-use zed_ftp::hash::hash_bytes;
+use ferry::ftp::Ftp;
+use ferry::hash::hash_bytes;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -44,13 +44,13 @@ fn status_reports_per_file_state() {
     std::fs::write(local_root.join("local_only.txt"), b"only here\n").unwrap();
 
     // Pre-populate state with known-good entries.
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "in_sync.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(in_sync_contents),
             size: in_sync_contents.len() as u64,
             remote_mtime: now,
@@ -59,7 +59,7 @@ fn status_reports_per_file_state() {
     );
     state.files.insert(
         "remote_changed.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(original),
             size: original.len() as u64,
             remote_mtime: now,
@@ -69,7 +69,7 @@ fn status_reports_per_file_state() {
     state.save(&state_dir.join("state.json")).unwrap();
 
     // Write the config pointing at the container.
-    let cfg_path = local_root.join(".zed-ftp.toml");
+    let cfg_path = local_root.join(".ferry.toml");
     let cfg = format!(
         r#"
 [connection]
@@ -89,7 +89,7 @@ remote_root = "/"
     );
     std::fs::write(&cfg_path, cfg).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("status")
@@ -97,7 +97,7 @@ remote_root = "/"
         .unwrap();
     assert!(
         out.status.success(),
-        "zed-ftp status failed: stdout={} stderr={}",
+        "ferry status failed: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );

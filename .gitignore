@@ -1,3 +1,6 @@
 target/
+.ferry.toml
+.ferry/
+# Legacy names, kept ignored until existing projects migrate to .ferry.*
 .zed-ftp.toml
 .zed-ftp/

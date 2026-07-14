@@ -29,7 +29,7 @@ pub fn safe_rel(p: &str) -> Result<String> {
 }
 
 /// Walk the local mirror, populating `out` with relative paths (forward-slash
-/// separated). Skips files matched by the ignore matcher and the `.zed-ftp`
+/// separated). Skips files matched by the ignore matcher and the `.ferry`
 /// state directory.
 pub fn walk_local(
     root: &Path,
@@ -49,7 +49,7 @@ pub fn walk_local(
         }
         if is_dir {
             // Skip the state directory itself.
-            if path.file_name().and_then(|s| s.to_str()) == Some(".zed-ftp") {
+            if path.file_name().and_then(|s| s.to_str()) == Some(crate::names::STATE_DIR) {
                 continue;
             }
             walk_local(root, &path, matcher, out)?;

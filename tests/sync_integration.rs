@@ -5,8 +5,8 @@ use testcontainers::{
     runners::SyncRunner,
     Container, GenericImage, ImageExt,
 };
-use zed_ftp::ftp::Ftp;
-use zed_ftp::hash::hash_bytes;
+use ferry::ftp::Ftp;
+use ferry::hash::hash_bytes;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -19,7 +19,7 @@ fn start_ftp() -> (String, u16, Container<GenericImage>) {
 }
 
 fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".zed-ftp.toml");
+    let cfg_path = local_root.join(".ferry.toml");
     let cfg = format!(
         r#"
 [connection]
@@ -55,13 +55,13 @@ fn sync_noop_when_in_sync() {
     std::fs::write(local_root.join("agree.txt"), bytes).unwrap();
 
     // Seed state so local == remote == known → InSync.
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "agree.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(bytes),
             size: bytes.len() as u64,
             remote_mtime: now,
@@ -73,7 +73,7 @@ fn sync_noop_when_in_sync() {
 
     let cfg_path = write_config(local_root, &host, port);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("sync")
@@ -131,13 +131,13 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     // Seed state so:
     //   local-changed.txt:  known = local_changed_known → local != known, remote == known → LocalChanged
     //   remote-changed.txt: known = remote_changed_known → local == known, remote != known → RemoteChanged
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "local-changed.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(local_changed_known),
             size: local_changed_known.len() as u64,
             remote_mtime: now,
@@ -146,7 +146,7 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     );
     state.files.insert(
         "remote-changed.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(remote_changed_known),
             size: remote_changed_known.len() as u64,
             remote_mtime: now,
@@ -157,7 +157,7 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
 
     let cfg_path = write_config(local_root, &host, port);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("sync")
@@ -186,7 +186,7 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
 
     // State should now reflect the post-sync hashes for both files.
     let new_state =
-        zed_ftp::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
+        ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
     let lc_rec = new_state.files.get("local-changed.txt").expect("local-changed in state");
     assert_eq!(lc_rec.sha256, hash_bytes(local_changed_new));
     assert_eq!(lc_rec.size, local_changed_new.len() as u64);
@@ -215,13 +215,13 @@ fn sync_refuses_both_changed_then_obeys_force() {
 
     // Seed state with the original "known" hash — neither side matches it now,
     // and they differ from each other → BothChanged.
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "conflict.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(known_bytes),
             size: known_bytes.len() as u64,
             remote_mtime: now,
@@ -233,7 +233,7 @@ fn sync_refuses_both_changed_then_obeys_force() {
     let cfg_path = write_config(local_root, &host, port);
 
     // Without --force: sync should fail; neither side should be modified.
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("sync")
@@ -257,7 +257,7 @@ fn sync_refuses_both_changed_then_obeys_force() {
     );
 
     // With --force: local should win — sync uploads local over remote.
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("sync")
@@ -280,7 +280,7 @@ fn sync_refuses_both_changed_then_obeys_force() {
     assert_eq!(local_after_force, local_bytes, "local should still be local");
 
     let new_state =
-        zed_ftp::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
+        ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
     let rec = new_state.files.get("conflict.txt").expect("entry present");
     assert_eq!(rec.sha256, hash_bytes(local_bytes));
     assert_eq!(rec.size, local_bytes.len() as u64);

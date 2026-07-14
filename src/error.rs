@@ -1,4 +1,4 @@
-//! Typed exit conditions for `zed-ftp`.
+//! Typed exit conditions for `ferry`.
 //!
 //! These are returned from command modules wrapped in [`anyhow::Error`] so
 //! callers can continue to use `?` and `with_context(...)` freely while

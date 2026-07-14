@@ -1,4 +1,4 @@
-//! Integration tests for `zed-ftp init`. The non-ignored tests do NOT
+//! Integration tests for `ferry init`. The non-ignored tests do NOT
 //! require Docker — they cover the `--no-validate` flow which doesn't
 //! touch FTP. The `#[ignore]`d test at the bottom exercises the full
 //! validation flow against a vsftpd container; run with:
@@ -10,10 +10,10 @@ use std::process::{Command, Stdio};
 #[test]
 fn init_writes_config_and_updates_gitignore() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join(".zed-ftp.toml");
+    let cfg_path = dir.path().join(".ferry.toml");
     let cwd = dir.path();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["init", "--no-validate", "--config", cfg_path.to_str().unwrap()])
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -44,8 +44,8 @@ fn init_writes_config_and_updates_gitignore() {
 
     let gi_path = cwd.join(".gitignore");
     let gi = std::fs::read_to_string(&gi_path).unwrap();
-    assert!(gi.contains(".zed-ftp.toml"));
-    assert!(gi.contains(".zed-ftp/"));
+    assert!(gi.contains(".ferry.toml"));
+    assert!(gi.contains(".ferry/"));
 }
 
 /// Exercises the full validating init flow against a real FTP server.
@@ -56,7 +56,7 @@ fn init_writes_config_and_updates_gitignore() {
 /// - local:  `shared.txt` ("X"), `local_only.txt` ("L"), `differs.txt` ("local-version")
 ///
 /// We answer 'k' to the `differs.txt` prompt, so neither side is touched
-/// and only `shared.txt` ends up seeded into `.zed-ftp/state.json`.
+/// and only `shared.txt` ends up seeded into `.ferry/state.json`.
 #[test]
 #[ignore]
 fn validates_existing_local_against_remote() {
@@ -65,7 +65,7 @@ fn validates_existing_local_against_remote() {
         runners::SyncRunner,
         GenericImage, ImageExt,
     };
-    use zed_ftp::ftp::Ftp;
+    use ferry::ftp::Ftp;
 
     // Spin up the FTP server. Same image + creds as tests/ftp_integration.rs
     // so we share the pattern reviewers already know.
@@ -92,9 +92,9 @@ fn validates_existing_local_against_remote() {
     std::fs::write(local_root.join("local_only.txt"), b"L").unwrap();
     std::fs::write(local_root.join("differs.txt"), b"local-version").unwrap();
 
-    let cfg_path = local_root.join(".zed-ftp.toml");
+    let cfg_path = local_root.join(".ferry.toml");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["init", "--config", cfg_path.to_str().unwrap()])
         .current_dir(local_root)
         .stdin(Stdio::piped())
@@ -121,12 +121,12 @@ fn validates_existing_local_against_remote() {
     );
 
     // Config landed on disk.
-    assert!(cfg_path.exists(), ".zed-ftp.toml should have been written");
+    assert!(cfg_path.exists(), ".ferry.toml should have been written");
 
     // State file should exist and contain ONLY shared.txt.
-    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_path = local_root.join(".ferry").join("state.json");
     let state_text = std::fs::read_to_string(&state_path)
-        .expect(".zed-ftp/state.json should have been seeded");
+        .expect(".ferry/state.json should have been seeded");
     assert!(state_text.contains("shared.txt"), "state missing shared.txt: {state_text}");
     assert!(
         !state_text.contains("local_only.txt"),
@@ -159,10 +159,10 @@ fn validates_existing_local_against_remote() {
 #[test]
 fn init_refuses_when_config_exists() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join(".zed-ftp.toml");
+    let cfg_path = dir.path().join(".ferry.toml");
     std::fs::write(&cfg_path, "junk").unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .args(["init", "--no-validate", "--config", cfg_path.to_str().unwrap()])
         .current_dir(dir.path())
         .stdin(Stdio::null())

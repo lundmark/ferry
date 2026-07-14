@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "zed-ftp", version, about = "FTP sync helper for Zed projects")]
+#[command(name = "ferry", version, about = "FTP sync helper for editors and coding agents")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -46,7 +46,7 @@ enum Cmd {
 /// - 0 success
 /// - 1 generic error (default for anything we don't classify)
 /// - 2 conflict — refused without `--force`
-/// - 3 config or auth problem — Zed should prompt to fix `.zed-ftp.toml`
+/// - 3 config or auth problem — Zed should prompt to fix `.ferry.toml`
 ///   rather than retry blindly
 fn main() {
     let code = run();
@@ -55,22 +55,34 @@ fn main() {
 
 fn run() -> i32 {
     let cli = Cli::parse();
-    let cfg = cli.config.unwrap_or_else(|| std::path::PathBuf::from(".zed-ftp.toml"));
+    let explicit_config = cli.config.is_some();
+    let cfg = cli
+        .config
+        .unwrap_or_else(|| std::path::PathBuf::from(ferry::names::CONFIG_FILE));
+    // Auto-migrate legacy `.zed-ftp` config/state to the current `.ferry` names
+    // when using the default config location. Best-effort: a migration failure
+    // is a warning, not a hard stop — the command below will surface any real
+    // "config not found" error itself.
+    if !explicit_config {
+        if let Err(e) = ferry::names::migrate_legacy(std::path::Path::new(".")) {
+            eprintln!("warning: {e:#}");
+        }
+    }
     let result: anyhow::Result<()> = match cli.cmd {
-        Cmd::Init { no_validate } => zed_ftp::commands::init::run(&cfg, no_validate),
-        Cmd::Ls { path } => zed_ftp::commands::ls::run(&cfg, path.as_deref()),
-        Cmd::Hook { cooldown } => zed_ftp::commands::hook::run(cooldown),
-        Cmd::Status => zed_ftp::commands::status::run(&cfg),
-        Cmd::Pull { paths, force } => zed_ftp::commands::pull::run(&cfg, &paths, force),
-        Cmd::Push { paths, force } => zed_ftp::commands::push::run(&cfg, &paths, force),
-        Cmd::Sync { force } => zed_ftp::commands::sync::run(&cfg, force),
-        Cmd::Rm { paths, recursive } => zed_ftp::commands::rm::run(&cfg, &paths, recursive),
+        Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate),
+        Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
+        Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown),
+        Cmd::Status => ferry::commands::status::run(&cfg),
+        Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force),
+        Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force),
+        Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force),
+        Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive),
     };
     match result {
         Ok(()) => 0,
         Err(e) => {
             // `{:#}` expands the full anyhow context chain on one line so
-            // users see e.g. "config: reading .zed-ftp.toml: No such file…"
+            // users see e.g. "config: reading .ferry.toml: No such file…"
             // rather than just the outermost message.
             eprintln!("error: {e:#}");
             classify_exit(&e)
@@ -82,7 +94,7 @@ fn run() -> i32 {
 /// error and the entire `.chain()` so an `Exit::*` wrapped by a later
 /// `.with_context(...)` still resolves to its specific exit code.
 fn classify_exit(e: &anyhow::Error) -> i32 {
-    use zed_ftp::Exit;
+    use ferry::Exit;
     // anyhow's downcast_ref looks at the root; if the Exit was wrapped by
     // `.context(...)` later it won't match here, hence the chain walk below.
     if let Some(exit) = e.downcast_ref::<Exit>() {
@@ -96,8 +108,8 @@ fn classify_exit(e: &anyhow::Error) -> i32 {
     1
 }
 
-fn code_for(exit: &zed_ftp::Exit) -> i32 {
-    use zed_ftp::Exit;
+fn code_for(exit: &ferry::Exit) -> i32 {
+    use ferry::Exit;
     match exit {
         Exit::Conflict(_) => 2,
         Exit::Config(_) | Exit::Auth(_) => 3,

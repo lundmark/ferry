@@ -1,4 +1,4 @@
-//! `zed-ftp pull` — one-way download from remote into the local mirror.
+//! `ferry pull` — one-way download from remote into the local mirror.
 //!
 //! Pull is asymmetric with push by design: it only ever writes local files;
 //! it never deletes locally just because the remote is missing a file. That
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
@@ -242,7 +242,7 @@ fn normalize_rel(p: &str) -> String {
 pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let mut ftp = Ftp::connect(

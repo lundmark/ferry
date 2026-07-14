@@ -4,7 +4,7 @@ use testcontainers::{
     runners::SyncRunner,
     Container, GenericImage, ImageExt,
 };
-use zed_ftp::ftp::Ftp;
+use ferry::ftp::Ftp;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")

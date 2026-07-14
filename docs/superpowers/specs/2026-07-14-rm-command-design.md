@@ -1,10 +1,10 @@
-# `zed-ftp rm` — delete files on the server (and locally)
+# `ferry rm` — delete files on the server (and locally)
 
 Date: 2026-07-14
 
 ## Problem
 
-`zed-ftp` can `push`, `pull`, `sync`, and `status`, but it has no way to
+`ferry` can `push`, `pull`, `sync`, and `status`, but it has no way to
 delete a file on the remote server. Deletion was deliberately kept out of
 `push` — `push.rs` already documents that a locally-missing file is "not
 yours to delete" and that `rm` is "its own deliberate command." This spec
@@ -29,7 +29,7 @@ fills that gap.
 ## Command surface
 
 ```
-zed-ftp rm <paths...> [--recursive]
+ferry rm <paths...> [--recursive]
 ```
 
 - New `Rm { paths: Vec<String>, recursive: bool }` subcommand in `main.rs`,

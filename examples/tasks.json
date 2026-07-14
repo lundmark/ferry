@@ -1,34 +1,34 @@
 [
   {
     "label": "FTP: push current file",
-    "command": "zed-ftp",
+    "command": "ferry",
     "args": ["push", "$ZED_RELATIVE_FILE"],
     "use_new_terminal": false,
     "reveal": "on_error"
   },
   {
     "label": "FTP: pull current file",
-    "command": "zed-ftp",
+    "command": "ferry",
     "args": ["pull", "$ZED_RELATIVE_FILE"],
     "use_new_terminal": false,
     "reveal": "on_error"
   },
   {
     "label": "FTP: delete current file",
-    "command": "zed-ftp",
+    "command": "ferry",
     "args": ["rm", "$ZED_RELATIVE_FILE"],
     "use_new_terminal": false,
     "reveal": "on_error"
   },
   {
     "label": "FTP: status",
-    "command": "zed-ftp",
+    "command": "ferry",
     "args": ["status"],
     "reveal": "always"
   },
   {
     "label": "FTP: sync all",
-    "command": "zed-ftp",
+    "command": "ferry",
     "args": ["sync"],
     "reveal": "always"
   }

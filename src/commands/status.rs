@@ -12,7 +12,7 @@ use std::path::Path;
 pub fn run(config_path: &Path) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;

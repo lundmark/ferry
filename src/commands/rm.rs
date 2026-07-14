@@ -1,4 +1,4 @@
-//! `zed-ftp rm` — delete files on the remote server, the local mirror, and the
+//! `ferry rm` — delete files on the remote server, the local mirror, and the
 //! state record, in one deliberate command.
 //!
 //! Unlike `push`/`pull`/`sync`, `rm` is destructive by intent: it performs no
@@ -30,7 +30,7 @@ pub fn run(config_path: &Path, paths: &[String], recursive: bool) -> Result<()> 
     let rels: Vec<String> = paths.iter().map(|p| safe_rel(p)).collect::<Result<_>>()?;
 
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
     let mut state = StateFile::load_or_default(&state_path)?;
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
 

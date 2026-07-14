@@ -533,6 +533,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "ferry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ignore",
+ "lsp-server",
+ "lsp-types",
+ "percent-encoding",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "suppaftp",
+ "tempfile",
+ "testcontainers",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3242,28 +3264,6 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
-]
-
-[[package]]
-name = "zed-ftp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "ignore",
- "lsp-server",
- "lsp-types",
- "percent-encoding",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "suppaftp",
- "tempfile",
- "testcontainers",
- "thiserror 1.0.69",
- "toml",
 ]
 
 [[package]]

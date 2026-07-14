@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "zed-ftp hook"
+            "command": "ferry hook"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "zed-ftp hook --cooldown 3600"
+            "command": "ferry hook --cooldown 3600"
           }
         ]
       }

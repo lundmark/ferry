@@ -1,7 +1,7 @@
-//! `zed-ftp hook` — Claude Code / Codex PreToolUse hook.
+//! `ferry hook` — Claude Code / Codex PreToolUse hook.
 //!
 //! Reads a hook-envelope JSON object from stdin, extracts the file path
-//! from the tool's inputs, and — if the file lives under a zed-ftp
+//! from the tool's inputs, and — if the file lives under a ferry
 //! project — pulls it (with a configurable cooldown). Always exits 0
 //! so the LLM's tool call is never blocked; failures are surfaced on
 //! stderr, which the hosting agent shows to the user.
@@ -57,14 +57,25 @@ pub fn run(cooldown_secs: i64) -> Result<()> {
         return Ok(());
     }
 
-    // Walk up to find .zed-ftp.toml. If none, we're not in a zed-ftp
-    // project; the tool call has nothing to do with FTP.
-    let config_path = match find_config_upward(file_path) {
+    // Walk up to find a project root (holding the config file, under either the
+    // current or the legacy name). If none, we're not in a ferry project; the
+    // tool call has nothing to do with FTP.
+    let root = match find_project_dir_upward(file_path) {
         Some(p) => p,
         None => return Ok(()),
     };
-    let root = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let rel = match file_path.strip_prefix(root) {
+    // Best-effort one-time rename of legacy .zed-ftp files. Never fail the hook
+    // over it — a rename that can't happen (e.g. read-only FS) just means we
+    // fall back to reading the legacy names below.
+    if let Err(e) = crate::names::migrate_legacy(&root) {
+        eprintln!("ferry hook: migration warning: {e:#}");
+    }
+    // Prefer the current names; tolerate legacy ones if migration couldn't run
+    // so the hook keeps working rather than silently going dark.
+    let config_path = existing_or(&root, crate::names::CONFIG_FILE, crate::names::LEGACY_CONFIG_FILE);
+    let state_dir = existing_or(&root, crate::names::STATE_DIR, crate::names::LEGACY_STATE_DIR);
+
+    let rel = match file_path.strip_prefix(&root) {
         Ok(r) => r.to_string_lossy().replace('\\', "/"),
         Err(_) => return Ok(()),
     };
@@ -72,15 +83,15 @@ pub fn run(cooldown_secs: i64) -> Result<()> {
     // Cooldown check. If the state entry's last_synced is within the
     // cooldown window, skip the pull.
     // (Loading Config is deferred until we know we're going to act, so a
-    // malformed .zed-ftp.toml doesn't kill unrelated tool calls.)
-    let state_path = root.join(".zed-ftp").join("state.json");
+    // malformed config doesn't kill unrelated tool calls.)
+    let state_path = state_dir.join("state.json");
     if let Ok(state) = StateFile::load_or_default(&state_path) {
         if let Some(record) = state.files.get(&rel) {
             let elapsed = Utc::now().signed_duration_since(record.last_synced);
             if elapsed.num_seconds() >= 0 && elapsed.num_seconds() < cooldown_secs {
                 let tool = input.tool_name.as_deref().unwrap_or("<unknown>");
                 eprintln!(
-                    "zed-ftp hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull"
+                    "ferry hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull"
                 );
                 return Ok(());
             }
@@ -95,27 +106,42 @@ pub fn run(cooldown_secs: i64) -> Result<()> {
     // install the hook.
     match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ true) {
         Ok(true) => {
-            eprintln!("zed-ftp hook: pulled {rel}");
+            eprintln!("ferry hook: pulled {rel}");
         }
         Ok(false) => {
             // Already in sync (or local-only). No output needed.
         }
         Err(e) => {
             // Don't fail the hook — deny would surprise the user. Just log.
-            eprintln!("zed-ftp hook: pull {rel} failed: {e:#}");
+            eprintln!("ferry hook: pull {rel} failed: {e:#}");
         }
     }
     Ok(())
 }
 
-fn find_config_upward(start: &Path) -> Option<PathBuf> {
+/// Walk up from `start` to the nearest ancestor directory that holds the config
+/// file under either the current (`.ferry.toml`) or legacy (`.zed-ftp.toml`)
+/// name. Matching both lets the hook detect — and then migrate — a project that
+/// predates the rename.
+fn find_project_dir_upward(start: &Path) -> Option<PathBuf> {
+    use crate::names::{CONFIG_FILE, LEGACY_CONFIG_FILE};
     let mut current = start.parent()?;
     loop {
-        let candidate = current.join(".zed-ftp.toml");
-        if candidate.exists() {
-            return Some(candidate);
+        if current.join(CONFIG_FILE).exists() || current.join(LEGACY_CONFIG_FILE).exists() {
+            return Some(current.to_path_buf());
         }
         current = current.parent()?;
+    }
+}
+
+/// Return `dir/preferred` if it exists, otherwise `dir/fallback`. Used to read
+/// through to legacy names when a migration couldn't be performed.
+fn existing_or(dir: &Path, preferred: &str, fallback: &str) -> PathBuf {
+    let p = dir.join(preferred);
+    if p.exists() {
+        p
+    } else {
+        dir.join(fallback)
     }
 }
 
@@ -146,22 +172,36 @@ mod tests {
     }
 
     #[test]
-    fn find_config_upward_finds_nested() {
+    fn find_project_dir_finds_nested_new_name() {
         let dir = tempfile::tempdir().unwrap();
         let deep = dir.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(dir.path().join(".zed-ftp.toml"), "").unwrap();
+        std::fs::write(dir.path().join(crate::names::CONFIG_FILE), "").unwrap();
         let file = deep.join("x.c");
         std::fs::write(&file, "").unwrap();
-        let found = find_config_upward(&file).unwrap();
-        assert_eq!(found, dir.path().join(".zed-ftp.toml"));
+        let found = find_project_dir_upward(&file).unwrap();
+        assert_eq!(found, dir.path());
     }
 
     #[test]
-    fn find_config_upward_returns_none_when_absent() {
+    fn find_project_dir_finds_legacy_name() {
+        // A project that predates the rename must still be discovered so it can
+        // be migrated.
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(dir.path().join(crate::names::LEGACY_CONFIG_FILE), "").unwrap();
+        let file = deep.join("x.c");
+        std::fs::write(&file, "").unwrap();
+        let found = find_project_dir_upward(&file).unwrap();
+        assert_eq!(found, dir.path());
+    }
+
+    #[test]
+    fn find_project_dir_returns_none_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("x.c");
         std::fs::write(&file, "").unwrap();
-        assert!(find_config_upward(&file).is_none());
+        assert!(find_project_dir_upward(&file).is_none());
     }
 }

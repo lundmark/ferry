@@ -1,8 +1,9 @@
 //! Minimal LSP server that pulls files from FTP whenever Zed opens them.
 //!
 //! On `textDocument/didOpen`, we walk up parent directories from the file to
-//! find a `.zed-ftp.toml`, compute the file's path relative to that config,
-//! and call `zed_ftp::commands::pull::run` synchronously. Everything else is a
+//! find the project root (holding `.ferry.toml`, or a legacy `.zed-ftp.toml`
+//! we migrate on sight), compute the file's path relative to that root, and
+//! call `ferry::commands::pull::run` synchronously. Everything else is a
 //! no-op.
 
 use std::path::{Path, PathBuf};
@@ -71,15 +72,14 @@ fn handle_did_open(connection: &Connection, uri_str: &str) {
     let Some(path) = uri_to_path(uri_str) else {
         return;
     };
-    let Some(config) = find_config(&path) else {
+    let Some(root) = find_project_dir(&path) else {
         return;
     };
-    // find_config always returns a path with a parent (the directory that
-    // contained the config file), but be defensive anyway.
-    let Some(root) = config.parent() else {
-        return;
-    };
-    let rel = match path.strip_prefix(root) {
+    // Best-effort one-time migration from the legacy `.zed-ftp` names; ignore
+    // failures so a read-only tree still gets served via the fallback below.
+    let _ = ferry::names::migrate_legacy(&root);
+    let config = existing_or(&root, ferry::names::CONFIG_FILE, ferry::names::LEGACY_CONFIG_FILE);
+    let rel = match path.strip_prefix(&root) {
         Ok(r) => r.to_string_lossy().into_owned(),
         Err(_) => return,
     };
@@ -87,21 +87,33 @@ fn handle_did_open(connection: &Connection, uri_str: &str) {
     // force=true: LSP-triggered auto-pull is an opt-in "always give me the
     // remote version" gesture. Users who have locally-modified files they
     // don't want overwritten should not install the LSP extension.
-    if let Err(e) = zed_ftp::commands::pull::run(&config, &[rel.clone()], true) {
-        show_warning(connection, format!("zed-ftp pull {rel}: {e:#}"));
+    if let Err(e) = ferry::commands::pull::run(&config, &[rel.clone()], true) {
+        show_warning(connection, format!("ferry pull {rel}: {e:#}"));
     }
 }
 
-/// Walk up parent directories from `start` looking for `.zed-ftp.toml`.
-/// Returns the path to the config file, or `None` if none is found.
-fn find_config(start: &Path) -> Option<PathBuf> {
+/// Walk up parent directories from `start` to the nearest project root, i.e. a
+/// directory holding the config file under the current (`.ferry.toml`) or
+/// legacy (`.zed-ftp.toml`) name. Returns the directory, or `None`.
+fn find_project_dir(start: &Path) -> Option<PathBuf> {
     let mut current = start.parent()?;
     loop {
-        let candidate = current.join(".zed-ftp.toml");
-        if candidate.exists() {
-            return Some(candidate);
+        if current.join(ferry::names::CONFIG_FILE).exists()
+            || current.join(ferry::names::LEGACY_CONFIG_FILE).exists()
+        {
+            return Some(current.to_path_buf());
         }
         current = current.parent()?;
+    }
+}
+
+/// Return `dir/preferred` if it exists, otherwise `dir/fallback`.
+fn existing_or(dir: &Path, preferred: &str, fallback: &str) -> PathBuf {
+    let p = dir.join(preferred);
+    if p.exists() {
+        p
+    } else {
+        dir.join(fallback)
     }
 }
 
@@ -144,35 +156,52 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn find_config_finds_nested_config() {
+    fn find_project_dir_finds_nested_config() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let config = root.join(".zed-ftp.toml");
-        fs::write(&config, "").unwrap();
+        fs::write(root.join(ferry::names::CONFIG_FILE), "").unwrap();
 
         let nested_dir = root.join("a/b/c");
         fs::create_dir_all(&nested_dir).unwrap();
         let file = nested_dir.join("foo.c");
         fs::write(&file, "").unwrap();
 
-        let found = find_config(&file).expect("should find config");
+        let found = find_project_dir(&file).expect("should find project dir");
         // Canonicalize both sides so /tmp -> /private/tmp differences on
         // macOS or symlinked temp dirs don't trip the equality check.
         assert_eq!(
             fs::canonicalize(&found).unwrap(),
-            fs::canonicalize(&config).unwrap()
+            fs::canonicalize(root).unwrap()
         );
     }
 
     #[test]
-    fn find_config_returns_none_when_absent() {
+    fn find_project_dir_finds_legacy_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join(ferry::names::LEGACY_CONFIG_FILE), "").unwrap();
+
+        let nested_dir = root.join("a/b");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let file = nested_dir.join("foo.c");
+        fs::write(&file, "").unwrap();
+
+        let found = find_project_dir(&file).expect("should find project dir via legacy name");
+        assert_eq!(
+            fs::canonicalize(&found).unwrap(),
+            fs::canonicalize(root).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_project_dir_returns_none_when_absent() {
         let tmp = TempDir::new().unwrap();
         let nested_dir = tmp.path().join("a/b/c");
         fs::create_dir_all(&nested_dir).unwrap();
         let file = nested_dir.join("foo.c");
         fs::write(&file, "").unwrap();
 
-        assert!(find_config(&file).is_none());
+        assert!(find_project_dir(&file).is_none());
     }
 
     #[test]

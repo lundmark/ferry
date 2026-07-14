@@ -5,8 +5,8 @@ use testcontainers::{
     runners::SyncRunner,
     Container, GenericImage, ImageExt,
 };
-use zed_ftp::ftp::Ftp;
-use zed_ftp::hash::hash_bytes;
+use ferry::ftp::Ftp;
+use ferry::hash::hash_bytes;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -19,7 +19,7 @@ fn start_ftp() -> (String, u16, Container<GenericImage>) {
 }
 
 fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".zed-ftp.toml");
+    let cfg_path = local_root.join(".ferry.toml");
     let cfg = format!(
         r#"
 [connection]
@@ -70,13 +70,13 @@ fn push_uploads_new_and_local_changed_files() {
     //   keep.txt   → local == remote == known → InSync (no upload expected)
     //   update.txt → local != known, remote == known → LocalChanged (uploads)
     //   newfile.txt → on local only → LocalOnly (uploads)
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "keep.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             sha256: hash_bytes(keep_bytes),
             size: keep_bytes.len() as u64,
             remote_mtime: now,
@@ -85,7 +85,7 @@ fn push_uploads_new_and_local_changed_files() {
     );
     state.files.insert(
         "update.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             // known == remote so classify() sees LocalChanged.
             sha256: hash_bytes(update_remote_original),
             size: update_remote_original.len() as u64,
@@ -97,7 +97,7 @@ fn push_uploads_new_and_local_changed_files() {
 
     let cfg_path = write_config(local_root, &host, port);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("push")
@@ -105,7 +105,7 @@ fn push_uploads_new_and_local_changed_files() {
         .unwrap();
     assert!(
         out.status.success(),
-        "zed-ftp push failed: stdout={} stderr={}",
+        "ferry push failed: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
@@ -130,7 +130,7 @@ fn push_uploads_new_and_local_changed_files() {
 
     // State should reflect the new hashes for the uploaded files.
     let new_state =
-        zed_ftp::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
+        ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
     let upd_rec = new_state.files.get("update.txt").expect("update.txt in state");
     assert_eq!(upd_rec.sha256, hash_bytes(update_local_new));
     assert_eq!(upd_rec.size, update_local_new.len() as u64);
@@ -158,13 +158,13 @@ fn push_refuses_remote_changed_without_force_and_obeys_force() {
     let local_bytes: &[u8] = b"original synced content\n";
     std::fs::write(local_root.join("edited.txt"), local_bytes).unwrap();
 
-    let state_dir = local_root.join(".zed-ftp");
+    let state_dir = local_root.join(".ferry");
     std::fs::create_dir_all(&state_dir).unwrap();
     let now = chrono::Utc::now();
-    let mut state = zed_ftp::state::StateFile::default();
+    let mut state = ferry::state::StateFile::default();
     state.files.insert(
         "edited.txt".into(),
-        zed_ftp::state::FileRecord {
+        ferry::state::FileRecord {
             // known == local so classify() sees RemoteChanged.
             sha256: hash_bytes(local_bytes),
             size: local_bytes.len() as u64,
@@ -177,7 +177,7 @@ fn push_refuses_remote_changed_without_force_and_obeys_force() {
     let cfg_path = write_config(local_root, &host, port);
 
     // Without --force: push should fail and the remote file should be untouched.
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("push")
@@ -196,7 +196,7 @@ fn push_refuses_remote_changed_without_force_and_obeys_force() {
     );
 
     // With --force: push should overwrite remote with local.
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("push")
@@ -213,7 +213,7 @@ fn push_refuses_remote_changed_without_force_and_obeys_force() {
     assert_eq!(after_force, local_bytes, "--force should overwrite remote");
 
     let new_state =
-        zed_ftp::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
+        ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
     let rec = new_state.files.get("edited.txt").expect("entry present");
     assert_eq!(rec.sha256, hash_bytes(local_bytes));
 }

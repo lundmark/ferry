@@ -1,5 +1,5 @@
 [package]
-name = "zed_ftp_extension"
+name = "ferry_extension"
 version = "0.1.0"
 edition = "2021"
 

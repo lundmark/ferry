@@ -1,7 +1,7 @@
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    Command::new(env!("CARGO_BIN_EXE_ferry"))
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn rm_rejects_unsafe_paths() {
     // A `..` path must be refused before we touch the server. Provide a valid
     // config so we get past config-load and reach path validation.
     let dir = tempfile::tempdir().unwrap();
-    let cfg_path = dir.path().join(".zed-ftp.toml");
+    let cfg_path = dir.path().join(".ferry.toml");
     std::fs::write(
         &cfg_path,
         r#"
@@ -62,7 +62,7 @@ remote_root = "/"
 #[test]
 fn missing_config_exits_3() {
     // A non-existent config path must surface as exit code 3 (config/auth
-    // category) so Zed's tasks.json can prompt the user to fix .zed-ftp.toml
+    // category) so Zed's tasks.json can prompt the user to fix .ferry.toml
     // rather than retry. Use a temp-dir path that's guaranteed not to exist.
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("nope.toml");

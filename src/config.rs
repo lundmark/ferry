@@ -52,7 +52,7 @@ impl Config {
             crate::error::Exit::Config(format!("parsing {}: {e}", path.display()))
         })?;
         // Resolve local_root relative to the config file's directory. Without
-        // this, invoking zed-ftp from a different CWD (as the Claude Code
+        // this, invoking ferry from a different CWD (as the Claude Code
         // hook does) makes `local_root = "."` point at the wrong tree.
         if cfg.paths.local_root.is_relative() {
             if let Some(parent) = path.parent() {
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn local_root_resolves_relative_to_config_file() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join(".zed-ftp.toml");
+        let cfg_path = dir.path().join(".ferry.toml");
         std::fs::write(
             &cfg_path,
             r#"
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn absolute_local_root_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join(".zed-ftp.toml");
+        let cfg_path = dir.path().join(".ferry.toml");
         std::fs::write(
             &cfg_path,
             r#"

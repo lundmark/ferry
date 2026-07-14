@@ -1,25 +1,25 @@
-# Zed FTP extension
+# Ferry extension
 
 Attaches a minimal language server to C files that shells out to
-`zed-ftp pull` whenever a file is opened. The LSP is a no-op otherwise —
+`ferry pull` whenever a file is opened. The LSP is a no-op otherwise —
 no completions, no diagnostics, no hover; its only job is to trigger a
 pull on `textDocument/didOpen`.
 
 ## Prerequisites
 
-1. Install the `zed-ftp` CLI and the `zed-ftp-lsp` binary. From the
+1. Install the `ferry` CLI and the `ferry-lsp` binary. From the
    repo root:
 
    ```
    cargo install --path .
    ```
 
-   That produces both `zed-ftp` and `zed-ftp-lsp` in `~/.cargo/bin`.
+   That produces both `ferry` and `ferry-lsp` in `~/.cargo/bin`.
    Make sure that directory is on your PATH.
 
-2. Configure a project by running `zed-ftp init` at the project root.
+2. Configure a project by running `ferry init` at the project root.
    The extension walks up from any opened file to find the nearest
-   `.zed-ftp.toml`; if none is found, the LSP silently no-ops.
+   `.ferry.toml`; if none is found, the LSP silently no-ops.
 
 ## Install the extension in Zed
 
@@ -35,7 +35,7 @@ and point it at this folder.
 ## Behaviour
 
 - On opening a `.c` or `.h` file anywhere under a project with a
-  `.zed-ftp.toml`, the LSP calls `zed-ftp pull <file> --force`.
+  `.ferry.toml`, the LSP calls `ferry pull <file> --force`.
 - `--force` is deliberate: the LSP scenario is "give me the current
   remote version." If you have locally-modified files you don't want
   overwritten, don't install this extension.
@@ -48,7 +48,7 @@ and point it at this folder.
 ## Caveats
 
 - Only `.c`/`.h` are attached by default. Add more languages under
-  `[language_servers.zed-ftp-lsp].languages` in `extension.toml`.
+  `[language_servers.ferry-lsp].languages` in `extension.toml`.
 - If the pull refuses (e.g. state divergence the design defines as a
   conflict), you'll see a warning notification but the editor still
   opens the local (stale) file.

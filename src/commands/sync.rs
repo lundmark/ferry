@@ -1,4 +1,4 @@
-//! `zed-ftp sync` — bidirectional reconciliation in a single pass.
+//! `ferry sync` — bidirectional reconciliation in a single pass.
 //!
 //! Sync walks the union of local + remote + state and applies the design's
 //! action matrix per file:
@@ -33,7 +33,7 @@ use std::path::Path;
 pub fn run(config_path: &Path, force: bool) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(".zed-ftp").join("state.json");
+    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;

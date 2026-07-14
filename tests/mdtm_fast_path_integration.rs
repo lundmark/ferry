@@ -38,7 +38,7 @@ use testcontainers::{
     runners::SyncRunner,
     Container, GenericImage, ImageExt,
 };
-use zed_ftp::ftp::Ftp;
+use ferry::ftp::Ftp;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -51,7 +51,7 @@ fn start_ftp() -> (String, u16, Container<GenericImage>) {
 }
 
 fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".zed-ftp.toml");
+    let cfg_path = local_root.join(".ferry.toml");
     let cfg = format!(
         r#"
 [connection]
@@ -92,7 +92,7 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
     // First sync: populates state.files["hello.txt"] with (sha256, size,
     // remote_mtime). After this, the fast path should fire on subsequent
     // status/sync runs against the same remote.
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("sync")
@@ -108,7 +108,7 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
 
     // Sanity: state recorded what we expect.
     let state =
-        zed_ftp::state::StateFile::load_or_default(&local_root.join(".zed-ftp/state.json")).unwrap();
+        ferry::state::StateFile::load_or_default(&local_root.join(".ferry/state.json")).unwrap();
     let rec = state.files.get("hello.txt").expect("hello.txt in state after sync");
     assert_eq!(rec.size, bytes.len() as u64);
 
@@ -116,7 +116,7 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
     // (mtime, size) recorded in state should match what the server reports,
     // so compute() skips the download and returns the cached hash. The
     // observable result is the InSync classification.
-    let out = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("status")
@@ -135,7 +135,7 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
     );
 
     // Run status again to make sure repeated fast-path hits stay stable.
-    let out2 = Command::new(env!("CARGO_BIN_EXE_zed-ftp"))
+    let out2 = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("status")
@@ -154,8 +154,8 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
     // happened to need the fast path on this file (cache miss because
     // sync wrote then we read same mtime). Either Some(true) or None is
     // acceptable; Some(false) would indicate a regression.
-    let state_after = zed_ftp::state::StateFile::load_or_default(
-        &local_root.join(".zed-ftp/state.json"),
+    let state_after = ferry::state::StateFile::load_or_default(
+        &local_root.join(".ferry/state.json"),
     )
     .unwrap();
     assert!(

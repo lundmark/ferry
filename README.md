@@ -1,15 +1,22 @@
-# zed-ftp
+# ferry
 
-A small Rust CLI that gives [Zed](https://zed.dev) editor users an FTP sync
-workflow — `push`, `pull`, `sync`, `status`, `rm`, and `init` — designed to be
-triggered from `.zed/tasks.json` so you can map them to keybindings or the
-command palette.
+A small Rust CLI for keeping a local project tree in sync with an FTP server —
+`push`, `pull`, `sync`, `status`, `rm`, and `init`. It's designed to be driven
+from an editor (e.g. [Zed](https://zed.dev)'s `.zed/tasks.json`) or from
+coding-agent PreToolUse hooks (Claude Code, Codex), so files are pulled and
+pushed as you and your agents work.
+
+> **Renamed from `zed-ftp`.** The binary is now `ferry`, the config file is
+> `.ferry.toml`, and state lives in `.ferry/`. Existing projects are migrated
+> automatically: the first time `ferry` runs in a project that still has
+> `.zed-ftp.toml` / `.zed-ftp/`, it renames them in place. Update any hook or
+> task wiring that referenced the old `zed-ftp` / `zed-ftp-lsp` binaries.
 
 ## Status
 
 Functional and unit-tested. The FTP integration tests are gated behind a live
 Docker daemon (they spin up a real `vsftpd` container), and the end-to-end
-smoke test of the Zed `tasks.json` flow has **not yet been run** in this
+smoke test of the editor `tasks.json` flow has **not yet been run** in this
 environment because Docker was unavailable. Expect to verify the round-trip
 against your own server before relying on it.
 
@@ -21,14 +28,14 @@ From a checkout of this repo:
 cargo install --path .
 ```
 
-This drops a `zed-ftp` binary into `~/.cargo/bin`.
+This drops a `ferry` binary into `~/.cargo/bin`.
 
 ## Quick start
 
 In your project root:
 
 ```sh
-zed-ftp init
+ferry init
 ```
 
 The wizard prompts for host, username, password, and remote root, then
@@ -37,10 +44,10 @@ Use `--no-validate` to skip the remote walk if you just want the config file
 written:
 
 ```sh
-zed-ftp init --no-validate
+ferry init --no-validate
 ```
 
-This writes a `.zed-ftp.toml` to the project root and appends it to
+This writes a `.ferry.toml` to the project root and appends it to
 `.gitignore`.
 
 ## Tasks.json integration
@@ -58,16 +65,16 @@ Zed, open the command palette and run `task: spawn` to pick one of:
 The per-file tasks use Zed's `$ZED_RELATIVE_FILE` variable so they operate on
 whichever buffer is active.
 
-`FTP: delete current file` runs `zed-ftp rm`, which removes the file on the
+`FTP: delete current file` runs `ferry rm`, which removes the file on the
 server **and** the local copy (and drops its sync record). It is deliberately
 destructive and does not prompt, so it only ever acts on the paths you name —
 a bare `rm` with no path is refused. To delete a whole directory subtree, run
-`zed-ftp rm --recursive <dir>` from a terminal.
+`ferry rm --recursive <dir>` from a terminal.
 
 ## Claude Code / Codex hook
 
 For LLM agents (Claude Code, Codex, etc.) that read and edit files on your
-behalf, register `zed-ftp hook` as a `PreToolUse` hook so every Read/Edit
+behalf, register `ferry hook` as a `PreToolUse` hook so every Read/Edit
 tool call auto-pulls the file from FTP first. There's a configurable
 cooldown (default 3600s) so a hot LLM turn doesn't hammer the server.
 
@@ -80,11 +87,11 @@ Example Claude Code `~/.claude/settings.json` (or project-local
     "PreToolUse": [
       {
         "matcher": "Edit|MultiEdit|Write",
-        "hooks": [{"type": "command", "command": "zed-ftp hook"}]
+        "hooks": [{"type": "command", "command": "ferry hook"}]
       },
       {
         "matcher": "Read",
-        "hooks": [{"type": "command", "command": "zed-ftp hook --cooldown 3600"}]
+        "hooks": [{"type": "command", "command": "ferry hook --cooldown 3600"}]
       }
     ]
   }
@@ -97,7 +104,7 @@ by cooldown, or errored — the LLM's tool call is never blocked.
 
 Behaviour:
 - Reads the tool envelope on stdin; extracts `tool_input.file_path`.
-- Walks upward to find `.zed-ftp.toml`; if not in a zed-ftp project, no-op.
+- Walks upward to find `.ferry.toml`; if not in a ferry project, no-op.
 - Compares `state.files[rel].last_synced` against the cooldown window; if
   fresh enough, skips the pull.
 - Otherwise runs a fast single-file pull (bypasses the tree walk).
@@ -108,13 +115,13 @@ Behaviour:
 
 For a hands-off workflow where opening a file automatically pulls the current
 remote version, install the companion extension at
-[`extensions/zed-ftp/`](extensions/zed-ftp/README.md). It attaches a minimal
-language server to `.c`/`.h` files that shells out to `zed-ftp pull --force`
+[`extensions/ferry/`](extensions/ferry/README.md). It attaches a minimal
+language server to `.c`/`.h` files that shells out to `ferry pull --force`
 on `textDocument/didOpen`. Install with:
 
 ```sh
-cargo install --path .          # installs both zed-ftp and zed-ftp-lsp
-cd extensions/zed-ftp
+cargo install --path .          # installs both ferry and ferry-lsp
+cd extensions/ferry
 zed --dev-extension .            # or use the Extensions palette
 ```
 
@@ -123,7 +130,7 @@ stale content" caveat inherent to the approach.
 
 ## Security
 
-**`.zed-ftp.toml` stores your FTP password in plaintext.** `init` automatically
+**`.ferry.toml` stores your FTP password in plaintext.** `init` automatically
 appends the config filename to `.gitignore`, but the file is still readable by
 anything on your machine that can read your working tree. FTPS and SFTP are
 explicitly out of scope for v1 — if you need encrypted transport, use a
@@ -143,12 +150,12 @@ These are stable so you can branch on them from shell scripts or task runners.
 ## Troubleshooting
 
 - **"MDTM not supported"** — some FTP servers don't implement `MDTM`, which
-  zed-ftp uses to skip re-hashing unchanged remote files. It falls back to
+  ferry uses to skip re-hashing unchanged remote files. It falls back to
   always downloading and re-hashing. The decision is cached in `state.json`
   after the first run so the probe only happens once.
 - **"Connection refused"** — check the port (default `21`) and your server's
-  passive-mode setting. zed-ftp uses passive mode.
-- **"Conflict: ..."** — run `zed-ftp status` to see which files diverge, then
+  passive-mode setting. ferry uses passive mode.
+- **"Conflict: ..."** — run `ferry status` to see which files diverge, then
   either `pull`/`push` the side you want to keep, or re-run with `--force` to
   blow away the other side.
 
