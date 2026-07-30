@@ -171,4 +171,6 @@ The `--ignored` suite requires a working Docker daemon and pulls
 
 ## License
 
-MIT (placeholder — update before publishing).
+[PolyForm Noncommercial 1.0.0](LICENSE.md) — free to use, modify, and share
+for any noncommercial purpose. Commercial use requires a separate license
+from the copyright holder; get in touch if you want one.
