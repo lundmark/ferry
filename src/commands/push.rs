@@ -6,7 +6,7 @@
 //! own deliberate command.
 
 use crate::commands::remote_hash;
-use crate::commands::walk::{remote_join, safe_rel, walk_local, walk_remote};
+use crate::commands::walk::{collect_remote_arg, remote_join, safe_rel, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
@@ -50,15 +50,12 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
             } else if local_full.is_file() {
                 local_paths.insert(rel_no_slash.clone());
             }
-            match walk_remote(&mut ftp, &cfg.paths.remote_root, &rel_no_slash, &mut remote_paths) {
-                Ok(()) => {}
-                Err(_) => {
-                    let remote_path = remote_join(&cfg.paths.remote_root, &rel_no_slash);
-                    if ftp.size(&remote_path).is_ok() {
-                        remote_paths.insert(rel_no_slash.clone());
-                    }
-                }
-            }
+            collect_remote_arg(
+                &mut ftp,
+                &cfg.paths.remote_root,
+                &rel_no_slash,
+                &mut remote_paths,
+            );
         }
     }
 

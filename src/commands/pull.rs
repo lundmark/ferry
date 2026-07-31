@@ -6,7 +6,7 @@
 //! else) cannot wipe your working tree.
 
 use crate::commands::remote_hash;
-use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::commands::walk::{collect_remote_arg, remote_join, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_file;
@@ -72,22 +72,13 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                 }
             }
 
-            // Remote: walk subtree, or if that fails at the top level,
-            // fall back to a SIZE probe (single file case).
-            let before = remote_paths.len();
-            match walk_remote(&mut ftp, &cfg.paths.remote_root, rel_no_slash, &mut remote_paths) {
-                Ok(()) => {
-                    found_here += remote_paths.len() - before;
-                }
-                Err(_) => {
-                    let remote_path = remote_join(&cfg.paths.remote_root, rel_no_slash);
-                    if ftp.size(&remote_path).is_ok()
-                        && remote_paths.insert(rel_no_slash.to_string())
-                    {
-                        found_here += 1;
-                    }
-                }
-            }
+            // Remote: subtree walk, or single-file resolution.
+            found_here += collect_remote_arg(
+                &mut ftp,
+                &cfg.paths.remote_root,
+                rel_no_slash,
+                &mut remote_paths,
+            );
 
             if found_here == 0 {
                 eprintln!("skip (not on local or remote): {rel_no_slash}");

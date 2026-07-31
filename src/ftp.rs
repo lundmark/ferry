@@ -15,6 +15,26 @@ pub struct Entry {
     pub modified: DateTime<Utc>,
 }
 
+/// The subset of remote operations the tree walk needs. Exists so `walk_remote`
+/// can be exercised against fake servers in unit tests — real FTP servers
+/// disagree about how to answer `LIST <file>`, and those disagreements are
+/// exactly what the walk has to handle.
+pub trait Remote {
+    fn list_dir(&mut self, dir: &str) -> Result<Vec<Entry>>;
+    /// `SIZE` is defined for files but not directories, so a successful reply
+    /// is how we tell the two apart. Mirrors the probe in `rm` and `pull_one`.
+    fn file_size(&mut self, path: &str) -> Result<u64>;
+}
+
+impl Remote for Ftp {
+    fn list_dir(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list(dir)
+    }
+    fn file_size(&mut self, path: &str) -> Result<u64> {
+        self.size(path)
+    }
+}
+
 impl Ftp {
     pub fn connect(host: &str, port: u16, user: &str, pass: &str, passive: bool) -> Result<Self> {
         // Connect + login failures become `Exit::Auth` so the process exits 3
