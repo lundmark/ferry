@@ -14,6 +14,8 @@ pub struct Connection {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_udp_port")]
+    pub udp_port: u16,
     pub user: String,
     pub password: String,
     #[serde(default = "default_true")]
@@ -36,6 +38,7 @@ pub struct Sync {
 }
 
 fn default_port() -> u16 { 21 }
+fn default_udp_port() -> u16 { 3203 }
 fn default_true() -> bool { true }
 fn default_local_root() -> PathBuf { PathBuf::from(".") }
 

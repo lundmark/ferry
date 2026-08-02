@@ -1,3 +1,4 @@
+pub mod cc;
 pub mod hook;
 pub mod init;
 pub mod ls;

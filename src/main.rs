@@ -40,6 +40,10 @@ enum Cmd {
     /// state records). Requires explicit paths; pass --recursive to delete a
     /// directory subtree.
     Rm { paths: Vec<String>, #[arg(long)] recursive: bool },
+    /// Check-compile files on the MUD via the UDP compile service. Prints
+    /// per-file OK/FAIL and diagnostics; exits non-zero if any failed.
+    #[command(alias = "check")]
+    Cc { paths: Vec<String> },
 }
 
 /// Exit codes (consumed by Zed's `tasks.json`):
@@ -77,6 +81,7 @@ fn run() -> i32 {
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force),
         Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive),
+        Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
     };
     match result {
         Ok(()) => 0,
