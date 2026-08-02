@@ -1,10 +1,11 @@
 # ferry
 
 A small Rust CLI for keeping a local project tree in sync with an FTP server —
-`push`, `pull`, `sync`, `status`, `rm`, and `init`. It's designed to be driven
-from an editor (e.g. [Zed](https://zed.dev)'s `.zed/tasks.json`) or from
-coding-agent PreToolUse hooks (Claude Code, Codex), so files are pulled and
-pushed as you and your agents work.
+`push`, `pull`, `sync`, `status`, `rm`, and `init` (plus `cc` for remote
+compile-checks against a MUD-style `check_compile` service). It's designed to
+be driven from an editor (e.g. [Zed](https://zed.dev)'s `.zed/tasks.json`) or
+from coding-agent PreToolUse hooks (Claude Code, Codex), so files are pulled
+and pushed as you and your agents work.
 
 > **Renamed from `zed-ftp`.** The binary is now `ferry`, the config file is
 > `.ferry.toml`, and state lives in `.ferry/`. Existing projects are migrated
@@ -127,6 +128,46 @@ zed --dev-extension .            # or use the Extensions palette
 
 See the extension's README for behaviour details and the "brief flash of
 stale content" caveat inherent to the approach.
+
+## Remote compile checks (`cc`)
+
+For servers that run the companion **UDP compile service** — an authenticated
+`check_compile` endpoint (as used by the 3Kingdoms/3Scapes LDMud MUD) — `ferry
+cc` dry-compiles files on the server without loading them:
+
+```sh
+ferry cc <file>...
+# e.g.
+ferry cc cmds/secure/cc.c players/foo/room.c
+```
+
+For each file it prints `<path>: OK` or `<path>: FAIL` followed by any
+compiler diagnostics (`<file>:<line>: error|warning: <message>`), and exits
+non-zero if any file failed — so it works as a pre-push compile gate. `check`
+is an alias: `ferry check <file>...`.
+
+Under the hood each file is one authenticated request (your `.ferry.toml`
+login/password) over a small tab-delimited UDP protocol; the server streams
+back chunked diagnostics that the client reassembles. Nothing is loaded or
+executed on the server — it's a pure compile check, and you can only check
+files you're allowed to write.
+
+### Configuration
+
+`cc` connects to the server's UDP port, set under `[connection]` in
+`.ferry.toml` (defaults to `3203`):
+
+```toml
+[connection]
+host     = "your.mud.host"
+port     = 3201          # FTP/TCP port
+udp_port = 3203          # compile-service UDP port
+user     = "yourwiz"
+password = "..."
+```
+
+This feature requires the server-side compile service to be installed; against
+a plain FTP server `cc` simply times out.
 
 ## Security
 
