@@ -7,6 +7,7 @@
 //! may not escape the sync roots, and deleting a directory demands
 //! `--recursive`.
 
+use crate::commands::ExecutionMode;
 use crate::commands::walk::{remote_join, safe_rel, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -16,7 +17,12 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub fn run(config_path: &Path, paths: &[String], recursive: bool) -> Result<()> {
+pub fn run(
+    config_path: &Path,
+    paths: &[String],
+    recursive: bool,
+    mode: ExecutionMode,
+) -> Result<()> {
     // Primary safety guard: refuse before touching config or the network so a
     // bare `rm` can never wipe anything.
     if paths.is_empty() {
@@ -45,9 +51,9 @@ pub fn run(config_path: &Path, paths: &[String], recursive: bool) -> Result<()> 
     let mut failed = false;
     for rel in &rels {
         let result = if recursive {
-            remove_recursive(&mut ftp, &mut state, &cfg, &local_root, &matcher, rel)
+            remove_recursive(&mut ftp, &mut state, &cfg, &local_root, &matcher, rel, mode)
         } else {
-            remove_file_target(&mut ftp, &mut state, &cfg, &local_root, rel)
+            remove_file_target(&mut ftp, &mut state, &cfg, &local_root, rel, mode)
         };
         if let Err(e) = result {
             eprintln!("error removing {rel}: {e:#}");
@@ -55,9 +61,11 @@ pub fn run(config_path: &Path, paths: &[String], recursive: bool) -> Result<()> 
         }
     }
 
-    // Persist state regardless — deletions that succeeded before a later
-    // failure still need their records dropped.
-    state.save(&state_path)?;
+    // In apply mode, persist state regardless — deletions that succeeded before
+    // a later failure still need their records dropped.
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
 
     if failed {
         anyhow::bail!("rm: one or more paths could not be deleted");
@@ -74,6 +82,7 @@ fn remove_file_target(
     cfg: &Config,
     local_root: &Path,
     rel: &str,
+    mode: ExecutionMode,
 ) -> Result<()> {
     let local_full = local_root.join(rel);
     if local_full.is_dir() {
@@ -95,7 +104,16 @@ fn remove_file_target(
         anyhow::bail!("no such file on remote or local: {rel}");
     }
 
-    delete_file(ftp, state, &remote_path, &local_full, rel, on_remote, on_local)?;
+    delete_file(
+        ftp,
+        state,
+        &remote_path,
+        &local_full,
+        rel,
+        on_remote,
+        on_local,
+        mode,
+    )?;
     Ok(())
 }
 
@@ -109,6 +127,7 @@ fn remove_recursive(
     local_root: &Path,
     matcher: &Matcher,
     rel: &str,
+    mode: ExecutionMode,
 ) -> Result<()> {
     // Enumerate files on both sides, scoped to this subtree. A remote subtree
     // that doesn't exist is not fatal — the local side may still have files.
@@ -141,11 +160,25 @@ fn remove_recursive(
         let on_local = local_files.contains(f);
         let remote_path = remote_join(&cfg.paths.remote_root, f);
         let local_file = local_root.join(f);
-        delete_file(ftp, state, &remote_path, &local_file, f, on_remote, on_local)?;
+        delete_file(
+            ftp,
+            state,
+            &remote_path,
+            &local_file,
+            f,
+            on_remote,
+            on_local,
+            mode,
+        )?;
         collect_dirs_at_or_below(f, rel, &mut dirs);
     }
 
     for d in dirs.iter().rev() {
+        if mode.is_dry_run() {
+            println!("would remove dir {d}/");
+            continue;
+        }
+
         let remote_dir = remote_join(&cfg.paths.remote_root, d);
         let remote_ok = match ftp.rmdir(&remote_dir) {
             Ok(()) => true,
@@ -184,7 +217,13 @@ fn delete_file(
     rel: &str,
     on_remote: bool,
     on_local: bool,
+    mode: ExecutionMode,
 ) -> Result<()> {
+    if mode.is_dry_run() {
+        println!("would delete ({}) {rel}", sides_label(on_remote, on_local));
+        return Ok(());
+    }
+
     if on_remote {
         ftp.rm(remote_path)
             .with_context(|| format!("deleting remote {remote_path}"))?;

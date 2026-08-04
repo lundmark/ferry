@@ -329,3 +329,161 @@ fn hook_dry_run_preserves_legacy_names() {
 
     let _fixture_guard = &fixture.container;
 }
+
+#[test]
+#[ignore = "requires Docker"]
+fn rm_dry_run_preserves_remote_local_and_state() {
+    let fixture = support::start_ftp();
+    let rel = "rm-dry-run.txt";
+    let bytes = b"rm dry-run bytes\n";
+
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.upload_bytes(&support::remote_path(rel), bytes).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let local_root = dir.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let local_path = local_root.join(rel);
+    std::fs::write(&local_path, bytes).unwrap();
+
+    let state_path = local_root.join(".ferry/state.json");
+    let now = chrono::Utc::now();
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        rel.into(),
+        ferry::state::FileRecord {
+            sha256: hash_bytes(bytes),
+            size: bytes.len() as u64,
+            remote_mtime: now,
+            last_synced: now,
+        },
+    );
+    state.save(&state_path).unwrap();
+
+    let generated_config = support::write_config(&local_root, &fixture);
+    let config = dir.path().join("rm-config.toml");
+    std::fs::rename(generated_config, &config).unwrap();
+    let state_before = std::fs::read(&state_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("--config")
+        .arg(&config)
+        .args(["rm", rel, "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("would delete (remote+local) {rel}")),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert_eq!(std::fs::read(&local_path).unwrap(), bytes);
+    assert_eq!(ftp.download(&support::remote_path(rel)).unwrap(), bytes);
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+
+    let _fixture_guard = &fixture.container;
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn recursive_rm_dry_run_preserves_files_and_directories() {
+    let fixture = support::start_ftp();
+    let dir_rel = "rm-dry-run-tree";
+    let root_rel = "rm-dry-run-tree/root.txt";
+    let nested_rel = "rm-dry-run-tree/sub/nested.txt";
+    let root_bytes = b"recursive root bytes\n";
+    let nested_bytes = b"recursive nested bytes\n";
+
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.mkdir(&support::remote_path(dir_rel)).unwrap();
+    ftp.mkdir(&support::remote_path(&format!("{dir_rel}/sub")))
+        .unwrap();
+    ftp.upload_bytes(&support::remote_path(root_rel), root_bytes)
+        .unwrap();
+    ftp.upload_bytes(&support::remote_path(nested_rel), nested_bytes)
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let local_root = dir.path().join("mirror");
+    std::fs::create_dir_all(local_root.join(format!("{dir_rel}/sub"))).unwrap();
+    std::fs::write(local_root.join(root_rel), root_bytes).unwrap();
+    std::fs::write(local_root.join(nested_rel), nested_bytes).unwrap();
+
+    let generated_config = support::write_config(&local_root, &fixture);
+    let config = dir.path().join("recursive-rm-config.toml");
+    std::fs::rename(generated_config, &config).unwrap();
+    let state_path = local_root.join(".ferry/state.json");
+    assert!(!state_path.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("--config")
+        .arg(&config)
+        .args(["rm", dir_rel, "--recursive", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for rel in [root_rel, nested_rel] {
+        assert!(
+            stdout.contains(&format!("would delete (remote+local) {rel}")),
+            "stdout={stdout}",
+        );
+    }
+    let lines: Vec<&str> = stdout.lines().collect();
+    let nested_dir_line = format!("would remove dir {dir_rel}/sub/");
+    let root_dir_line = format!("would remove dir {dir_rel}/");
+    let nested_dir_pos = lines
+        .iter()
+        .position(|line| *line == nested_dir_line)
+        .unwrap_or_else(|| panic!("missing nested directory preview; stdout={stdout}"));
+    let root_dir_pos = lines
+        .iter()
+        .position(|line| *line == root_dir_line)
+        .unwrap_or_else(|| panic!("missing root directory preview; stdout={stdout}"));
+    assert!(
+        nested_dir_pos < root_dir_pos,
+        "directory previews were not deepest-first; stdout={stdout}",
+    );
+
+    assert_eq!(
+        std::fs::read(local_root.join(root_rel)).unwrap(),
+        root_bytes
+    );
+    assert_eq!(
+        std::fs::read(local_root.join(nested_rel)).unwrap(),
+        nested_bytes,
+    );
+    assert!(local_root.join(dir_rel).is_dir());
+    assert!(local_root.join(format!("{dir_rel}/sub")).is_dir());
+    assert_eq!(
+        ftp.download(&support::remote_path(root_rel)).unwrap(),
+        root_bytes,
+    );
+    assert_eq!(
+        ftp.download(&support::remote_path(nested_rel)).unwrap(),
+        nested_bytes,
+    );
+    assert!(ftp.list(&support::remote_path(dir_rel)).is_ok());
+    assert!(
+        ftp.list(&support::remote_path(&format!("{dir_rel}/sub")))
+            .is_ok()
+    );
+    assert!(!state_path.exists());
+
+    let _fixture_guard = &fixture.container;
+}

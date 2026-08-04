@@ -81,7 +81,7 @@ fn run() -> i32 {
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
         Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force, mode),
-        Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive),
+        Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
     };
     match result {
