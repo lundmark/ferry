@@ -281,8 +281,10 @@ fn hook_dry_run_preserves_legacy_names() {
         .path()
         .join(ferry::names::LEGACY_STATE_DIR)
         .join("state.json");
-    let mut state = ferry::state::StateFile::default();
-    state.server_supports_mdtm = Some(false);
+    let state = ferry::state::StateFile {
+        server_supports_mdtm: Some(false),
+        ..Default::default()
+    };
     state.save(&legacy_state).unwrap();
 
     let config_before = std::fs::read(&legacy_config).unwrap();
