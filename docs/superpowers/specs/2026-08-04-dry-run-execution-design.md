@@ -16,7 +16,7 @@ single-file path-resolution change did not introduce the bug.
 files, connect to the configured server, list and download remote files for
 classification, and report errors. It must not:
 
-- create, replace, rename, or delete local project files;
+- create, replace, rename, or delete local project files or directories;
 - upload, rename, create, or delete remote files or directories;
 - create or update the ferry config, `.gitignore`, or sync state;
 - rename legacy `.zed-ftp` config or state into the current `.ferry` names.
