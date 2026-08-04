@@ -48,6 +48,63 @@ fn init_writes_config_and_updates_gitignore() {
     assert!(gi.contains(".ferry/"));
 }
 
+#[test]
+fn init_dry_run_does_not_write_config_or_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join(".ferry.toml");
+    let cwd = dir.path();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args([
+            "init",
+            "--no-validate",
+            "--dry-run",
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let answers = "ftp.example.com\n\ndeploy\nsecret\n/var/www/site\n\n";
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(answers.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "init did not succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(!cfg_path.exists(), "dry-run must not write the config");
+    assert!(
+        !cwd.join(".gitignore").exists(),
+        "dry-run must not write .gitignore",
+    );
+    assert!(
+        !cwd.join(".ferry/state.json").exists(),
+        "dry-run must not write state",
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("would write"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(cfg_path.to_str().unwrap()),
+        "stdout: {stdout}",
+    );
+    assert!(stdout.contains(".gitignore"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("secret"),
+        "stdout leaked password: {stdout}"
+    );
+}
+
 /// Exercises the full validating init flow against a real FTP server.
 /// Mirrors the container setup pattern in `tests/ftp_integration.rs`.
 ///

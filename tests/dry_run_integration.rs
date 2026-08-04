@@ -487,3 +487,93 @@ fn recursive_rm_dry_run_preserves_files_and_directories() {
 
     let _fixture_guard = &fixture.container;
 }
+
+#[test]
+#[ignore = "requires Docker"]
+fn validating_init_dry_run_previews_resolution_without_writes() {
+    let fixture = support::start_ftp();
+    let rel = "differs.txt";
+    let remote_bytes = b"old remote version\n";
+    let local_bytes = b"different local version\n";
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.upload_bytes(&support::remote_path(rel), remote_bytes)
+        .unwrap();
+
+    let project = tempfile::tempdir().unwrap();
+    let mirror = project.path().join("mirror");
+    std::fs::create_dir(&mirror).unwrap();
+    let local_path = mirror.join(rel);
+    std::fs::write(&local_path, local_bytes).unwrap();
+    let config_path = project.path().join(".ferry.toml");
+    let state_path = mirror.join(".ferry/state.json");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args([
+            "init",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let answers = format!(
+        "{host}\n{port}\ntest\ntestpw\n/home/test\nmirror\np\n",
+        host = fixture.host,
+        port = fixture.control_port,
+    );
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(answers.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert_eq!(
+        ftp.download(&support::remote_path(rel)).unwrap(),
+        remote_bytes,
+        "dry-run must not change the remote file",
+    );
+    assert_eq!(
+        std::fs::read(&local_path).unwrap(),
+        local_bytes,
+        "dry-run must not change the local file",
+    );
+    assert!(!config_path.exists(), "dry-run must not write the config");
+    assert!(
+        !project.path().join(".gitignore").exists(),
+        "dry-run must not write .gitignore",
+    );
+    assert!(!state_path.exists(), "dry-run must not write state");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("would push differs.txt"), "stdout={stdout}");
+    assert!(stdout.contains("would write state"), "stdout={stdout}");
+    assert!(
+        stdout.contains(state_path.to_str().unwrap()),
+        "stdout={stdout}",
+    );
+    assert!(stdout.contains("would write"), "stdout={stdout}");
+    assert!(
+        stdout.contains(config_path.to_str().unwrap()),
+        "stdout={stdout}",
+    );
+    assert!(stdout.contains(".gitignore"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("testpw"),
+        "stdout leaked password: {stdout}",
+    );
+
+    let _fixture_guard = &fixture.container;
+}

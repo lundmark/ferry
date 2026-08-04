@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 /// matcher the rest of the binary will use on subsequent commands.
 const DEFAULT_IGNORE: &[&str] = &[".git/", ".ferry/", "node_modules/", "target/", "*.log"];
 
-pub fn run(config_path: &Path, no_validate: bool) -> Result<()> {
+pub fn run(config_path: &Path, no_validate: bool, mode: ExecutionMode) -> Result<()> {
     // 1. Refuse if the target config already exists. We don't want to clobber
     //    a working setup; the user can edit or remove it explicitly.
     if config_path.exists() {
@@ -93,6 +93,7 @@ pub fn run(config_path: &Path, no_validate: bool) -> Result<()> {
             &remote_root,
             &mut stdin,
             &mut stdout,
+            mode,
         )?;
     }
 
@@ -101,6 +102,14 @@ pub fn run(config_path: &Path, no_validate: bool) -> Result<()> {
     //    derives `Deserialize` today) and can include a friendly comment
     //    header for users who open the file by hand.
     let cfg_text = render_config(&host, port, &user, &password, &remote_root, &local_root);
+    if mode.is_dry_run() {
+        writeln!(
+            stdout,
+            "\nwould write {} and update .gitignore",
+            config_path.display()
+        )?;
+        return Ok(());
+    }
     if let Some(parent) = config_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -143,6 +152,7 @@ fn validate_and_resolve<R: BufRead, W: Write>(
     remote_root: &str,
     stdin: &mut R,
     stdout: &mut W,
+    mode: ExecutionMode,
 ) -> Result<()> {
     // The ignore set mirrors what render_config will write into the new
     // .ferry.toml so the validation pass agrees with every subsequent
@@ -221,6 +231,7 @@ fn validate_and_resolve<R: BufRead, W: Write>(
     // produces a known-good hash on BOTH sides (p/P). 'k' and 's' leave the
     // file in an indeterminate state and we don't pretend otherwise.
     let mut state = StateFile::default();
+    let mut would_seed_state = !in_sync.is_empty();
 
     for entry in &in_sync {
         let remote_path = remote_join(remote_root, &entry.rel);
@@ -263,9 +274,11 @@ fn validate_and_resolve<R: BufRead, W: Write>(
                     &remote_path,
                     &bytes,
                     &new_hash,
-                    ExecutionMode::Apply,
+                    mode,
                 )?;
-                writeln!(stdout, "pushed {rel}")?;
+                would_seed_state = true;
+                let verb = if mode.is_dry_run() { "would push" } else { "pushed" };
+                writeln!(stdout, "{verb} {rel}")?;
             }
             'P' => {
                 let remote_path = remote_join(remote_root, rel);
@@ -282,9 +295,11 @@ fn validate_and_resolve<R: BufRead, W: Write>(
                     &remote_path,
                     &bytes,
                     &new_hash,
-                    ExecutionMode::Apply,
+                    mode,
                 )?;
-                writeln!(stdout, "pulled {rel}")?;
+                would_seed_state = true;
+                let verb = if mode.is_dry_run() { "would pull" } else { "pulled" };
+                writeln!(stdout, "{verb} {rel}")?;
             }
             's' => {
                 writeln!(stdout, "skipped {rel}")?;
@@ -303,10 +318,21 @@ fn validate_and_resolve<R: BufRead, W: Write>(
     // empty file just to demonstrate the directory exists. (If the user
     // had a prior state.json we'd overwrite it; but init refuses to run
     // when the config exists, so reaching here implies a fresh setup.)
-    if !state.files.is_empty() {
-        let state_path: PathBuf = local_root.join(crate::names::STATE_DIR).join("state.json");
-        state.save(&state_path)
-            .with_context(|| format!("writing state file {}", state_path.display()))?;
+    let state_path: PathBuf = local_root.join(crate::names::STATE_DIR).join("state.json");
+    if mode.should_apply() {
+        if !state.files.is_empty() {
+            state.save(&state_path)
+                .with_context(|| format!("writing state file {}", state_path.display()))?;
+        }
+    } else if would_seed_state {
+        let preview_path = if state_path.is_absolute() {
+            state_path.clone()
+        } else {
+            std::env::current_dir()
+                .context("reading current directory for state preview")?
+                .join(&state_path)
+        };
+        writeln!(stdout, "would write state {}", preview_path.display())?;
     }
 
     Ok(())
