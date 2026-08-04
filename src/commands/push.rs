@@ -7,6 +7,7 @@
 
 use crate::commands::remote_hash;
 use crate::commands::walk::{collect_remote_arg, remote_join, safe_rel, walk_local, walk_remote};
+use crate::commands::ExecutionMode;
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
@@ -17,7 +18,7 @@ use chrono::Utc;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
+pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
@@ -127,8 +128,8 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                     .as_deref()
                     .expect("local_bytes set when on_local is true");
                 let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
-                upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash)?;
-                println!("pushed {rel}");
+                upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash, mode)?;
+                println!("{} {rel}", if mode.is_dry_run() { "would push" } else { "pushed" });
             }
             FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
                 // Untracked = both sides have a file but no record of a prior sync.
@@ -139,8 +140,12 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                         .as_deref()
                         .expect("local_bytes set when on_local is true");
                     let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
-                    eprintln!("overwriting remote with local (--force): {rel}");
-                    upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash)?;
+                    if mode.is_dry_run() {
+                        eprintln!("would overwrite remote with local (--force): {rel}");
+                    } else {
+                        eprintln!("overwriting remote with local (--force): {rel}");
+                    }
+                    upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash, mode)?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
@@ -155,7 +160,9 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
     // Save state even if we hit a conflict — partial progress is still
     // worth persisting (e.g. clean LocalChanged pushes that succeeded
     // before the conflict file).
-    state.save(&state_path)?;
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
 
     if had_conflict {
         // Tag as `Exit::Conflict` so `main()` returns exit code 2 — Zed's
@@ -181,10 +188,13 @@ pub fn upload_one(
     remote_path: &str,
     bytes: &[u8],
     new_hash: &str,
+    mode: ExecutionMode,
 ) -> Result<()> {
+    if mode.is_dry_run() {
+        return Ok(());
+    }
     upload_remote_atomic(ftp, remote_path, bytes)?;
-    update_state_after_push(state, rel, ftp, remote_path, new_hash, bytes.len() as u64)?;
-    Ok(())
+    update_state_after_push(state, rel, ftp, remote_path, new_hash, bytes.len() as u64)
 }
 
 /// Upload `bytes` to `remote_path` via a sibling `.tmp.zedftp` file and FTP

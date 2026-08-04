@@ -59,6 +59,7 @@ fn main() {
 
 fn run() -> i32 {
     let cli = Cli::parse();
+    let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
     let explicit_config = cli.config.is_some();
     let cfg = cli
         .config
@@ -67,7 +68,7 @@ fn run() -> i32 {
     // when using the default config location. Best-effort: a migration failure
     // is a warning, not a hard stop — the command below will surface any real
     // "config not found" error itself.
-    if !explicit_config {
+    if !explicit_config && mode.should_apply() {
         if let Err(e) = ferry::names::migrate_legacy(std::path::Path::new(".")) {
             eprintln!("warning: {e:#}");
         }
@@ -78,7 +79,7 @@ fn run() -> i32 {
         Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown),
         Cmd::Status => ferry::commands::status::run(&cfg),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force),
-        Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force),
+        Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
         Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),

@@ -17,6 +17,7 @@
 //! user says "just sync it already," last-write-wins from the local side
 //! since that's the side the user is actively editing.
 
+use crate::commands::ExecutionMode;
 use crate::commands::pull::download_one;
 use crate::commands::push::upload_one;
 use crate::commands::remote_hash;
@@ -107,7 +108,15 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                 let new_hash = local_hash
                     .as_deref()
                     .expect("local_hash set when on_local is true");
-                upload_one(&mut ftp, &mut state, rel, &remote_path, &bytes, new_hash)?;
+                upload_one(
+                    &mut ftp,
+                    &mut state,
+                    rel,
+                    &remote_path,
+                    &bytes,
+                    new_hash,
+                    ExecutionMode::Apply,
+                )?;
                 println!("uploaded {rel}");
             }
             FileState::RemoteChanged | FileState::RemoteOnly => {
@@ -145,7 +154,15 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                         .as_deref()
                         .expect("local_hash set when on_local is true");
                     eprintln!("overwriting remote with local (--force): {rel}");
-                    upload_one(&mut ftp, &mut state, rel, &remote_path, &bytes, new_hash)?;
+                    upload_one(
+                        &mut ftp,
+                        &mut state,
+                        rel,
+                        &remote_path,
+                        &bytes,
+                        new_hash,
+                        ExecutionMode::Apply,
+                    )?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, local and remote diverged): {rel} — pass --force to take local",

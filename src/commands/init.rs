@@ -14,6 +14,7 @@
 //! input is masked in normal use) and fall back to a plain `read_line` when
 //! it isn't (so integration tests can pipe answers in via `Stdio::piped()`).
 
+use crate::commands::ExecutionMode;
 use crate::commands::pull::download_one;
 use crate::commands::push::upload_one;
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
@@ -255,7 +256,15 @@ fn validate_and_resolve<R: BufRead, W: Write>(
                     .with_context(|| format!("reading local {}", local_path.display()))?;
                 let new_hash = hash_bytes(&bytes);
                 let remote_path = remote_join(remote_root, rel);
-                upload_one(&mut ftp, &mut state, rel, &remote_path, &bytes, &new_hash)?;
+                upload_one(
+                    &mut ftp,
+                    &mut state,
+                    rel,
+                    &remote_path,
+                    &bytes,
+                    &new_hash,
+                    ExecutionMode::Apply,
+                )?;
                 writeln!(stdout, "pushed {rel}")?;
             }
             'P' => {
