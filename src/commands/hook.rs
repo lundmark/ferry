@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::commands::ExecutionMode;
 use crate::config::Config;
 use crate::state::StateFile;
 
@@ -26,7 +27,7 @@ struct HookInput {
     tool_input: Option<serde_json::Value>,
 }
 
-pub fn run(cooldown_secs: i64) -> Result<()> {
+pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     let mut buf = String::new();
     std::io::stdin()
         .read_to_string(&mut buf)
@@ -67,8 +68,10 @@ pub fn run(cooldown_secs: i64) -> Result<()> {
     // Best-effort one-time rename of legacy .zed-ftp files. Never fail the hook
     // over it — a rename that can't happen (e.g. read-only FS) just means we
     // fall back to reading the legacy names below.
-    if let Err(e) = crate::names::migrate_legacy(&root) {
-        eprintln!("ferry hook: migration warning: {e:#}");
+    if mode.should_apply() {
+        if let Err(e) = crate::names::migrate_legacy(&root) {
+            eprintln!("ferry hook: migration warning: {e:#}");
+        }
     }
     // Prefer the current names; tolerate legacy ones if migration couldn't run
     // so the hook keeps working rather than silently going dark.
@@ -104,10 +107,9 @@ pub fn run(cooldown_secs: i64) -> Result<()> {
     // Fast single-file pull with force=true. The hook contract is "give me
     // the current remote version"; users who don't want that shouldn't
     // install the hook.
-    match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ true) {
-        Ok(true) => {
-            eprintln!("ferry hook: pulled {rel}");
-        }
+    match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ true, mode) {
+        Ok(true) if mode.is_dry_run() => eprintln!("ferry hook: would pull {rel}"),
+        Ok(true) => eprintln!("ferry hook: pulled {rel}"),
         Ok(false) => {
             // Already in sync (or local-only). No output needed.
         }

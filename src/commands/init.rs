@@ -282,6 +282,7 @@ fn validate_and_resolve<R: BufRead, W: Write>(
                     &remote_path,
                     &bytes,
                     &new_hash,
+                    ExecutionMode::Apply,
                 )?;
                 writeln!(stdout, "pulled {rel}")?;
             }

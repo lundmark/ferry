@@ -138,6 +138,7 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                     &remote_path,
                     &bytes_owned,
                     &rh_inner.sha256,
+                    ExecutionMode::Apply,
                 )?;
                 println!("downloaded {rel}");
             }

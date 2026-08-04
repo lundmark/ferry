@@ -76,9 +76,9 @@ fn run() -> i32 {
     let result: anyhow::Result<()> = match cli.cmd {
         Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate),
         Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
-        Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown),
+        Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
         Cmd::Status => ferry::commands::status::run(&cfg),
-        Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force),
+        Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
         Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive),

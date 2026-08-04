@@ -7,6 +7,7 @@
 
 use crate::commands::remote_hash;
 use crate::commands::walk::{collect_remote_arg, remote_join, walk_local, walk_remote};
+use crate::commands::ExecutionMode;
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_file;
@@ -17,7 +18,7 @@ use chrono::Utc;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
+pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
@@ -167,8 +168,24 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                     None => ftp.download(&remote_path)
                         .with_context(|| format!("downloading {remote_path}"))?,
                 };
-                download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, &bytes_owned, &rh_inner.sha256)?;
-                println!("pulled {rel}");
+                download_one(
+                    &mut ftp,
+                    &mut state,
+                    &local_root.join(rel),
+                    rel,
+                    &remote_path,
+                    &bytes_owned,
+                    &rh_inner.sha256,
+                    mode,
+                )?;
+                println!(
+                    "{} {rel}",
+                    if mode.is_dry_run() {
+                        "would pull"
+                    } else {
+                        "pulled"
+                    }
+                );
             }
             FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
                 // Untracked = both sides have a file but no record of a prior sync.
@@ -181,8 +198,21 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
                         None => ftp.download(&remote_path)
                             .with_context(|| format!("downloading {remote_path}"))?,
                     };
-                    eprintln!("overwriting local with remote (--force): {rel}");
-                    download_one(&mut ftp, &mut state, &local_root.join(rel), rel, &remote_path, &bytes_owned, &rh_inner.sha256)?;
+                    if mode.is_dry_run() {
+                        eprintln!("would overwrite local with remote (--force): {rel}");
+                    } else {
+                        eprintln!("overwriting local with remote (--force): {rel}");
+                    }
+                    download_one(
+                        &mut ftp,
+                        &mut state,
+                        &local_root.join(rel),
+                        rel,
+                        &remote_path,
+                        &bytes_owned,
+                        &rh_inner.sha256,
+                        mode,
+                    )?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
@@ -197,7 +227,9 @@ pub fn run(config_path: &Path, paths: &[String], force: bool) -> Result<()> {
     // Save state even if we hit a conflict — partial progress is still
     // worth persisting (e.g. clean RemoteChanged pulls that succeeded
     // before the conflict file).
-    state.save(&state_path)?;
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
 
     if had_conflict {
         // Tag as `Exit::Conflict` so `main()` returns exit code 2 — Zed's
@@ -228,9 +260,9 @@ fn normalize_rel(p: &str) -> String {
 /// downloads when the remote wins. Refuses on conflict without `force`
 /// exactly like `run()` does.
 ///
-/// Returns `Ok(true)` if a download was performed, `Ok(false)` if no
-/// action was needed (InSync / LocalOnly / conflict-with-force-skipped).
-pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
+/// Returns `Ok(true)` if a pull was required (whether applied or previewed),
+/// `Ok(false)` if no action was needed (InSync / LocalOnly).
+pub fn pull_one(config_path: &Path, rel: &str, force: bool, mode: ExecutionMode) -> Result<bool> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
@@ -274,7 +306,7 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
     let known = state.files.get(rel).map(|r| r.sha256.as_str());
     let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
 
-    let mut wrote = false;
+    let mut pull_required = false;
     match st {
         FileState::InSync | FileState::LocalOnly => {}
         FileState::RemoteOnly | FileState::RemoteChanged => {
@@ -293,8 +325,9 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
                 &remote_path,
                 &bytes,
                 &rh_inner.sha256,
+                mode,
             )?;
-            wrote = true;
+            pull_required = true;
         }
         FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
             if force {
@@ -313,8 +346,9 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
                     &remote_path,
                     &bytes,
                     &rh_inner.sha256,
+                    mode,
                 )?;
-                wrote = true;
+                pull_required = true;
             } else {
                 return Err(crate::error::Exit::Conflict(format!(
                     "conflict ({st:?}) on {rel}: local changes present; pass --force to override",
@@ -324,8 +358,10 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool) -> Result<bool> {
         }
     }
 
-    state.save(&state_path)?;
-    Ok(wrote)
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
+    Ok(pull_required)
 }
 
 /// Write `bytes` to `local_path` atomically (via temp + rename) and refresh
@@ -340,7 +376,11 @@ pub fn download_one(
     remote_path: &str,
     bytes: &[u8],
     new_hash: &str,
+    mode: ExecutionMode,
 ) -> Result<()> {
+    if mode.is_dry_run() {
+        return Ok(());
+    }
     write_local_atomic(local_path, bytes)?;
     update_state_after_pull(state, rel, ftp, remote_path, new_hash, bytes.len() as u64)?;
     Ok(())

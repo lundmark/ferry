@@ -87,7 +87,12 @@ fn handle_did_open(connection: &Connection, uri_str: &str) {
     // force=true: LSP-triggered auto-pull is an opt-in "always give me the
     // remote version" gesture. Users who have locally-modified files they
     // don't want overwritten should not install the LSP extension.
-    if let Err(e) = ferry::commands::pull::run(&config, &[rel.clone()], true) {
+    if let Err(e) = ferry::commands::pull::run(
+        &config,
+        &[rel.clone()],
+        true,
+        ferry::commands::ExecutionMode::Apply,
+    ) {
         show_warning(connection, format!("ferry pull {rel}: {e:#}"));
     }
 }
