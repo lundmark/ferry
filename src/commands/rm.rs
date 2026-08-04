@@ -209,6 +209,8 @@ fn remove_recursive(
 
 /// Delete one file from the sides indicated by `on_remote`/`on_local`, drop its
 /// state entry, and print the result. The caller guarantees at least one side.
+// Paths and presence are independent for each side, so keep them explicit.
+#[allow(clippy::too_many_arguments)]
 fn delete_file(
     ftp: &mut Ftp,
     state: &mut StateFile,

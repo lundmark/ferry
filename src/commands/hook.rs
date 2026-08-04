@@ -68,10 +68,10 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // Best-effort one-time rename of legacy .zed-ftp files. Never fail the hook
     // over it — a rename that can't happen (e.g. read-only FS) just means we
     // fall back to reading the legacy names below.
-    if mode.should_apply() {
-        if let Err(e) = crate::names::migrate_legacy(&root) {
-            eprintln!("ferry hook: migration warning: {e:#}");
-        }
+    if mode.should_apply()
+        && let Err(e) = crate::names::migrate_legacy(&root)
+    {
+        eprintln!("ferry hook: migration warning: {e:#}");
     }
     // Prefer the current names; tolerate legacy ones if migration couldn't run
     // so the hook keeps working rather than silently going dark.

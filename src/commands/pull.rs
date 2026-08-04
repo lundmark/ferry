@@ -369,6 +369,9 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool, mode: ExecutionMode)
 /// [`ExecutionMode::DryRun`], perform neither mutation.
 ///
 /// Shared with the sync command on its remote-wins branch.
+// The state update needs both local and remote identities plus the downloaded
+// payload metadata; wrapping these one-to-one inputs would only hide them.
+#[allow(clippy::too_many_arguments)]
 pub fn download_one(
     ftp: &mut Ftp,
     state: &mut StateFile,
