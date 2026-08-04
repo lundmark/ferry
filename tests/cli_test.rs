@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
@@ -136,4 +137,89 @@ remote_root = "/"
     assert_eq!(std::fs::read(&legacy_state).unwrap(), state_before);
     assert!(!dir.path().join(ferry::names::CONFIG_FILE).exists());
     assert!(!dir.path().join(ferry::names::STATE_DIR).exists());
+}
+
+#[test]
+fn hook_dry_run_cooldown_reads_legacy_state_past_empty_current_dir() {
+    let project = tempfile::tempdir().unwrap();
+    let local_root = project.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let target = local_root.join("target.txt");
+    std::fs::write(&target, b"local bytes\n").unwrap();
+
+    let config_path = project.path().join(ferry::names::CONFIG_FILE);
+    std::fs::write(
+        &config_path,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+local_root = "mirror"
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+
+    let legacy_state_path = local_root
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    let now = chrono::Utc::now();
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        "target.txt".into(),
+        ferry::state::FileRecord {
+            sha256: "known".into(),
+            size: 12,
+            remote_mtime: now,
+            last_synced: now,
+        },
+    );
+    state.save(&legacy_state_path).unwrap();
+    let current_state_dir = local_root.join(ferry::names::STATE_DIR);
+    std::fs::create_dir(&current_state_dir).unwrap();
+
+    let config_before = std::fs::read(&config_path).unwrap();
+    let state_before = std::fs::read(&legacy_state_path).unwrap();
+    let target_before = std::fs::read(&target).unwrap();
+
+    let mut child = bin()
+        .args(["hook", "--cooldown", "3600", "--dry-run"])
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.as_mut().unwrap(),
+        &serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": target},
+        }),
+    )
+    .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("within 3600s cooldown, skipping pull"),
+        "legacy cooldown state was ignored and FTP was attempted; stderr={stderr}",
+    );
+    assert!(!stderr.contains("pull failed"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+    assert_eq!(std::fs::read(&legacy_state_path).unwrap(), state_before);
+    assert_eq!(std::fs::read(&target).unwrap(), target_before);
+    assert!(!current_state_dir.join("state.json").exists());
+    assert_eq!(std::fs::read_dir(&current_state_dir).unwrap().count(), 0);
 }

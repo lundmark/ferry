@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::commands::ExecutionMode;
+use crate::commands::{state_path_for, ExecutionMode};
 use crate::config::Config;
 use crate::state::StateFile;
 
@@ -76,18 +76,26 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // Prefer the current names; tolerate legacy ones if migration couldn't run
     // so the hook keeps working rather than silently going dark.
     let config_path = existing_or(&root, crate::names::CONFIG_FILE, crate::names::LEGACY_CONFIG_FILE);
-    let state_dir = existing_or(&root, crate::names::STATE_DIR, crate::names::LEGACY_STATE_DIR);
+    let (rel_root, state_path) = if mode.is_dry_run() {
+        let cfg = Config::load(&config_path)?;
+        let local_root = cfg.paths.local_root;
+        let state_path = state_path_for(&local_root, mode);
+        (local_root, state_path)
+    } else {
+        let state_dir =
+            existing_or(&root, crate::names::STATE_DIR, crate::names::LEGACY_STATE_DIR);
+        (root.clone(), state_dir.join("state.json"))
+    };
 
-    let rel = match file_path.strip_prefix(&root) {
+    let rel = match file_path.strip_prefix(&rel_root) {
         Ok(r) => r.to_string_lossy().replace('\\', "/"),
         Err(_) => return Ok(()),
     };
 
     // Cooldown check. If the state entry's last_synced is within the
-    // cooldown window, skip the pull.
-    // (Loading Config is deferred until we know we're going to act, so a
-    // malformed config doesn't kill unrelated tool calls.)
-    let state_path = state_dir.join("state.json");
+    // cooldown window, skip the pull. Apply mode keeps config loading deferred
+    // until we know we're going to act; dry-run loaded it above only to resolve
+    // the configured local root for read-through state selection.
     if let Ok(state) = StateFile::load_or_default(&state_path) {
         if let Some(record) = state.files.get(&rel) {
             let elapsed = Utc::now().signed_duration_since(record.last_synced);
@@ -101,8 +109,10 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
         }
     }
 
-    // Load config lazily now that we know we're about to act.
-    let _cfg_check = Config::load(&config_path)?;
+    if mode.should_apply() {
+        // Preserve apply mode's lazy config validation after the cooldown check.
+        let _cfg_check = Config::load(&config_path)?;
+    }
 
     // Fast single-file pull with force=true. The hook contract is "give me
     // the current remote version"; users who don't want that shouldn't
