@@ -195,3 +195,72 @@ fn forced_pull_dry_run_previews_overwrite_without_writing() {
 
     let _fixture_guard = &fixture.container;
 }
+
+#[test]
+#[ignore = "requires Docker"]
+fn hook_dry_run_preserves_legacy_names() {
+    let fixture = support::start_ftp();
+    let remote_bytes = b"legacy hook remote only\n";
+    let rel = "legacy-hook-target.txt";
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.upload_bytes(&support::remote_path(rel), remote_bytes)
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let current_config = support::write_config(dir.path(), &fixture);
+    let legacy_config = dir.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    std::fs::rename(&current_config, &legacy_config).unwrap();
+
+    let legacy_state = dir
+        .path()
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    let mut state = ferry::state::StateFile::default();
+    state.server_supports_mdtm = Some(false);
+    state.save(&legacy_state).unwrap();
+
+    let config_before = std::fs::read(&legacy_config).unwrap();
+    let state_before = std::fs::read(&legacy_state).unwrap();
+    let target = dir.path().join(rel);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .args(["hook", "--cooldown", "0", "--dry-run"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.as_mut().unwrap(),
+        &serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": target},
+        }),
+    )
+    .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!("ferry hook: would pull {rel}")),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(std::fs::read(&legacy_config).unwrap(), config_before);
+    assert_eq!(std::fs::read(&legacy_state).unwrap(), state_before);
+    assert!(!dir.path().join(ferry::names::CONFIG_FILE).exists());
+    assert!(!dir.path().join(ferry::names::STATE_DIR).exists());
+    assert!(!target.exists());
+    assert_eq!(
+        ftp.download(&support::remote_path(rel)).unwrap(),
+        remote_bytes
+    );
+
+    let _fixture_guard = &fixture.container;
+}

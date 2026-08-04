@@ -364,10 +364,11 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool, mode: ExecutionMode)
     Ok(pull_required)
 }
 
-/// Write `bytes` to `local_path` atomically (via temp + rename) and refresh
-/// the corresponding state entry. Shared with the sync command — both pull
-/// and sync need exactly this "write + record the new hash" sequence on the
-/// remote-wins branch.
+/// In [`ExecutionMode::Apply`], write `bytes` to `local_path` atomically (via
+/// temp + rename) and refresh the corresponding state entry. In
+/// [`ExecutionMode::DryRun`], perform neither mutation.
+///
+/// Shared with the sync command on its remote-wins branch.
 pub fn download_one(
     ftp: &mut Ftp,
     state: &mut StateFile,
