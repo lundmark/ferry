@@ -84,6 +84,71 @@ fn pull_file_dry_run_does_not_create_local_file_or_state() {
 
 #[test]
 #[ignore = "requires Docker"]
+fn sync_dry_run_preserves_both_sides_and_state() {
+    let fixture = support::start_ftp();
+    let local_bytes = b"local sync dry-run bytes\n";
+    let remote_bytes = b"remote sync dry-run bytes\n";
+    let local_rel = "local-only.txt";
+    let remote_rel = "remote-only.txt";
+
+    let dir = tempfile::tempdir().unwrap();
+    let local_root = dir.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let local_path = local_root.join(local_rel);
+    let remote_local_path = local_root.join(remote_rel);
+    std::fs::write(&local_path, local_bytes).unwrap();
+
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.upload_bytes(&support::remote_path(remote_rel), remote_bytes)
+        .unwrap();
+
+    let generated_config = support::write_config(&local_root, &fixture);
+    let config = dir.path().join("sync-config.toml");
+    std::fs::rename(generated_config, &config).unwrap();
+    let state_path = local_root.join(".ferry/state.json");
+    assert!(!state_path.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("--config")
+        .arg(&config)
+        .args(["sync", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("would upload {local_rel}")),
+        "stdout={stdout}",
+    );
+    assert!(
+        stdout.contains(&format!("would download {remote_rel}")),
+        "stdout={stdout}",
+    );
+
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_bytes);
+    assert!(
+        ftp.size(&support::remote_path(local_rel)).is_err(),
+        "local-only file should remain absent remotely",
+    );
+    assert!(!remote_local_path.exists());
+    assert_eq!(
+        ftp.download(&support::remote_path(remote_rel)).unwrap(),
+        remote_bytes,
+    );
+    assert!(!state_path.exists());
+
+    let _fixture_guard = &fixture.container;
+}
+
+#[test]
+#[ignore = "requires Docker"]
 fn hook_dry_run_does_not_pull_or_save_state() {
     let fixture = support::start_ftp();
     let remote_bytes = b"hook remote only\n";

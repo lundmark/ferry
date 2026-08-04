@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub fn run(config_path: &Path, force: bool) -> Result<()> {
+pub fn run(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
@@ -115,9 +115,13 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                     &remote_path,
                     &bytes,
                     new_hash,
-                    ExecutionMode::Apply,
+                    mode,
                 )?;
-                println!("uploaded {rel}");
+                if mode.is_dry_run() {
+                    println!("would upload {rel}");
+                } else {
+                    println!("uploaded {rel}");
+                }
             }
             FileState::RemoteChanged | FileState::RemoteOnly => {
                 // We need real bytes to write locally. If the fast path
@@ -138,9 +142,13 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                     &remote_path,
                     &bytes_owned,
                     &rh_inner.sha256,
-                    ExecutionMode::Apply,
+                    mode,
                 )?;
-                println!("downloaded {rel}");
+                if mode.is_dry_run() {
+                    println!("would download {rel}");
+                } else {
+                    println!("downloaded {rel}");
+                }
             }
             FileState::BothChanged | FileState::Untracked => {
                 // Conflict: both sides moved away from the last known state
@@ -154,7 +162,11 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                     let new_hash = local_hash
                         .as_deref()
                         .expect("local_hash set when on_local is true");
-                    eprintln!("overwriting remote with local (--force): {rel}");
+                    if mode.is_dry_run() {
+                        eprintln!("would overwrite remote with local (--force): {rel}");
+                    } else {
+                        eprintln!("overwriting remote with local (--force): {rel}");
+                    }
                     upload_one(
                         &mut ftp,
                         &mut state,
@@ -162,7 +174,7 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
                         &remote_path,
                         &bytes,
                         new_hash,
-                        ExecutionMode::Apply,
+                        mode,
                     )?;
                 } else {
                     eprintln!(
@@ -175,9 +187,11 @@ pub fn run(config_path: &Path, force: bool) -> Result<()> {
         }
     }
 
-    // Persist progress even on conflict so the clean files don't have to be
+    // Persist apply progress even on conflict so the clean files don't have to be
     // re-hashed next run. Matches push/pull behavior.
-    state.save(&state_path)?;
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
 
     if had_conflict {
         // Tag as `Exit::Conflict` so `main()` returns exit code 2 — Zed's
