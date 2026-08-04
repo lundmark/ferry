@@ -7,7 +7,7 @@
 
 use crate::commands::remote_hash;
 use crate::commands::walk::{collect_remote_arg, remote_join, safe_rel, walk_local, walk_remote};
-use crate::commands::ExecutionMode;
+use crate::commands::{state_path_for, ExecutionMode};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
@@ -21,7 +21,7 @@ use std::path::Path;
 pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+    let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;

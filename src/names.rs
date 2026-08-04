@@ -13,6 +13,18 @@ pub const LEGACY_CONFIG_FILE: &str = ".zed-ftp.toml";
 /// The state directory name used before the rename from `zed-ftp`.
 pub const LEGACY_STATE_DIR: &str = ".zed-ftp";
 
+/// Select the current config for reading, falling back to the legacy name only
+/// when the current file is absent. This helper never mutates either path.
+pub fn config_path_for_read(dir: &Path) -> std::path::PathBuf {
+    let current = dir.join(CONFIG_FILE);
+    if current.exists() {
+        current
+    } else {
+        let legacy = dir.join(LEGACY_CONFIG_FILE);
+        if legacy.exists() { legacy } else { current }
+    }
+}
+
 /// One-time, in-place rename of legacy `.zed-ftp` files in `dir` to the current
 /// `.ferry` names. Idempotent and non-clobbering: each item is renamed only
 /// when the new name is absent and the legacy name is present, so a clean or
@@ -42,6 +54,32 @@ pub fn migrate_legacy(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_read_path_falls_back_to_current_when_neither_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(config_path_for_read(dir.path()), dir.path().join(CONFIG_FILE));
+    }
+
+    #[test]
+    fn config_read_path_uses_legacy_when_current_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_CONFIG_FILE);
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        assert_eq!(config_path_for_read(dir.path()), legacy);
+    }
+
+    #[test]
+    fn config_read_path_prefers_current_over_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(CONFIG_FILE);
+        let legacy = dir.path().join(LEGACY_CONFIG_FILE);
+        std::fs::write(&current, "current").unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        assert_eq!(config_path_for_read(dir.path()), current);
+    }
 
     #[test]
     fn migrate_renames_legacy_config_and_state() {

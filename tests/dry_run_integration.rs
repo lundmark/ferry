@@ -577,3 +577,62 @@ fn validating_init_dry_run_previews_resolution_without_writes() {
 
     let _fixture_guard = &fixture.container;
 }
+
+#[test]
+#[ignore = "requires Docker"]
+fn status_dry_run_does_not_persist_mdtm_cache() {
+    let fixture = support::start_ftp();
+    let rel = "status-cache.txt";
+    let bytes = b"status cache bytes\n";
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    let remote_path = support::remote_path(rel);
+    ftp.upload_bytes(&remote_path, bytes).unwrap();
+    let remote_mtime = ftp.mtime(&remote_path).unwrap();
+    let remote_size = ftp.size(&remote_path).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(rel), bytes).unwrap();
+    let state_path = dir.path().join(".ferry/state.json");
+    let now = chrono::Utc::now();
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        rel.into(),
+        ferry::state::FileRecord {
+            sha256: hash_bytes(bytes),
+            size: remote_size,
+            remote_mtime,
+            last_synced: now,
+        },
+    );
+    assert_eq!(state.server_supports_mdtm, None);
+    state.save(&state_path).unwrap();
+    let state_before = std::fs::read(&state_path).unwrap();
+    let config = support::write_config(dir.path(), &fixture);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("--config")
+        .arg(&config)
+        .args(["status", "--dry-run"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("InSync") && stdout.contains(rel),
+        "expected ordinary status output; stdout={stdout}",
+    );
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        state_before,
+        "dry-run must not persist the MDTM capability cache",
+    );
+
+    let _fixture_guard = &fixture.container;
+}

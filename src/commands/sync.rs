@@ -17,7 +17,7 @@
 //! user says "just sync it already," last-write-wins from the local side
 //! since that's the side the user is actively editing.
 
-use crate::commands::ExecutionMode;
+use crate::commands::{state_path_for, ExecutionMode};
 use crate::commands::pull::download_one;
 use crate::commands::push::upload_one;
 use crate::commands::remote_hash;
@@ -34,7 +34,7 @@ use std::path::Path;
 pub fn run(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+    let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;

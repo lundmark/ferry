@@ -1,4 +1,4 @@
-use crate::commands::remote_hash;
+use crate::commands::{remote_hash, state_path_for, ExecutionMode};
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -9,10 +9,10 @@ use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub fn run(config_path: &Path) -> Result<()> {
+pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+    let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
@@ -66,9 +66,11 @@ pub fn run(config_path: &Path) -> Result<()> {
         println!("{:>14}\t{}", format!("{:?}", st), rel);
     }
 
-    // Persist any cached `server_supports_mdtm` decision so subsequent runs
-    // skip the MDTM probe entirely on servers that don't support it.
-    state.save(&state_path)?;
+    // In apply mode, persist the MDTM capability decision so subsequent runs
+    // can skip the probe. Dry-run keeps the cache update in memory only.
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
 
     Ok(())
 }

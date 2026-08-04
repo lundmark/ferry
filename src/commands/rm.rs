@@ -7,7 +7,7 @@
 //! may not escape the sync roots, and deleting a directory demands
 //! `--recursive`.
 
-use crate::commands::ExecutionMode;
+use crate::commands::{state_path_for, ExecutionMode};
 use crate::commands::walk::{remote_join, safe_rel, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -36,7 +36,7 @@ pub fn run(
     let rels: Vec<String> = paths.iter().map(|p| safe_rel(p)).collect::<Result<_>>()?;
 
     let local_root = cfg.paths.local_root.clone();
-    let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+    let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
 

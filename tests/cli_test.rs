@@ -86,3 +86,54 @@ fn unknown_subcommand_is_non_zero() {
     let out = bin().args(["bogus"]).output().unwrap();
     assert_ne!(out.status.code(), Some(0));
 }
+
+#[test]
+fn dry_run_does_not_migrate_legacy_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let legacy_config = dir.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    let legacy_state = dir
+        .path()
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    std::fs::write(
+        &legacy_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+local_root = "."
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let state = ferry::state::StateFile::default();
+    state.save(&legacy_state).unwrap();
+    let config_before = std::fs::read(&legacy_config).unwrap();
+    let state_before = std::fs::read(&legacy_state).unwrap();
+
+    let out = bin()
+        .args(["status", "--dry-run"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected auth exit after loading legacy config; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ftp connect 127.0.0.1:1"),
+        "legacy config was not read through; stderr={stderr}",
+    );
+    assert_eq!(std::fs::read(&legacy_config).unwrap(), config_before);
+    assert_eq!(std::fs::read(&legacy_state).unwrap(), state_before);
+    assert!(!dir.path().join(ferry::names::CONFIG_FILE).exists());
+    assert!(!dir.path().join(ferry::names::STATE_DIR).exists());
+}

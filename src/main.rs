@@ -61,9 +61,13 @@ fn run() -> i32 {
     let cli = Cli::parse();
     let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
     let explicit_config = cli.config.is_some();
-    let cfg = cli
-        .config
-        .unwrap_or_else(|| std::path::PathBuf::from(ferry::names::CONFIG_FILE));
+    let cfg = cli.config.unwrap_or_else(|| {
+        if mode.is_dry_run() {
+            ferry::names::config_path_for_read(std::path::Path::new("."))
+        } else {
+            std::path::PathBuf::from(ferry::names::CONFIG_FILE)
+        }
+    });
     // Auto-migrate legacy `.zed-ftp` config/state to the current `.ferry` names
     // when using the default config location. Best-effort: a migration failure
     // is a warning, not a hard stop — the command below will surface any real
@@ -77,7 +81,7 @@ fn run() -> i32 {
         Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate, mode),
         Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
         Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
-        Cmd::Status => ferry::commands::status::run(&cfg),
+        Cmd::Status => ferry::commands::status::run(&cfg, mode),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
         Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force, mode),
