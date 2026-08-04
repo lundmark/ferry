@@ -51,6 +51,29 @@ ferry init --no-validate
 This writes a `.ferry.toml` to the project root and appends it to
 `.gitignore`.
 
+## Dry runs
+
+Add `--dry-run` anywhere in a Ferry command to preview write-capable commands
+without changing local files, the remote server, or Ferry's config and state:
+
+```sh
+ferry push src/example.c --dry-run
+ferry sync --dry-run
+ferry rm old/file.c --dry-run
+```
+
+Ferry still connects, reads and hashes files, validates paths and credentials,
+and detects conflicts. A dry run can therefore fail with the same validation,
+authentication, path, or conflict exit code as the real command. Adding
+`--force` changes the planned overwrite but remains non-mutating.
+
+Previewed actions use future-tense output such as `would push`, `would pull`,
+`would upload`, `would download`, and `would delete`. This protection covers
+`push`, `pull`, `sync`, `rm`, `init`, and `hook`, including config,
+`.gitignore`, sync-state, and legacy-name migration writes. `status --dry-run`
+also suppresses its normally hidden state-cache update. The observational
+`ls` and `cc` / `check` commands otherwise behave normally.
+
 ## Tasks.json integration
 
 Copy [`examples/tasks.json`](examples/tasks.json) into your project's

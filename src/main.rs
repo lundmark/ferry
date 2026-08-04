@@ -9,6 +9,7 @@ struct Cli {
     config: Option<std::path::PathBuf>,
     #[arg(long, short, global = true)]
     verbose: bool,
+    /// Preview write-capable commands without changing local, remote, or Ferry state.
     #[arg(long, global = true)]
     dry_run: bool,
 }
