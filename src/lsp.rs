@@ -7,14 +7,24 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, MessageType, ServerCapabilities,
-    ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions,
+    CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, Command,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, ExecuteCommandOptions,
+    ExecuteCommandParams, MessageType, ServerCapabilities, ShowMessageParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
 };
 
 use crate::commands::ExecutionMode;
 use crate::commands::cc::{self, FileCheckResult};
 use crate::commands::file_transfer::TransferOutcome;
+
+pub const PULL_COMMAND: &str = "ferry.pull";
+pub const PUSH_COMMAND: &str = "ferry.push";
+pub const COMPILE_COMMAND: &str = "ferry.compile";
+pub const ACTION_COMMANDS: &[&str] = &[PULL_COMMAND, PUSH_COMMAND, COMPILE_COMMAND];
+
+const CODE_ACTION_METHOD: &str = "textDocument/codeAction";
+const EXECUTE_COMMAND_METHOD: &str = "workspace/executeCommand";
 
 pub trait FileOperations {
     fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome>;
@@ -86,6 +96,93 @@ impl<O: FileOperations> Server<O> {
         Vec::new()
     }
 
+    fn process_request(&mut self, request: Request) -> Vec<Message> {
+        match request.method.as_str() {
+            CODE_ACTION_METHOD => vec![Message::Response(code_actions(request))],
+            EXECUTE_COMMAND_METHOD => self.execute_command(request),
+            _ => vec![Message::Response(Response::new_err(
+                request.id,
+                ErrorCode::MethodNotFound as i32,
+                "unsupported request".to_string(),
+            ))],
+        }
+    }
+
+    fn execute_command(&mut self, request: Request) -> Vec<Message> {
+        let id = request.id;
+        let params = match serde_json::from_value::<ExecuteCommandParams>(request.params) {
+            Ok(params) => params,
+            Err(_) => {
+                return vec![Message::Response(invalid_params(
+                    id,
+                    "invalid execute-command parameters",
+                ))];
+            }
+        };
+        if !ACTION_COMMANDS.contains(&params.command.as_str()) || params.arguments.len() != 1 {
+            return vec![Message::Response(invalid_params(
+                id,
+                "invalid Ferry command or arguments",
+            ))];
+        }
+        let Some(uri) = params.arguments[0].as_str() else {
+            return vec![Message::Response(invalid_params(
+                id,
+                "expected one file URI argument",
+            ))];
+        };
+        let Some(path) = uri_to_path(uri) else {
+            return vec![Message::Response(invalid_params(
+                id,
+                "expected one file URI argument",
+            ))];
+        };
+        let resolved = match crate::project::resolve_file(&path, true) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return vec![Message::Response(invalid_params(
+                    id,
+                    "file is outside a Ferry project",
+                ))];
+            }
+            Err(error) => {
+                return operation_response(
+                    id,
+                    warning_message(format!(
+                        "ferry: {}; run a Ferry task for details",
+                        safe_error_summary(&error)
+                    )),
+                );
+            }
+        };
+        let relative_path = resolved.relative_path;
+        let feedback = match params.command.as_str() {
+            PULL_COMMAND => transfer_feedback(
+                &relative_path,
+                self.operations.pull(
+                    &resolved.config_path,
+                    &relative_path,
+                    /* force = */ false,
+                ),
+            ),
+            PUSH_COMMAND => transfer_feedback(
+                &relative_path,
+                self.operations.push(
+                    &resolved.config_path,
+                    &relative_path,
+                    /* force = */ false,
+                ),
+            ),
+            COMPILE_COMMAND => compile_feedback(
+                &relative_path,
+                self.operations
+                    .compile(&resolved.config_path, &relative_path),
+            ),
+            _ => unreachable!("command was validated above"),
+        };
+        operation_response(id, feedback)
+    }
+
     fn handle_file_event(&mut self, uri: &str, event: Event) -> Option<Message> {
         let Some(path) = uri_to_path(uri) else {
             return None;
@@ -132,6 +229,35 @@ impl<O: FileOperations> Server<O> {
     }
 }
 
+fn code_actions(request: Request) -> Response {
+    let id = request.id;
+    let params = match serde_json::from_value::<CodeActionParams>(request.params) {
+        Ok(params) => params,
+        Err(_) => return invalid_params(id, "invalid code-action parameters"),
+    };
+    let uri = params.text_document.uri;
+    let actions = uri_to_path(uri.as_str())
+        .and_then(|path| crate::project::resolve_file(&path, true).ok().flatten())
+        .map(|_| {
+            [
+                ("Ferry: Pull", PULL_COMMAND),
+                ("Ferry: Push", PUSH_COMMAND),
+                ("Ferry: Compile-check", COMPILE_COMMAND),
+            ]
+            .into_iter()
+            .map(|(title, command)| {
+                CodeActionOrCommand::Command(Command {
+                    title: title.to_string(),
+                    command: command.to_string(),
+                    arguments: Some(vec![serde_json::Value::String(uri.as_str().to_string())]),
+                })
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Response::new_ok(id, actions)
+}
+
 #[derive(Clone, Copy)]
 enum Event {
     Open,
@@ -149,15 +275,28 @@ pub fn capabilities() -> ServerCapabilities {
                 save: Some(TextDocumentSyncSaveOptions::Supported(true)),
             },
         )),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: ACTION_COMMANDS
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
         ..ServerCapabilities::default()
     }
+}
+
+enum Work {
+    Notification(Notification),
+    Request(Request),
 }
 
 pub fn main_loop<O: FileOperations + Send + 'static>(
     connection: Connection,
     mut server: Server<O>,
 ) -> Result<()> {
-    let (work_sender, work_receiver) = mpsc::channel::<Notification>();
+    let (work_sender, work_receiver) = mpsc::channel::<Work>();
     let (outbound_sender, outbound_receiver) = mpsc::channel::<Message>();
     let running = Arc::new(AtomicBool::new(true));
     let worker_running = Arc::clone(&running);
@@ -167,13 +306,17 @@ pub fn main_loop<O: FileOperations + Send + 'static>(
     // after the protocol loop exits.
     let _worker = thread::spawn(move || {
         while worker_running.load(Ordering::Acquire) {
-            let Ok(notification) = work_receiver.recv() else {
+            let Ok(work) = work_receiver.recv() else {
                 return;
             };
             if !worker_running.load(Ordering::Acquire) {
                 return;
             }
-            for message in server.process_notification(notification) {
+            let messages = match work {
+                Work::Notification(notification) => server.process_notification(notification),
+                Work::Request(request) => server.process_request(request),
+            };
+            for message in messages {
                 if outbound_sender.send(message).is_err() {
                     return;
                 }
@@ -189,7 +332,7 @@ pub fn main_loop<O: FileOperations + Send + 'static>(
 
 fn protocol_loop(
     connection: &Connection,
-    work_sender: &mpsc::Sender<Notification>,
+    work_sender: &mpsc::Sender<Work>,
     outbound_receiver: &mpsc::Receiver<Message>,
 ) -> Result<()> {
     loop {
@@ -201,12 +344,12 @@ fn protocol_loop(
 
         match connection.receiver.try_recv() {
             Ok(Message::Request(request)) => {
-                if handle_request(connection, request)? {
+                if handle_request(connection, work_sender, request)? {
                     return Ok(());
                 }
             }
             Ok(Message::Notification(notification)) => {
-                if work_sender.send(notification).is_err() {
+                if work_sender.send(Work::Notification(notification)).is_err() {
                     return Ok(());
                 }
             }
@@ -217,9 +360,23 @@ fn protocol_loop(
     }
 }
 
-fn handle_request(connection: &Connection, request: Request) -> Result<bool> {
+fn handle_request(
+    connection: &Connection,
+    work_sender: &mpsc::Sender<Work>,
+    request: Request,
+) -> Result<bool> {
     if request.method == "shutdown" {
         return Ok(connection.handle_shutdown(&request)?);
+    }
+
+    if request.method == CODE_ACTION_METHOD {
+        let response = code_actions(request);
+        let _ = connection.sender.send(Message::Response(response));
+        return Ok(false);
+    }
+
+    if request.method == EXECUTE_COMMAND_METHOD {
+        return Ok(work_sender.send(Work::Request(request)).is_err());
     }
 
     let response = Response::new_err(
@@ -229,6 +386,14 @@ fn handle_request(connection: &Connection, request: Request) -> Result<bool> {
     );
     let _ = connection.sender.send(Message::Response(response));
     Ok(false)
+}
+
+fn invalid_params(id: lsp_server::RequestId, message: &str) -> Response {
+    Response::new_err(id, ErrorCode::InvalidParams as i32, message.to_string())
+}
+
+fn operation_response(id: lsp_server::RequestId, feedback: Message) -> Vec<Message> {
+    vec![Message::Response(Response::new_ok(id, ())), feedback]
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -258,6 +423,57 @@ fn warning_message(message: String) -> Message {
     Message::Notification(notification)
 }
 
+fn info_message(message: String) -> Message {
+    let notification = Notification::new(
+        "window/showMessage".to_string(),
+        ShowMessageParams {
+            typ: MessageType::INFO,
+            message,
+        },
+    );
+    Message::Notification(notification)
+}
+
+fn transfer_feedback(relative_path: &str, result: Result<TransferOutcome>) -> Message {
+    match result {
+        Ok(outcome) => {
+            let summary = match outcome.status {
+                crate::commands::file_transfer::TransferStatus::Transferred => "transferred",
+                crate::commands::file_transfer::TransferStatus::Unchanged => "unchanged",
+                crate::commands::file_transfer::TransferStatus::SkippedMissingSource => {
+                    "skipped: source missing"
+                }
+            };
+            info_message(format!("ferry: {relative_path}: {summary}"))
+        }
+        Err(error) => warning_message(format!(
+            "ferry: {relative_path}: {}; run a Ferry task for details",
+            safe_error_summary(&error)
+        )),
+    }
+}
+
+fn compile_feedback(relative_path: &str, result: Result<FileCheckResult>) -> Message {
+    match result {
+        Ok(result) => match result.status {
+            crate::commands::cc::FileCheckStatus::Passed => {
+                info_message(format!("ferry: {relative_path}: compile-check passed"))
+            }
+            crate::commands::cc::FileCheckStatus::Failed => warning_message(format!(
+                "ferry: {relative_path}: compile-check failed: {}",
+                result.diagnostics
+            )),
+            crate::commands::cc::FileCheckStatus::TransportError(_) => warning_message(format!(
+                "ferry: {relative_path}: compile-check transport error; run a Ferry task for details"
+            )),
+        },
+        Err(error) => warning_message(format!(
+            "ferry: {relative_path}: {}; run a Ferry task for details",
+            safe_error_summary(&error)
+        )),
+    }
+}
+
 fn safe_error_summary(error: &anyhow::Error) -> &'static str {
     for source in error.chain() {
         if let Some(exit) = source.downcast_ref::<crate::error::Exit>() {
@@ -280,7 +496,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Result, anyhow};
     use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
@@ -306,6 +522,10 @@ mod tests {
             rel: String,
             force: bool,
         },
+        Compile {
+            config_path: PathBuf,
+            rel: String,
+        },
     }
 
     #[derive(Clone, Copy)]
@@ -319,6 +539,8 @@ mod tests {
         calls: Rc<RefCell<Vec<Call>>>,
         failure: Option<Failure>,
         status: TransferStatus,
+        compile_status: FileCheckStatus,
+        diagnostics: String,
     }
 
     impl FakeOperations {
@@ -327,6 +549,8 @@ mod tests {
                 calls,
                 failure: None,
                 status: TransferStatus::Transferred,
+                compile_status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
             }
         }
 
@@ -335,6 +559,8 @@ mod tests {
                 calls,
                 failure: None,
                 status,
+                compile_status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
             }
         }
 
@@ -343,6 +569,22 @@ mod tests {
                 calls,
                 failure: Some(failure),
                 status: TransferStatus::Transferred,
+                compile_status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            }
+        }
+
+        fn compiling(
+            calls: Rc<RefCell<Vec<Call>>>,
+            status: FileCheckStatus,
+            diagnostics: &str,
+        ) -> Self {
+            Self {
+                calls,
+                failure: None,
+                status: TransferStatus::Transferred,
+                compile_status: status,
+                diagnostics: diagnostics.to_string(),
             }
         }
 
@@ -380,12 +622,26 @@ mod tests {
             self.result(rel)
         }
 
-        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
-            Ok(FileCheckResult {
-                path: rel.to_string(),
-                status: FileCheckStatus::Passed,
-                diagnostics: String::new(),
-            })
+        fn compile(&mut self, config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            self.calls.borrow_mut().push(Call::Compile {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+            });
+            match self.failure {
+                Some(Failure::Conflict) => {
+                    Err(crate::error::Exit::Conflict("changed".into()).into())
+                }
+                Some(Failure::Generic) => Err(anyhow!("transport unavailable")),
+                Some(Failure::SensitiveAuth) => Err(crate::error::Exit::Auth(format!(
+                    "login rejected for {REVIEW_SECRET}"
+                ))
+                .into()),
+                None => Ok(FileCheckResult {
+                    path: rel.to_string(),
+                    status: self.compile_status.clone(),
+                    diagnostics: self.diagnostics.clone(),
+                }),
+            }
         }
     }
 
@@ -702,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn task_six_capabilities_advertise_only_text_synchronization() {
+    fn capabilities_advertise_text_sync_and_exact_ferry_actions() {
         assert_eq!(
             capabilities(),
             ServerCapabilities {
@@ -715,6 +971,15 @@ mod tests {
                         save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                     },
                 )),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![
+                        PULL_COMMAND.to_string(),
+                        PUSH_COMMAND.to_string(),
+                        COMPILE_COMMAND.to_string(),
+                    ],
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
                 ..ServerCapabilities::default()
             }
         );
@@ -773,6 +1038,480 @@ mod tests {
             Message::Response(response) if response.id == RequestId::from(id) => response,
             other => panic!("expected response {id}, got {other:?}"),
         }
+    }
+
+    fn code_action_request(id: i32, uri: &Uri) -> Request {
+        Request::new(
+            RequestId::from(id),
+            "textDocument/codeAction".to_string(),
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+    }
+
+    fn request_code_actions(uri: Uri) -> Response {
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(SendOperations)));
+        client_connection
+            .sender
+            .send(Message::Request(code_action_request(61, &uri)))
+            .unwrap();
+
+        let response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("code-action response");
+        send_shutdown(&client_connection, 62);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response");
+        loop_thread.join().unwrap().unwrap();
+        assert!(response_with_id(shutdown, 62).error.is_none());
+        response_with_id(response, 61)
+    }
+
+    #[test]
+    fn code_action_returns_exact_ferry_commands_for_project_file() {
+        let fixture = Fixture::new("");
+        let uri = fixture.uri();
+
+        let response = request_code_actions(uri.clone());
+
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result.unwrap(),
+            serde_json::json!([
+                {
+                    "title": "Ferry: Pull",
+                    "command": "ferry.pull",
+                    "arguments": [uri]
+                },
+                {
+                    "title": "Ferry: Push",
+                    "command": "ferry.push",
+                    "arguments": [uri]
+                },
+                {
+                    "title": "Ferry: Compile-check",
+                    "command": "ferry.compile",
+                    "arguments": [uri]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn code_action_returns_empty_for_non_file_uri() {
+        let uri = Uri::from_str("untitled:buffer").unwrap();
+
+        let response = request_code_actions(uri);
+
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn code_action_returns_empty_for_file_outside_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("outside.c");
+        fs::write(&path, "").unwrap();
+        let uri = Uri::from_str(&format!("file://{}", path.display())).unwrap();
+
+        let response = request_code_actions(uri);
+
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn code_action_rejects_malformed_parameters() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut server = Server::new(FakeOperations::successful(calls));
+        let request = Request::new(
+            RequestId::from(63),
+            CODE_ACTION_METHOD.to_string(),
+            serde_json::json!({ "textDocument": {} }),
+        );
+
+        let (response, messages) = process_server_request(&mut server, request);
+
+        assert_eq!(
+            response.error.unwrap().code,
+            ErrorCode::InvalidParams as i32
+        );
+        assert!(messages.is_empty());
+    }
+
+    fn execute_command_request(
+        id: i32,
+        command: &str,
+        arguments: Vec<serde_json::Value>,
+    ) -> Request {
+        Request::new(
+            RequestId::from(id),
+            EXECUTE_COMMAND_METHOD.to_string(),
+            serde_json::json!({
+                "command": command,
+                "arguments": arguments
+            }),
+        )
+    }
+
+    fn process_server_request<O: FileOperations>(
+        server: &mut Server<O>,
+        request: Request,
+    ) -> (Response, Vec<ShowMessageParams>) {
+        let mut response = None;
+        let mut notifications = Vec::new();
+        for message in server.process_request(request) {
+            match message {
+                Message::Response(item) => {
+                    assert!(response.replace(item).is_none(), "duplicate response");
+                }
+                Message::Notification(item) if item.method == "window/showMessage" => {
+                    notifications.push(serde_json::from_value(item.params).unwrap());
+                }
+                other => panic!("unexpected server message: {other:?}"),
+            }
+        }
+        (response.expect("request response"), notifications)
+    }
+
+    #[test]
+    fn execute_command_invalid_inputs_return_invalid_params_without_operations() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.c");
+        fs::write(&outside, "").unwrap();
+        let outside_uri = serde_json::json!(format!("file://{}", outside.display()));
+        let requests = vec![
+            execute_command_request(70, "ferry.unknown", vec![uri.clone()]),
+            execute_command_request(71, PULL_COMMAND, vec![]),
+            execute_command_request(72, PUSH_COMMAND, vec![uri.clone(), uri.clone()]),
+            execute_command_request(73, COMPILE_COMMAND, vec![serde_json::json!(42)]),
+            Request::new(
+                RequestId::from(74),
+                EXECUTE_COMMAND_METHOD.to_string(),
+                serde_json::json!({ "arguments": [uri.clone()] }),
+            ),
+            execute_command_request(75, PULL_COMMAND, vec![serde_json::json!("untitled:buffer")]),
+            execute_command_request(76, PUSH_COMMAND, vec![outside_uri]),
+        ];
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
+
+        for request in requests {
+            let (response, messages) = process_server_request(&mut server, request);
+            assert_eq!(
+                response.error.expect("InvalidParams response").code,
+                ErrorCode::InvalidParams as i32
+            );
+            assert!(messages.is_empty());
+        }
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn execute_command_manual_pull_and_push_run_once_without_force() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
+
+        for (id, command) in [(80, PULL_COMMAND), (81, PUSH_COMMAND)] {
+            let (response, messages) = process_server_request(
+                &mut server,
+                execute_command_request(id, command, vec![uri.clone()]),
+            );
+            assert!(response.error.is_none());
+            assert_eq!(response.result, Some(serde_json::Value::Null));
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].typ, MessageType::INFO);
+        }
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                Call::Pull {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                },
+                Call::Push {
+                    config_path: fixture.config_path,
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_command_transfer_success_feedback_distinguishes_every_outcome() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        for (status, expected) in [
+            (TransferStatus::Transferred, "transferred"),
+            (TransferStatus::Unchanged, "unchanged"),
+            (TransferStatus::SkippedMissingSource, "source missing"),
+        ] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut server = Server::new(FakeOperations::with_status(calls, status));
+
+            let (response, messages) = process_server_request(
+                &mut server,
+                execute_command_request(90, PULL_COMMAND, vec![uri.clone()]),
+            );
+
+            assert!(response.error.is_none());
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].typ, MessageType::INFO);
+            assert!(messages[0].message.contains("src/nested/hello world.c"));
+            assert!(messages[0].message.contains(expected));
+        }
+    }
+
+    #[test]
+    fn execute_command_transfer_failures_emit_safe_path_warnings() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        for failure in [Failure::Conflict, Failure::Generic, Failure::SensitiveAuth] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut server = Server::new(FakeOperations::failing(calls, failure));
+
+            let (response, messages) = process_server_request(
+                &mut server,
+                execute_command_request(100, PUSH_COMMAND, vec![uri.clone()]),
+            );
+
+            assert!(response.error.is_none());
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].typ, MessageType::WARNING);
+            assert!(messages[0].message.contains("src/nested/hello world.c"));
+            assert!(!messages[0].message.contains(REVIEW_SECRET));
+            assert!(!messages[0].message.contains("transport unavailable"));
+        }
+    }
+
+    #[test]
+    fn execute_command_compile_pass_and_failure_emit_detailed_feedback() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        for (status, diagnostics, expected_type) in [
+            (FileCheckStatus::Passed, "", MessageType::INFO),
+            (
+                FileCheckStatus::Failed,
+                "line 9: expected semicolon",
+                MessageType::WARNING,
+            ),
+        ] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut server = Server::new(FakeOperations::compiling(
+                Rc::clone(&calls),
+                status,
+                diagnostics,
+            ));
+
+            let (response, messages) = process_server_request(
+                &mut server,
+                execute_command_request(110, COMPILE_COMMAND, vec![uri.clone()]),
+            );
+
+            assert!(response.error.is_none());
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].typ, expected_type);
+            assert!(messages[0].message.contains("src/nested/hello world.c"));
+            if !diagnostics.is_empty() {
+                assert!(messages[0].message.contains(diagnostics));
+            }
+            assert_eq!(calls.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn execute_command_compile_transport_cases_emit_safe_warnings() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        let cases = [
+            FakeOperations::compiling(
+                Rc::new(RefCell::new(Vec::new())),
+                FileCheckStatus::TransportError(REVIEW_SECRET.to_string()),
+                "",
+            ),
+            FakeOperations::failing(Rc::new(RefCell::new(Vec::new())), Failure::SensitiveAuth),
+        ];
+        for operations in cases {
+            let mut server = Server::new(operations);
+
+            let (response, messages) = process_server_request(
+                &mut server,
+                execute_command_request(120, COMPILE_COMMAND, vec![uri.clone()]),
+            );
+
+            assert!(response.error.is_none());
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].typ, MessageType::WARNING);
+            assert!(messages[0].message.contains("src/nested/hello world.c"));
+            assert!(!messages[0].message.contains(REVIEW_SECRET));
+        }
+    }
+
+    struct RecordingSendOperations {
+        calls: Arc<Mutex<Vec<Call>>>,
+    }
+
+    impl FileOperations for RecordingSendOperations {
+        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::Pull {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+                force,
+            });
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::Push {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+                force,
+            });
+            Ok(TransferOutcome::new(rel, TransferStatus::Unchanged))
+        }
+
+        fn compile(&mut self, config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            self.calls.lock().unwrap().push(Call::Compile {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+            });
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    fn receive_request_messages(client: &Connection, id: i32, count: usize) -> Vec<Message> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut messages = Vec::new();
+        while messages.len() < count {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for request {id}");
+            messages.push(
+                client
+                    .receiver
+                    .recv_timeout(remaining)
+                    .unwrap_or_else(|_| panic!("timed out waiting for request {id}")),
+            );
+        }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::Response(response) if response.id == RequestId::from(id)))
+                .count(),
+            1,
+            "request must receive exactly one correlated response"
+        );
+        messages
+    }
+
+    #[test]
+    fn main_loop_processes_actions_and_commands_with_correlated_feedback() {
+        let fixture = Fixture::new("");
+        let uri = fixture.uri();
+        let uri_value = serde_json::to_value(&uri).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let operations = RecordingSendOperations {
+            calls: Arc::clone(&calls),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+
+        client_connection
+            .sender
+            .send(Message::Request(code_action_request(130, &uri)))
+            .unwrap();
+        let action_messages = receive_request_messages(&client_connection, 130, 1);
+        let actions = response_with_id(action_messages.into_iter().next().unwrap(), 130);
+        assert!(actions.error.is_none());
+        assert_eq!(actions.result.unwrap().as_array().unwrap().len(), 3);
+
+        let mut feedback = Vec::new();
+        for (id, command) in [
+            (131, PULL_COMMAND),
+            (132, PUSH_COMMAND),
+            (133, COMPILE_COMMAND),
+        ] {
+            client_connection
+                .sender
+                .send(Message::Request(execute_command_request(
+                    id,
+                    command,
+                    vec![uri_value.clone()],
+                )))
+                .unwrap();
+            let messages = receive_request_messages(&client_connection, id, 2);
+            for message in messages {
+                match message {
+                    Message::Response(response) => {
+                        assert_eq!(response.id, RequestId::from(id));
+                        assert!(response.error.is_none());
+                        assert_eq!(response.result, Some(serde_json::Value::Null));
+                    }
+                    Message::Notification(notification)
+                        if notification.method == "window/showMessage" =>
+                    {
+                        feedback.push(
+                            serde_json::from_value::<ShowMessageParams>(notification.params)
+                                .unwrap(),
+                        );
+                    }
+                    other => panic!("unexpected protocol message: {other:?}"),
+                }
+            }
+        }
+
+        send_shutdown(&client_connection, 134);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response");
+        loop_thread.join().unwrap().unwrap();
+
+        assert!(response_with_id(shutdown, 134).error.is_none());
+        assert_eq!(feedback.len(), 3);
+        assert!(feedback.iter().all(|message| {
+            message.typ == MessageType::INFO && message.message.contains("src/nested/hello world.c")
+        }));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Call::Pull {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                },
+                Call::Push {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                },
+                Call::Compile {
+                    config_path: fixture.config_path,
+                    rel: "src/nested/hello world.c".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -903,6 +1642,58 @@ mod tests {
         assert!(shutdown.error.is_none());
         assert!(prompt_loop_exit, "main loop should terminate promptly");
         assert!(writer_disconnected, "worker must not retain the LSP sender");
+    }
+
+    #[test]
+    fn code_action_remains_responsive_while_transfer_worker_is_blocked() {
+        let fixture = Fixture::new("");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let operations = BlockingOperations {
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull should start");
+        client_connection
+            .sender
+            .send(Message::Request(code_action_request(141, &fixture.uri())))
+            .unwrap();
+
+        let prompt_action = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(500))
+            .ok();
+        send_shutdown(&client_connection, 142);
+        let prompt_shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response");
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked operation should be released");
+        loop_thread.join().unwrap().unwrap();
+
+        let action = response_with_id(
+            prompt_action.expect("code action must not wait for transfer worker"),
+            141,
+        );
+        assert!(action.error.is_none());
+        assert_eq!(action.result.unwrap().as_array().unwrap().len(), 3);
+        assert!(response_with_id(prompt_shutdown, 142).error.is_none());
     }
 
     #[test]
