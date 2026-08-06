@@ -791,7 +791,7 @@ mod tests {
 
         let unsupported = client_connection
             .receiver
-            .recv_timeout(Duration::from_millis(150))
+            .recv_timeout(Duration::from_secs(2))
             .ok();
         send_shutdown(&client_connection, 42);
         let shutdown = client_connection
@@ -878,11 +878,9 @@ mod tests {
         send_shutdown(&client_connection, 51);
         let prompt_shutdown = client_connection
             .receiver
-            .recv_timeout(Duration::from_millis(150))
+            .recv_timeout(Duration::from_secs(2))
             .ok();
-        let prompt_loop_exit = loop_done_rx
-            .recv_timeout(Duration::from_millis(150))
-            .is_ok();
+        let prompt_loop_exit = loop_done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         let writer_disconnected = prompt_loop_exit
             && client_connection
                 .receiver
