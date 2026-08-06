@@ -118,27 +118,43 @@ impl<O: FileOperations> Server<O> {
     }
 
     fn process_command(&mut self, command: PreparedCommand) -> Message {
+        let resolved = match crate::project::resolve_file(&command.absolute_path, true) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return warning_message(format!(
+                    "ferry: {}: file is no longer in a Ferry project",
+                    command.initial_relative_path
+                ));
+            }
+            Err(error) => {
+                return warning_message(format!(
+                    "ferry: {}: {}; run a Ferry task for details",
+                    command.initial_relative_path,
+                    safe_error_summary(&error)
+                ));
+            }
+        };
         match command.action {
             ActionCommand::Pull => transfer_feedback(
-                &command.relative_path,
+                &resolved.relative_path,
                 self.operations.pull(
-                    &command.config_path,
-                    &command.relative_path,
+                    &resolved.config_path,
+                    &resolved.relative_path,
                     /* force = */ false,
                 ),
             ),
             ActionCommand::Push => transfer_feedback(
-                &command.relative_path,
+                &resolved.relative_path,
                 self.operations.push(
-                    &command.config_path,
-                    &command.relative_path,
+                    &resolved.config_path,
+                    &resolved.relative_path,
                     /* force = */ false,
                 ),
             ),
             ActionCommand::Compile => compile_feedback(
-                &command.relative_path,
+                &resolved.relative_path,
                 self.operations
-                    .compile(&command.config_path, &command.relative_path),
+                    .compile(&resolved.config_path, &resolved.relative_path),
             ),
         }
     }
@@ -227,8 +243,8 @@ enum ActionCommand {
 
 struct PreparedCommand {
     action: ActionCommand,
-    config_path: PathBuf,
-    relative_path: String,
+    absolute_path: PathBuf,
+    initial_relative_path: String,
 }
 
 enum PreparedRequest {
@@ -301,8 +317,8 @@ fn prepare_execute_command(request: Request) -> PreparedRequest {
         id,
         command: PreparedCommand {
             action,
-            config_path: resolved.config_path,
-            relative_path: resolved.relative_path,
+            absolute_path: path,
+            initial_relative_path: resolved.relative_path,
         },
     }
 }
@@ -1658,6 +1674,58 @@ mod tests {
         }
     }
 
+    struct QueueBlockingOperations {
+        calls: Arc<Mutex<Vec<Call>>>,
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+    }
+
+    impl FileOperations for QueueBlockingOperations {
+        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            let is_first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(Call::Pull {
+                    config_path: config_path.to_path_buf(),
+                    rel: rel.to_string(),
+                    force,
+                });
+                calls.len() == 1
+            };
+            if is_first {
+                self.started.send(()).unwrap();
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+                self.finished.send(()).unwrap();
+            }
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::Push {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+                force,
+            });
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            self.calls.lock().unwrap().push(Call::Compile {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+            });
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
     #[test]
     fn main_loop_shutdown_does_not_wait_for_blocked_file_operation() {
         let fixture = Fixture::new("");
@@ -1830,6 +1898,83 @@ mod tests {
         assert!(response_with_id(prompt_shutdown, 152).error.is_none());
         assert!(prompt_loop_exit, "main loop should terminate promptly");
         assert!(writer_disconnected, "worker must not retain the LSP sender");
+    }
+
+    #[test]
+    fn queued_command_re_resolves_after_project_roots_change() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let operations = QueueBlockingOperations {
+            calls: Arc::clone(&calls),
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("automatic pull should block first");
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                161,
+                PULL_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let prompt_command = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .ok();
+
+        let other_root = fixture.config_path.parent().unwrap().join("other");
+        fs::create_dir(&other_root).unwrap();
+        fixture.set_raw_config(
+            "[connection]\nhost = \"example.invalid\"\nuser = \"u\"\npassword = \"p\"\n\
+             [paths]\nlocal_root = \"other\"\nremote_root = \"/changed\"\n",
+        );
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked operation should be released");
+        let eventual_feedback = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .ok();
+        let no_duplicate = client_connection.receiver.try_recv().is_err();
+        send_shutdown(&client_connection, 162);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response");
+        loop_thread.join().unwrap().unwrap();
+
+        let command = response_with_id(prompt_command.expect("prompt command response"), 161);
+        assert!(command.error.is_none());
+        assert_eq!(command.result, Some(serde_json::Value::Null));
+        let warning = match eventual_feedback.expect("safe stale-command warning") {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
+            }
+            other => panic!("expected warning feedback, got {other:?}"),
+        };
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert!(warning.message.contains("src/nested/hello world.c"));
+        assert!(!warning.message.contains("/changed"));
+        assert_eq!(calls.lock().unwrap().len(), 1, "stale target must not run");
+        assert!(no_duplicate, "command must receive exactly one response");
+        assert!(response_with_id(shutdown, 162).error.is_none());
     }
 
     #[test]
