@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ferry", version, about = "FTP sync helper for editors and coding agents")]
+#[command(
+    name = "ferry",
+    version,
+    about = "FTP sync helper for editors and coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -17,7 +21,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Interactive setup; validates existing local files vs remote.
-    Init { #[arg(long)] no_validate: bool },
+    Init {
+        #[arg(long)]
+        no_validate: bool,
+    },
     /// List a remote directory (connectivity smoke test). PATH is relative
     /// to `paths.remote_root` from the config; empty lists the root itself.
     Ls { path: Option<String> },
@@ -32,15 +39,30 @@ enum Cmd {
     /// Show per-file sync state vs remote.
     Status,
     /// Download remote -> local.
-    Pull { paths: Vec<String>, #[arg(long)] force: bool },
+    Pull {
+        paths: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Upload local -> remote.
-    Push { paths: Vec<String>, #[arg(long)] force: bool },
+    Push {
+        paths: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Pull then push; refuses on conflict unless --force.
-    Sync { #[arg(long)] force: bool },
+    Sync {
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete files on the remote server and the local mirror (and drop their
     /// state records). Requires explicit paths; pass --recursive to delete a
     /// directory subtree.
-    Rm { paths: Vec<String>, #[arg(long)] recursive: bool },
+    Rm {
+        paths: Vec<String>,
+        #[arg(long)]
+        recursive: bool,
+    },
     /// Check-compile files on the MUD via the UDP compile service. Prints
     /// per-file OK/FAIL and diagnostics; exits non-zero if any failed.
     #[command(alias = "check")]
@@ -61,6 +83,14 @@ fn main() {
 fn run() -> i32 {
     let cli = Cli::parse();
     let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
+    if matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty()) {
+        return finish(ferry::commands::rm::run(
+            std::path::Path::new(""),
+            &[],
+            false,
+            mode,
+        ));
+    }
     let explicit_config = cli.config.is_some();
     let mut cfg = cli.config.unwrap_or_else(|| default_config_path(&cli.cmd));
     let explicit_legacy_config = explicit_config
@@ -105,6 +135,10 @@ fn run() -> i32 {
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
     };
+    finish(result)
+}
+
+fn finish(result: anyhow::Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {

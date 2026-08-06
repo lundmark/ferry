@@ -29,6 +29,67 @@ fn rm_requires_at_least_one_path() {
 }
 
 #[test]
+fn bare_rm_does_not_migrate_legacy_project_files() {
+    let project = tempfile::tempdir().unwrap();
+    let legacy_config = project.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    let legacy_state = project
+        .path()
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    std::fs::write(
+        &legacy_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    ferry::state::StateFile::default()
+        .save(&legacy_state)
+        .unwrap();
+    let config_before = std::fs::read(&legacy_config).unwrap();
+    let state_before = std::fs::read(&legacy_state).unwrap();
+
+    let out = bin()
+        .arg("rm")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "bare rm should exit non-zero");
+    assert!(stderr.contains("at least one path"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&legacy_config).unwrap(), config_before);
+    assert_eq!(std::fs::read(&legacy_state).unwrap(), state_before);
+    assert!(!project.path().join(ferry::names::CONFIG_FILE).exists());
+    assert!(!project.path().join(ferry::names::STATE_DIR).exists());
+}
+
+#[test]
+fn malformed_hook_json_does_not_echo_input() {
+    let marker = "SENSITIVE-HOOK-MARKER-9dff6c";
+    let mut child = bin()
+        .arg("hook")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write!(child.stdin.as_mut().unwrap(), "{{invalid:{marker}}}").unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    assert!(!stderr.contains(marker), "hook echoed input: {stderr}");
+    assert!(stderr.contains("parsing hook envelope"), "stderr={stderr}");
+}
+
+#[test]
 fn rm_rejects_unsafe_paths() {
     // A `..` path must be refused before we touch the server. Provide a valid
     // config so we get past config-load and reach path validation.
@@ -420,16 +481,26 @@ remote_root = "/"
 "#,
     )
     .unwrap();
-    let legacy = local_root.join(ferry::names::LEGACY_STATE_DIR).join("state.json");
+    let legacy = local_root
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
     recent_state("target.txt").save(&legacy).unwrap();
     std::fs::create_dir(local_root.join(ferry::names::STATE_DIR)).unwrap();
 
     let output = hook_with_target(project.path(), &target);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stderr={stderr}");
-    assert!(stderr.contains("within 3600s cooldown, skipping pull"), "stderr={stderr}");
+    assert!(
+        stderr.contains("within 3600s cooldown, skipping pull"),
+        "stderr={stderr}"
+    );
     assert!(!stderr.contains("pull failed"), "stderr={stderr}");
-    assert!(local_root.join(ferry::names::STATE_DIR).join("state.json").exists());
+    assert!(
+        local_root
+            .join(ferry::names::STATE_DIR)
+            .join("state.json")
+            .exists()
+    );
     assert!(!legacy.exists());
 }
 
@@ -455,16 +526,25 @@ remote_root = "/"
 "#,
     )
     .unwrap();
-    let legacy = local_root.join(ferry::names::LEGACY_STATE_DIR).join("state.json");
+    let legacy = local_root
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
     recent_state("target.txt").save(&legacy).unwrap();
-    std::fs::write(local_root.join(ferry::names::STATE_DIR), b"blocks migration").unwrap();
+    std::fs::write(
+        local_root.join(ferry::names::STATE_DIR),
+        b"blocks migration",
+    )
+    .unwrap();
     let legacy_before = std::fs::read(&legacy).unwrap();
 
     let output = hook_with_target(project.path(), &target);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stderr={stderr}");
     assert!(stderr.contains("warning"), "stderr={stderr}");
-    assert!(stderr.contains("within 3600s cooldown, skipping pull"), "stderr={stderr}");
+    assert!(
+        stderr.contains("within 3600s cooldown, skipping pull"),
+        "stderr={stderr}"
+    );
     assert!(!stderr.contains("pull failed"), "stderr={stderr}");
     assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
 }

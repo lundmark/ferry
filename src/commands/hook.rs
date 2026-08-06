@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 
-use crate::commands::{state_path_for, ExecutionMode};
+use crate::commands::{ExecutionMode, state_path_for};
 use crate::state::StateFile;
 
 /// Shape shared by Claude Code (snake_case) hook input. Codex uses a
@@ -38,9 +38,7 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     if buf.trim().is_empty() {
         return Ok(());
     }
-    let input: HookInput = match serde_json::from_str(&buf)
-        .with_context(|| format!("parsing hook envelope: {buf}"))
-    {
+    let input: HookInput = match serde_json::from_str(&buf).context("parsing hook envelope") {
         Ok(input) => input,
         Err(error) => {
             eprintln!("ferry hook: {error:#}");
@@ -72,11 +70,14 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
         Ok(Some(resolved)) => resolved,
         Ok(None) => return Ok(()),
         Err(error) => {
-            eprintln!("ferry hook: resolving {} failed: {error:#}", file_path.display());
+            eprintln!(
+                "ferry hook: resolving {} failed: {error:#}",
+                file_path.display()
+            );
             return Ok(());
         }
     };
-    let config_path = crate::names::config_path_for_read(&resolved.config_dir);
+    let config_path = resolved.config_path;
     let state_path = state_path_for(&resolved.config.paths.local_root, mode);
     let rel = resolved.relative_path;
 
@@ -84,16 +85,14 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // cooldown window, skip the pull. Apply mode keeps config loading deferred
     // until we know we're going to act; dry-run loaded it above only to resolve
     // the configured local root for read-through state selection.
-    if let Ok(state) = StateFile::load_or_default(&state_path) {
-        if let Some(record) = state.files.get(&rel) {
-            let elapsed = Utc::now().signed_duration_since(record.last_synced);
-            if elapsed.num_seconds() >= 0 && elapsed.num_seconds() < cooldown_secs {
-                let tool = input.tool_name.as_deref().unwrap_or("<unknown>");
-                eprintln!(
-                    "ferry hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull"
-                );
-                return Ok(());
-            }
+    if let Ok(state) = StateFile::load_or_default(&state_path)
+        && let Some(record) = state.files.get(&rel)
+    {
+        let elapsed = Utc::now().signed_duration_since(record.last_synced);
+        if elapsed.num_seconds() >= 0 && elapsed.num_seconds() < cooldown_secs {
+            let tool = input.tool_name.as_deref().unwrap_or("<unknown>");
+            eprintln!("ferry hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull");
+            return Ok(());
         }
     }
 
@@ -128,7 +127,11 @@ mod tests {
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.tool_name.as_deref(), Some("Read"));
         assert_eq!(
-            input.tool_input.unwrap().get("file_path").and_then(|v| v.as_str()),
+            input
+                .tool_input
+                .unwrap()
+                .get("file_path")
+                .and_then(|v| v.as_str()),
             Some("/tmp/foo.c")
         );
     }

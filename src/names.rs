@@ -17,12 +17,26 @@ pub const LEGACY_STATE_DIR: &str = ".zed-ftp";
 /// when the current file is absent. This helper never mutates either path.
 pub fn config_path_for_read(dir: &Path) -> std::path::PathBuf {
     let current = dir.join(CONFIG_FILE);
-    if current.exists() {
+    if entry_is_present(&current) {
         current
     } else {
         let legacy = dir.join(LEGACY_CONFIG_FILE);
-        if legacy.exists() { legacy } else { current }
+        if entry_is_present(&legacy) {
+            legacy
+        } else {
+            current
+        }
     }
+}
+
+/// Whether a directory entry exists without following a symlink target.
+/// Errors other than `NotFound` are treated as present so callers preserve the
+/// matching directory boundary and let the eventual read report the error.
+pub fn entry_is_present(path: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// One-time, in-place rename of legacy `.zed-ftp` files in `dir` to the current
@@ -169,6 +183,20 @@ mod tests {
         let current = dir.path().join(CONFIG_FILE);
         let legacy = dir.path().join(LEGACY_CONFIG_FILE);
         std::fs::write(&current, "current").unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        assert_eq!(config_path_for_read(dir.path()), current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_current_config_still_precedes_legacy() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(CONFIG_FILE);
+        let legacy = dir.path().join(LEGACY_CONFIG_FILE);
+        symlink(dir.path().join("missing.toml"), &current).unwrap();
         std::fs::write(&legacy, "legacy").unwrap();
 
         assert_eq!(config_path_for_read(dir.path()), current);

@@ -25,7 +25,7 @@ pub fn find_config_upward(start: &Path) -> Option<ProjectLocation> {
 
     loop {
         let config_path = crate::names::config_path_for_read(&dir);
-        if config_path.exists() {
+        if crate::names::entry_is_present(&config_path) {
             return Some(ProjectLocation {
                 config_dir: dir,
                 config_path,
@@ -191,6 +191,45 @@ mod tests {
         let location = find_config_upward(&nested).unwrap();
         assert_eq!(location.config_dir, tmp.path());
         assert_eq!(location.config_path, tmp.path().join(LEGACY_CONFIG_FILE));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_current_config_stops_upward_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        write_config(tmp.path(), ".");
+        let current = nested.join(CONFIG_FILE);
+        symlink(nested.join("missing.toml"), &current).unwrap();
+        let file = nested.join("file.c");
+        std::fs::write(&file, "").unwrap();
+
+        let location = find_config_upward(&nested).unwrap();
+        assert_eq!(location.config_dir, nested);
+        assert_eq!(location.config_path, current);
+        let error = resolve_file(&file, false).unwrap_err();
+        assert!(error.to_string().contains("reading"));
+        assert!(error.to_string().contains(CONFIG_FILE));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_legacy_config_stops_upward_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        write_config(tmp.path(), ".");
+        let legacy = nested.join(LEGACY_CONFIG_FILE);
+        symlink(nested.join("missing.toml"), &legacy).unwrap();
+
+        let location = find_config_upward(&nested).unwrap();
+        assert_eq!(location.config_dir, nested);
+        assert_eq!(location.config_path, legacy);
     }
 
     #[test]

@@ -7,12 +7,12 @@
 
 use crate::commands::remote_hash;
 use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
-use crate::commands::{state_path_for, ExecutionMode};
+use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
 use crate::ignored::Matcher;
-use crate::state::{classify, FileRecord, FileState, StateFile};
+use crate::state::{FileRecord, FileState, StateFile, classify};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::BTreeSet;
@@ -48,7 +48,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
     } else {
         for rel_no_slash in &paths {
-            let local_full = local_root.join(&rel_no_slash);
+            let local_full = local_root.join(rel_no_slash);
             if local_full.is_dir() {
                 walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;
             } else if local_full.is_file() {
@@ -57,7 +57,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
             collect_remote_arg(
                 &mut ftp,
                 &cfg.paths.remote_root,
-                &rel_no_slash,
+                rel_no_slash,
                 &mut remote_paths,
             );
         }
@@ -130,9 +130,26 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                 let bytes = local_bytes
                     .as_deref()
                     .expect("local_bytes set when on_local is true");
-                let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
-                upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash, mode)?;
-                println!("{} {rel}", if mode.is_dry_run() { "would push" } else { "pushed" });
+                let new_hash = local_hash
+                    .as_deref()
+                    .expect("local_hash matches local_bytes");
+                upload_one(
+                    &mut ftp,
+                    &mut state,
+                    rel,
+                    &remote_path,
+                    bytes,
+                    new_hash,
+                    mode,
+                )?;
+                println!(
+                    "{} {rel}",
+                    if mode.is_dry_run() {
+                        "would push"
+                    } else {
+                        "pushed"
+                    }
+                );
             }
             FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
                 // Untracked = both sides have a file but no record of a prior sync.
@@ -142,13 +159,23 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                     let bytes = local_bytes
                         .as_deref()
                         .expect("local_bytes set when on_local is true");
-                    let new_hash = local_hash.as_deref().expect("local_hash matches local_bytes");
+                    let new_hash = local_hash
+                        .as_deref()
+                        .expect("local_hash matches local_bytes");
                     if mode.is_dry_run() {
                         eprintln!("would overwrite remote with local (--force): {rel}");
                     } else {
                         eprintln!("overwriting remote with local (--force): {rel}");
                     }
-                    upload_one(&mut ftp, &mut state, rel, &remote_path, bytes, new_hash, mode)?;
+                    upload_one(
+                        &mut ftp,
+                        &mut state,
+                        rel,
+                        &remote_path,
+                        bytes,
+                        new_hash,
+                        mode,
+                    )?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
@@ -206,13 +233,15 @@ pub fn upload_one(
 fn upload_remote_atomic(ftp: &mut Ftp, remote_path: &str, bytes: &[u8]) -> Result<()> {
     ensure_remote_parents(ftp, remote_path)?;
     let tmp = format!("{remote_path}.tmp.zedftp");
-    if let Err(e) = ftp.upload_bytes(&tmp, bytes)
+    if let Err(e) = ftp
+        .upload_bytes(&tmp, bytes)
         .with_context(|| format!("uploading temp {tmp}"))
     {
         let _ = ftp.rm(&tmp);
         return Err(e);
     }
-    if let Err(e) = ftp.rename(&tmp, remote_path)
+    if let Err(e) = ftp
+        .rename(&tmp, remote_path)
         .with_context(|| format!("renaming {tmp} -> {remote_path}"))
     {
         let _ = ftp.rm(&tmp);
@@ -268,7 +297,8 @@ fn update_state_after_push(
     new_hash: &str,
     size: u64,
 ) -> Result<()> {
-    let remote_mtime = ftp.mtime(remote_path)
+    let remote_mtime = ftp
+        .mtime(remote_path)
         .with_context(|| format!("fetching mtime for {remote_path}"))?;
     state.files.insert(
         rel.to_string(),
