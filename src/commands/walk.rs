@@ -18,7 +18,10 @@ pub fn remote_join(root: &str, rel: &str) -> String {
 /// could escape the sync roots. Shared by `push` and `rm` so both enforce the
 /// same containment rule.
 pub fn safe_rel(p: &str) -> Result<String> {
+    #[cfg(windows)]
     let s = p.replace('\\', "/");
+    #[cfg(not(windows))]
+    let s = p.to_owned();
     let rel = s.trim_start_matches("./").to_string();
     if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
         anyhow::bail!(

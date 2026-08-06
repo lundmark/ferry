@@ -42,25 +42,21 @@ pub fn resolve_file(path: &Path, migrate_legacy: bool) -> Result<Option<Resolved
         return Ok(None);
     };
 
-    if migrate_legacy {
-        if let Err(error) = crate::names::migrate_legacy(&location.config_dir) {
-            eprintln!(
-                "ferry: warning: migrating legacy paths in {}: {error:#}",
-                location.config_dir.display()
-            );
-        }
+    if migrate_legacy && let Err(error) = crate::names::migrate_legacy(&location.config_dir) {
+        eprintln!(
+            "ferry: warning: migrating legacy paths in {}: {error:#}",
+            location.config_dir.display()
+        );
     }
 
     let config_path = crate::names::config_path_for_read(&location.config_dir);
     let config = Config::load(&config_path)?;
 
-    if migrate_legacy {
-        if let Err(error) = crate::names::migrate_legacy(&config.paths.local_root) {
-            eprintln!(
-                "ferry: warning: migrating legacy paths in {}: {error:#}",
-                config.paths.local_root.display()
-            );
-        }
+    if migrate_legacy && let Err(error) = crate::names::migrate_legacy(&config.paths.local_root) {
+        eprintln!(
+            "ferry: warning: migrating legacy paths in {}: {error:#}",
+            config.paths.local_root.display()
+        );
     }
 
     let relative_path = relative_to_local_root(&config.paths.local_root, path)?;
@@ -118,7 +114,14 @@ pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> 
             local_root.display()
         )
     })?;
-    crate::commands::walk::safe_rel(&relative.to_string_lossy().replace('\\', "/"))
+    let relative = relative
+        .to_str()
+        .context("relative path is not valid UTF-8")?;
+    #[cfg(windows)]
+    let relative = relative.replace('\\', "/");
+    #[cfg(not(windows))]
+    let relative = relative.to_owned();
+    crate::commands::walk::safe_rel(&relative)
 }
 
 #[cfg(test)]
@@ -266,5 +269,32 @@ mod tests {
         );
         assert!(!legacy_state.exists());
         assert!(!mirror.join(LEGACY_STATE_DIR).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_literal_backslash_in_unix_relative_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"a\\b.c".to_vec());
+        let path = tmp.path().join(&name);
+        std::fs::write(&path, "").unwrap();
+
+        assert_eq!(relative_to_local_root(tmp.path(), &path).unwrap(), "a\\b.c");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_relative_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"bad-\xff.c".to_vec());
+        let path = tmp.path().join(name);
+        std::fs::write(&path, "").unwrap();
+
+        let error = relative_to_local_root(tmp.path(), &path).unwrap_err();
+        assert!(error.to_string().contains("UTF-8"));
     }
 }
