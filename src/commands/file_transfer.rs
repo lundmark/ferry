@@ -1,4 +1,4 @@
-use crate::ftp::Remote;
+use crate::ftp::{ExactFilePresence, Remote};
 use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +27,7 @@ impl TransferOutcome {
 /// as `Missing`: callers must return the indeterminate error instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemotePresence {
-    Present(u64),
+    Present,
     Missing,
 }
 
@@ -39,26 +39,14 @@ pub enum RemotePresence {
 /// operation succeeds we preserve both errors and make no transfer decision.
 pub fn probe_remote_file<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Result<RemotePresence> {
     match remote.file_size(path) {
-        Ok(size) => Ok(RemotePresence::Present(size)),
+        Ok(_) => Ok(RemotePresence::Present),
         Err(size_error) => {
-            let (parent, leaf) = match path.rsplit_once('/') {
-                Some(("", leaf)) => ("/", leaf),
-                Some((parent, leaf)) => (parent, leaf),
-                None => (".", path),
-            };
-            match remote.list_dir(parent) {
-                Ok(entries) => Ok(entries
-                    .into_iter()
-                    .find(|entry| {
-                        let name = entry.name.trim_end_matches('/');
-                        name == leaf || name == path.trim_end_matches('/')
-                    })
-                    .map_or(RemotePresence::Missing, |entry| {
-                        RemotePresence::Present(entry.size)
-                    })),
-                Err(list_error) => Err(size_error).with_context(|| {
+            match remote.exact_file_presence(path) {
+                Ok(ExactFilePresence::Present) => Ok(RemotePresence::Present),
+                Ok(ExactFilePresence::Missing) => Ok(RemotePresence::Missing),
+                Err(exact_error) => Err(size_error).with_context(|| {
                     format!(
-                        "remote presence for {path} is indeterminate after listing {parent}: {list_error:#}"
+                        "remote presence for {path} is indeterminate after exact lookup: {exact_error:#}"
                     )
                 }),
             }
@@ -69,13 +57,14 @@ pub fn probe_remote_file<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{RemotePresence, TransferOutcome, TransferStatus, probe_remote_file};
-    use crate::ftp::{Entry, Remote};
+    use crate::ftp::{Entry, ExactFilePresence, Remote};
     use anyhow::Result;
     use chrono::Utc;
 
     struct ScriptedRemote {
         size: Option<Result<u64>>,
         listing: Option<Result<Vec<Entry>>>,
+        exact: Option<Result<ExactFilePresence>>,
     }
 
     impl Remote for ScriptedRemote {
@@ -85,6 +74,10 @@ mod tests {
 
         fn file_size(&mut self, _path: &str) -> Result<u64> {
             self.size.take().expect("one SIZE call")
+        }
+
+        fn exact_file_presence(&mut self, _path: &str) -> Result<ExactFilePresence> {
+            self.exact.take().expect("one exact probe call")
         }
     }
 
@@ -113,11 +106,12 @@ mod tests {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![file("target.txt", 7)])),
+            exact: Some(Ok(ExactFilePresence::Present)),
         };
 
         assert_eq!(
             probe_remote_file(&mut remote, "/home/test/target.txt").unwrap(),
-            RemotePresence::Present(7)
+            RemotePresence::Present
         );
     }
 
@@ -126,11 +120,12 @@ mod tests {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![file("/home/test/target.txt", 7)])),
+            exact: Some(Ok(ExactFilePresence::Present)),
         };
 
         assert_eq!(
             probe_remote_file(&mut remote, "/home/test/target.txt").unwrap(),
-            RemotePresence::Present(7)
+            RemotePresence::Present
         );
     }
 
@@ -139,6 +134,7 @@ mod tests {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![])),
+            exact: Some(Ok(ExactFilePresence::Missing)),
         };
 
         assert_eq!(
@@ -152,11 +148,25 @@ mod tests {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Err(anyhow::anyhow!("LIST permission denied"))),
+            exact: Some(Err(anyhow::anyhow!("NLST permission denied"))),
         };
 
         let error = probe_remote_file(&mut remote, "/home/test/target.txt").unwrap_err();
 
         assert!(format!("{error:#}").contains("SIZE unsupported"));
-        assert!(format!("{error:#}").contains("LIST permission denied"));
+        assert!(format!("{error:#}").contains("NLST permission denied"));
+    }
+
+    #[test]
+    fn incomplete_parent_listing_cannot_prove_exact_file_absence() {
+        let mut remote = ScriptedRemote {
+            size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
+            listing: Some(Ok(vec![file("other.txt", 3)])),
+            exact: Some(Err(anyhow::anyhow!("NLST malformed response"))),
+        };
+
+        let error = probe_remote_file(&mut remote, "/home/test/target.txt").unwrap_err();
+
+        assert!(format!("{error:#}").contains("NLST malformed response"));
     }
 }

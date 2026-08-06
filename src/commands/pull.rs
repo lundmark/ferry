@@ -287,7 +287,7 @@ pub fn pull_one(
 
         let remote_path = remote_join(&cfg.paths.remote_root, &rel);
         let remote_exists = match probe_remote_file(&mut ftp, &remote_path)? {
-            RemotePresence::Present(_) => true,
+            RemotePresence::Present => true,
             RemotePresence::Missing => false,
         };
         if !remote_exists && local_hash.is_none() {
