@@ -5,9 +5,13 @@
 //! locally-missing file is treated as "not yours to delete" — `rm` is its
 //! own deliberate command.
 
+use crate::commands::file_transfer::{
+    RemotePresence, TransferOutcome, TransferStatus, probe_remote_file,
+};
 use crate::commands::remote_hash;
-use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
-use crate::commands::file_transfer::{TransferOutcome, TransferStatus};
+use crate::commands::walk::{
+    collect_remote_arg, remote_join, safe_arg, safe_rel, walk_local, walk_remote,
+};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -216,6 +220,7 @@ pub fn push_one(
     force: bool,
     mode: ExecutionMode,
 ) -> Result<TransferOutcome> {
+    let rel = safe_rel(rel).with_context(|| format!("push {rel}"))?;
     (|| {
         let cfg = Config::load(config_path)?;
         let local_root = cfg.paths.local_root.clone();
@@ -230,7 +235,7 @@ pub fn push_one(
             cfg.connection.passive,
         )?;
 
-        let local_path = local_root.join(rel);
+        let local_path = local_root.join(&rel);
         let local_bytes = if local_path.exists() {
             Some(
                 std::fs::read(&local_path)
@@ -241,18 +246,21 @@ pub fn push_one(
         };
         let local_hash = local_bytes.as_deref().map(hash_bytes);
 
-        let remote_path = remote_join(&cfg.paths.remote_root, rel);
-        let remote_exists = ftp.size(&remote_path).is_ok();
+        let remote_path = remote_join(&cfg.paths.remote_root, &rel);
+        let remote_exists = match probe_remote_file(&mut ftp, &remote_path)? {
+            RemotePresence::Present(_) => true,
+            RemotePresence::Missing => false,
+        };
         if !remote_exists && local_hash.is_none() {
             anyhow::bail!("neither local nor remote has {rel}");
         }
         let remote_hash = if remote_exists {
-            Some(remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false)?.sha256)
+            Some(remote_hash::compute(&mut ftp, &mut state, &rel, &remote_path, false)?.sha256)
         } else {
             None
         };
 
-        let known = state.files.get(rel).map(|r| r.sha256.as_str());
+        let known = state.files.get(&rel).map(|r| r.sha256.as_str());
         let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
         let status = match st {
             FileState::InSync => TransferStatus::Unchanged,
@@ -267,7 +275,7 @@ pub fn push_one(
                 upload_one(
                     &mut ftp,
                     &mut state,
-                    rel,
+                    &rel,
                     &remote_path,
                     bytes,
                     new_hash,
@@ -291,7 +299,7 @@ pub fn push_one(
                 upload_one(
                     &mut ftp,
                     &mut state,
-                    rel,
+                    &rel,
                     &remote_path,
                     bytes,
                     new_hash,
@@ -301,10 +309,10 @@ pub fn push_one(
             }
         };
 
-        if mode.should_apply() {
+        if mode.should_apply() && status == TransferStatus::Transferred {
             state.save(&state_path)?;
         }
-        Ok(TransferOutcome::new(rel, status))
+        Ok(TransferOutcome::new(&rel, status))
     })()
     .with_context(|| format!("push {rel}"))
 }

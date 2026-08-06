@@ -5,15 +5,19 @@
 //! way an accidentally-empty remote (or an interrupted upload by someone
 //! else) cannot wipe your working tree.
 
+use crate::commands::file_transfer::{
+    RemotePresence, TransferOutcome, TransferStatus, probe_remote_file,
+};
 use crate::commands::remote_hash;
-use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
-use crate::commands::file_transfer::{TransferOutcome, TransferStatus};
-use crate::commands::{state_path_for, ExecutionMode};
+use crate::commands::walk::{
+    collect_remote_arg, remote_join, safe_arg, safe_rel, walk_local, walk_remote,
+};
+use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_file;
 use crate::ignored::Matcher;
-use crate::state::{classify, FileRecord, FileState, StateFile};
+use crate::state::{FileRecord, FileState, StateFile, classify};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::BTreeSet;
@@ -93,9 +97,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
             }
             let prefix = format!("{rel_no_slash}/");
             for path in local_paths.iter().chain(remote_paths.iter()) {
-                if path.starts_with(&prefix)
-                    && !matcher.is_ignored(&local_root.join(path), false)
-                {
+                if path.starts_with(&prefix) && !matcher.is_ignored(&local_root.join(path), false) {
                     out.insert(path.clone());
                 }
             }
@@ -163,7 +165,8 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                 let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
                 let bytes_owned: Vec<u8> = match &rh_inner.bytes {
                     Some(b) => b.clone(),
-                    None => ftp.download(&remote_path)
+                    None => ftp
+                        .download(&remote_path)
                         .with_context(|| format!("downloading {remote_path}"))?,
                 };
                 download_one(
@@ -193,7 +196,8 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                     let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
                     let bytes_owned: Vec<u8> = match &rh_inner.bytes {
                         Some(b) => b.clone(),
-                        None => ftp.download(&remote_path)
+                        None => ftp
+                            .download(&remote_path)
                             .with_context(|| format!("downloading {remote_path}"))?,
                     };
                     if mode.is_dry_run() {
@@ -259,6 +263,7 @@ pub fn pull_one(
     force: bool,
     mode: ExecutionMode,
 ) -> Result<TransferOutcome> {
+    let rel = safe_rel(rel).with_context(|| format!("pull {rel}"))?;
     (|| {
         let cfg = Config::load(config_path)?;
         let local_root = cfg.paths.local_root.clone();
@@ -273,17 +278,18 @@ pub fn pull_one(
             cfg.connection.passive,
         )?;
 
-        let local_path = local_root.join(rel);
+        let local_path = local_root.join(&rel);
         let local_hash = if local_path.exists() {
             Some(hash_file(&local_path)?)
         } else {
             None
         };
 
-        let remote_path = remote_join(&cfg.paths.remote_root, rel);
-        // Probe remote existence via SIZE; treat any SIZE error as "not present"
-        // so brand-new local files or typo'd rels don't blow up the hook.
-        let remote_exists = ftp.size(&remote_path).is_ok();
+        let remote_path = remote_join(&cfg.paths.remote_root, &rel);
+        let remote_exists = match probe_remote_file(&mut ftp, &remote_path)? {
+            RemotePresence::Present(_) => true,
+            RemotePresence::Missing => false,
+        };
         if !remote_exists && local_hash.is_none() {
             anyhow::bail!("neither local nor remote has {rel}");
         }
@@ -292,7 +298,7 @@ pub fn pull_one(
             Some(remote_hash::compute(
                 &mut ftp,
                 &mut state,
-                rel,
+                &rel,
                 &remote_path,
                 true,
             )?)
@@ -300,7 +306,7 @@ pub fn pull_one(
             None
         };
         let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
-        let known = state.files.get(rel).map(|r| r.sha256.as_str());
+        let known = state.files.get(&rel).map(|r| r.sha256.as_str());
         let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
 
         let status = match st {
@@ -318,7 +324,7 @@ pub fn pull_one(
                     &mut ftp,
                     &mut state,
                     &local_path,
-                    rel,
+                    &rel,
                     &remote_path,
                     &bytes,
                     &rh_inner.sha256,
@@ -344,7 +350,7 @@ pub fn pull_one(
                     &mut ftp,
                     &mut state,
                     &local_path,
-                    rel,
+                    &rel,
                     &remote_path,
                     &bytes,
                     &rh_inner.sha256,
@@ -354,10 +360,10 @@ pub fn pull_one(
             }
         };
 
-        if mode.should_apply() {
+        if mode.should_apply() && status == TransferStatus::Transferred {
             state.save(&state_path)?;
         }
-        Ok(TransferOutcome::new(rel, status))
+        Ok(TransferOutcome::new(&rel, status))
     })()
     .with_context(|| format!("pull {rel}"))
 }
@@ -397,8 +403,8 @@ fn write_local_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
     let tmp = tmp_path(path);
-    if let Err(e) = std::fs::write(&tmp, bytes)
-        .with_context(|| format!("writing temp file {}", tmp.display()))
+    if let Err(e) =
+        std::fs::write(&tmp, bytes).with_context(|| format!("writing temp file {}", tmp.display()))
     {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -429,7 +435,8 @@ fn update_state_after_pull(
     new_hash: &str,
     size: u64,
 ) -> Result<()> {
-    let remote_mtime = ftp.mtime(remote_path)
+    let remote_mtime = ftp
+        .mtime(remote_path)
         .with_context(|| format!("fetching mtime for {remote_path}"))?;
     state.files.insert(
         rel.to_string(),
