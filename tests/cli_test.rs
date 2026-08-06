@@ -256,6 +256,58 @@ remote_root = "/"
     );
 }
 
+#[test]
+fn explicit_legacy_config_refreshes_after_apply_migration() {
+    let project = tempfile::tempdir().unwrap();
+    let unrelated_cwd = tempfile::tempdir().unwrap();
+    std::fs::write(
+        unrelated_cwd.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 2
+user = "unrelated"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let legacy_config = project.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    std::fs::write(
+        &legacy_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+
+    let output = bin()
+        .args(["status", "--config"])
+        .arg(&legacy_config)
+        .current_dir(unrelated_cwd.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ftp connect 127.0.0.1:1"),
+        "explicit migrated config was not refreshed; stderr={stderr}",
+    );
+    assert!(
+        project.path().join(ferry::names::CONFIG_FILE).exists(),
+        "legacy config was not migrated",
+    );
+    assert!(!legacy_config.exists(), "legacy config was not removed");
+}
+
 fn recent_state(target: &str) -> ferry::state::StateFile {
     let now = chrono::Utc::now();
     let mut state = ferry::state::StateFile::default();

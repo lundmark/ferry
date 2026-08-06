@@ -63,6 +63,10 @@ fn run() -> i32 {
     let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
     let explicit_config = cli.config.is_some();
     let mut cfg = cli.config.unwrap_or_else(|| default_config_path(&cli.cmd));
+    let explicit_legacy_config = explicit_config
+        && cfg
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(ferry::names::LEGACY_CONFIG_FILE));
     let is_hook = matches!(&cli.cmd, Cmd::Hook { .. });
     let should_load_config = !matches!(&cli.cmd, Cmd::Init { .. })
         && !matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty());
@@ -71,7 +75,7 @@ fn run() -> i32 {
         if let Err(e) = ferry::names::migrate_legacy(config_dir) {
             eprintln!("warning: {e:#}");
         }
-        if !explicit_config {
+        if !explicit_config || explicit_legacy_config {
             cfg = ferry::names::config_path_for_read(config_dir);
         }
 
