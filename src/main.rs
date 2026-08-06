@@ -67,6 +67,7 @@ fn run() -> i32 {
         && cfg
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new(ferry::names::LEGACY_CONFIG_FILE));
+    let explicit_legacy_entry_exists = explicit_legacy_config && path_entry_exists(&cfg);
     let is_hook = matches!(&cli.cmd, Cmd::Hook { .. });
     let should_load_config = !matches!(&cli.cmd, Cmd::Init { .. })
         && !matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty());
@@ -75,7 +76,7 @@ fn run() -> i32 {
         if let Err(e) = ferry::names::migrate_legacy(config_dir) {
             eprintln!("warning: {e:#}");
         }
-        if !explicit_config || explicit_legacy_config {
+        if !explicit_config || (explicit_legacy_entry_exists && path_entry_is_missing(&cfg)) {
             cfg = ferry::names::config_path_for_read(config_dir);
         }
 
@@ -114,6 +115,17 @@ fn run() -> i32 {
             classify_exit(&e)
         }
     }
+}
+
+fn path_entry_exists(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn path_entry_is_missing(path: &std::path::Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 fn default_config_path(cmd: &Cmd) -> std::path::PathBuf {
