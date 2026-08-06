@@ -17,6 +17,8 @@ operations must never use force.
 Ferry already provides:
 
 - a project-local .ferry.toml configuration file;
+- best-effort migration from the legacy .zed-ftp.toml and .zed-ftp state
+  names, which this feature preserves;
 - a ferry-lsp process launched by the Ferry Zed extension;
 - a textDocument/didOpen handler that currently performs a forced pull;
 - example project tasks for pull, push, delete, status, and full sync; and
@@ -46,12 +48,46 @@ Defaults when the section or fields are absent:
 The nearest ancestor .ferry.toml remains the project boundary. Files outside a
 Ferry project are ignored.
 
+## Path and Project Resolution
+
+Editor events and current-file tasks begin with an absolute local file path.
+They must not assume that the Zed worktree root, the configuration directory,
+and paths.local_root are the same directory.
+
+Resolution follows these rules:
+
+1. Starting at the file's parent, find the nearest ancestor containing
+   .ferry.toml or the legacy .zed-ftp.toml. Nearest-ancestor selection gives
+   nested Ferry projects predictable ownership.
+2. Preserve the existing best-effort legacy-name migration before loading the
+   selected configuration.
+3. Load the configuration so a relative paths.local_root is resolved against
+   the configuration directory, as it is today.
+4. Normalize the absolute file path and require it to be contained by the
+   resolved local_root. Strip that prefix to obtain the only relative path
+   passed to synchronization, state, ignore, and remote-path code.
+5. If the file is outside local_root, reject the operation with a path-specific
+   warning. Never construct a path containing parent traversal.
+
+The editor integration supports configurations whose local_root is the
+configuration directory or one of its descendants. A configuration that
+points local_root outside the configuration's ancestor tree cannot be
+discovered from a file event and is explicitly unsupported for automatic
+editor integration.
+
+For Zed tasks, use cwd=$ZED_DIRNAME and pass $ZED_FILE as an absolute path.
+Ferry's default configuration lookup will be extended to walk upward from the
+working directory, and a shared path resolver will accept an absolute input
+only when it is contained by the selected local_root. Existing relative CLI
+arguments retain their current local-root-relative meaning.
+
 ## Architecture
 
 The existing Ferry Zed extension remains a thin launcher for ferry-lsp.
 ferry-lsp owns editor-event handling and current-file Code Actions. The Ferry
-library continues to own configuration, path validation, FTP synchronization,
-conflict detection, state updates, and compile checks.
+library continues to own configuration and project resolution, path
+validation, FTP synchronization, conflict detection, state updates, and
+compile checks.
 
 The LSP advertises:
 
@@ -63,13 +99,17 @@ The LSP advertises:
 Operations are processed serially by the LSP event loop. This keeps open and
 save operations for a worktree ordered without blocking Zed's UI.
 
+The LSP must call structured, non-printing library APIs. Nothing used inside
+ferry-lsp may write to stdout because stdout is the language server's JSON-RPC
+transport.
+
 ## Event Flow
 
 ### Open
 
 1. Zed opens a C or header buffer and sends textDocument/didOpen.
-2. ferry-lsp resolves the file URI, finds the nearest Ferry project, and loads
-   that project's configuration.
+2. ferry-lsp resolves the file URI, finds the nearest Ferry project, loads its
+   configuration, and maps the absolute file through the resolved local_root.
 3. If editor.pull_on_open is false, the event is ignored.
 4. Otherwise Ferry performs a normal pull for that relative file. It does not
    pass force.
@@ -82,7 +122,8 @@ are ignored.
 ### Save
 
 1. Zed writes the buffer locally and sends textDocument/didSave.
-2. ferry-lsp resolves the Ferry project and loads its configuration.
+2. ferry-lsp resolves the Ferry project and maps the absolute file through the
+   resolved local_root.
 3. If editor.push_on_save is false, the event is ignored.
 4. Otherwise Ferry performs a normal push for that relative file. It does not
    pass force.
@@ -103,12 +144,30 @@ Pull and Push reuse the same conflict-safe library operations as the automatic
 flow. Compile-check reuses Ferry's UDP compile client.
 
 Project .zed/tasks.json also exposes current-file Pull, Push, and Compile-check
-tasks, plus Status and broader synchronization tasks. Tasks provide a terminal
-view for detailed output and remain usable when a user prefers the Task Picker
-or a keybinding.
+tasks, plus Status and broader synchronization tasks. Current-file tasks set
+their working directory to $ZED_DIRNAME and pass $ZED_FILE, allowing Ferry's
+nearest-project and containment rules to select the same project and relative
+path as ferry-lsp. Tasks provide a terminal view for detailed output and
+remain usable when a user prefers the Task Picker or a keybinding.
 
 Destructive deletion is not promoted as a Code Action. If retained in the
 example tasks, it must remain clearly labeled as destructive.
+
+## Pull and Push API Refactor
+
+The existing aggregate pull and push commands print progress to stdout and can
+return conflict summaries that do not identify an individual path. Those
+command adapters are not safe to call from a language server.
+
+Add non-printing, single-file Pull and Push library operations that return
+structured outcomes such as unchanged, transferred, skipped, or conflict.
+Every outcome and error contains the local-root-relative path. The existing CLI
+commands become formatting adapters over these operations where practical and
+retain their current user-facing output and exit codes.
+
+ferry-lsp uses only the single-file APIs. It converts structured outcomes into
+silence for successful automatic actions, confirmations for successful manual
+actions, and path-specific warnings for conflicts or failures.
 
 ## Compile-Check Refactor
 
@@ -132,19 +191,25 @@ terminal output.
 - Compile failures are reported as failures, not transport errors, and include
   server diagnostics.
 - No automatic or manual action introduced by this feature uses force.
+- No library operation called by ferry-lsp writes to stdout.
 
 ## Change Surface
 
 The implementation is expected to update:
 
 - src/config.rs for the editor configuration and safe defaults;
+- shared project/path resolution and CLI default-config lookup for
+  nearest-ancestor discovery and absolute-path containment;
 - src/bin/ferry-lsp.rs for LSP capabilities, open/save dispatch, Code Actions,
   commands, feedback, and test seams;
+- src/commands/pull.rs and src/commands/push.rs for structured, non-printing
+  single-file outcomes used by the LSP;
 - src/commands/cc.rs and related UDP types for structured compile results;
 - examples/tasks.json for the complete current-file workflow;
 - README.md and extensions/ferry/README.md for installation, behavior, and
   configuration; and
-- extension metadata if its description or version needs updating.
+- Ferry crate metadata and Zed extension metadata, both bumped from 0.1.0 to
+  0.2.0 with descriptions covering configurable pull-on-open and push-on-save.
 
 After Ferry is updated, the 3S project receives only project-specific wiring:
 an editor section in .ferry.toml and a .zed/tasks.json file. Credentials and
@@ -156,6 +221,11 @@ Automated verification covers:
 
 - parsing explicit editor settings;
 - defaults of pull_on_open=true and push_on_save=false;
+- nearest-config selection for nested projects;
+- absolute path mapping when local_root is the config directory or a
+  descendant;
+- rejection of files outside local_root and of parent traversal;
+- upward default-config lookup used by current-file Zed tasks;
 - didOpen enabled and disabled paths;
 - proof that didOpen calls a non-forced pull;
 - didSave enabled and disabled paths;
@@ -163,6 +233,8 @@ Automated verification covers:
 - non-file buffers and files outside Ferry projects;
 - Code Action discovery and command dispatch;
 - success, conflict, and generic-error notifications;
+- structured, path-specific Pull and Push results;
+- proof that LSP operations do not write to stdout;
 - structured compile results and CLI exit behavior; and
 - the existing Ferry test suite, formatting, and linting.
 
@@ -179,7 +251,8 @@ Deployment verification:
 6. Confirm save does not push when push_on_save is absent or false.
 7. Enable push_on_save only for a controlled test project or disposable file,
    then verify the save event.
-8. Confirm Code Actions and Task Picker entries target the active file.
+8. Confirm Code Actions and Task Picker entries target the active file,
+   including a test fixture whose local_root is not ".".
 
 ## Non-Goals
 
