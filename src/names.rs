@@ -46,6 +46,38 @@ pub fn migrate_legacy(dir: &Path) -> Result<()> {
         std::fs::rename(&old_state, &new_state)
             .with_context(|| format!("migrating {LEGACY_STATE_DIR}/ -> {STATE_DIR}/"))?;
         eprintln!("ferry: migrated {LEGACY_STATE_DIR}/ -> {STATE_DIR}/");
+    } else if new_state.is_dir() && old_state.is_dir() {
+        let new_state_file = new_state.join("state.json");
+        let old_state_file = old_state.join("state.json");
+        if !new_state_file.exists() {
+            if old_state_file.exists() {
+                std::fs::rename(&old_state_file, &new_state_file).with_context(|| {
+                    format!("migrating {LEGACY_STATE_DIR}/state.json -> {STATE_DIR}/state.json")
+                })?;
+                eprintln!(
+                    "ferry: migrated {LEGACY_STATE_DIR}/state.json -> {STATE_DIR}/state.json"
+                );
+            }
+
+            let is_empty = std::fs::read_dir(&old_state)
+                .with_context(|| {
+                    format!("checking legacy state directory {}", old_state.display())
+                })?
+                .next()
+                .transpose()
+                .with_context(|| {
+                    format!("checking legacy state directory {}", old_state.display())
+                })?
+                .is_none();
+            if is_empty {
+                std::fs::remove_dir(&old_state).with_context(|| {
+                    format!(
+                        "removing empty legacy state directory {}",
+                        old_state.display()
+                    )
+                })?;
+            }
+        }
     }
 
     Ok(())
@@ -58,7 +90,10 @@ mod tests {
     #[test]
     fn config_read_path_falls_back_to_current_when_neither_exists() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(config_path_for_read(dir.path()), dir.path().join(CONFIG_FILE));
+        assert_eq!(
+            config_path_for_read(dir.path()),
+            dir.path().join(CONFIG_FILE)
+        );
     }
 
     #[test]
@@ -142,5 +177,21 @@ mod tests {
 
         assert!(dir.path().join(STATE_DIR).exists());
         assert!(!dir.path().join(LEGACY_STATE_DIR).exists());
+    }
+
+    #[test]
+    fn migrate_keeps_legacy_state_when_current_state_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(STATE_DIR).join("state.json");
+        let legacy = dir.path().join(LEGACY_STATE_DIR).join("state.json");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&current, "current").unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        migrate_legacy(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "current");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy");
     }
 }
