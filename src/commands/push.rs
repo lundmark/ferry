@@ -7,6 +7,7 @@
 
 use crate::commands::remote_hash;
 use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
+use crate::commands::file_transfer::{TransferOutcome, TransferStatus};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -205,6 +206,107 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     }
 
     Ok(())
+}
+
+/// Fast single-file push that bypasses the local + remote tree walks used by
+/// [`run`]. It returns structured data and leaves all reporting to its caller.
+pub fn push_one(
+    config_path: &Path,
+    rel: &str,
+    force: bool,
+    mode: ExecutionMode,
+) -> Result<TransferOutcome> {
+    (|| {
+        let cfg = Config::load(config_path)?;
+        let local_root = cfg.paths.local_root.clone();
+        let state_path = state_path_for(&local_root, mode);
+        let mut state = StateFile::load_or_default(&state_path)?;
+
+        let mut ftp = Ftp::connect(
+            &cfg.connection.host,
+            cfg.connection.port,
+            &cfg.connection.user,
+            &cfg.connection.password,
+            cfg.connection.passive,
+        )?;
+
+        let local_path = local_root.join(rel);
+        let local_bytes = if local_path.exists() {
+            Some(
+                std::fs::read(&local_path)
+                    .with_context(|| format!("reading local {}", local_path.display()))?,
+            )
+        } else {
+            None
+        };
+        let local_hash = local_bytes.as_deref().map(hash_bytes);
+
+        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+        let remote_exists = ftp.size(&remote_path).is_ok();
+        if !remote_exists && local_hash.is_none() {
+            anyhow::bail!("neither local nor remote has {rel}");
+        }
+        let remote_hash = if remote_exists {
+            Some(remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false)?.sha256)
+        } else {
+            None
+        };
+
+        let known = state.files.get(rel).map(|r| r.sha256.as_str());
+        let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
+        let status = match st {
+            FileState::InSync => TransferStatus::Unchanged,
+            FileState::RemoteOnly => TransferStatus::SkippedMissingSource,
+            FileState::LocalOnly | FileState::LocalChanged => {
+                let bytes = local_bytes
+                    .as_deref()
+                    .expect("local_bytes set when local file exists");
+                let new_hash = local_hash
+                    .as_deref()
+                    .expect("local_hash matches local_bytes");
+                upload_one(
+                    &mut ftp,
+                    &mut state,
+                    rel,
+                    &remote_path,
+                    bytes,
+                    new_hash,
+                    mode,
+                )?;
+                TransferStatus::Transferred
+            }
+            FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
+                if !force {
+                    return Err(crate::error::Exit::Conflict(format!(
+                        "conflict ({st:?}) on {rel}: remote changes present; pass --force to override",
+                    ))
+                    .into());
+                }
+                let bytes = local_bytes
+                    .as_deref()
+                    .expect("local_bytes set when local file exists");
+                let new_hash = local_hash
+                    .as_deref()
+                    .expect("local_hash matches local_bytes");
+                upload_one(
+                    &mut ftp,
+                    &mut state,
+                    rel,
+                    &remote_path,
+                    bytes,
+                    new_hash,
+                    mode,
+                )?;
+                TransferStatus::Transferred
+            }
+        };
+
+        if mode.should_apply() {
+            state.save(&state_path)?;
+        }
+        Ok(TransferOutcome::new(rel, status))
+    })()
+    .with_context(|| format!("push {rel}"))
 }
 
 /// Upload `bytes` to `remote_path` atomically (via temp + rename) and refresh

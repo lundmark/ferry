@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 
+use crate::commands::file_transfer::TransferStatus;
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::state::StateFile;
 
@@ -100,14 +101,17 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // the current remote version"; users who don't want that shouldn't
     // install the hook.
     match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ true, mode) {
-        Ok(true) if mode.is_dry_run() => eprintln!("ferry hook: would pull {rel}"),
-        Ok(true) => eprintln!("ferry hook: pulled {rel}"),
-        Ok(false) => {
-            // Already in sync (or local-only). No output needed.
+        Ok(outcome) if outcome.status == TransferStatus::Transferred => {
+            if mode.is_dry_run() {
+                eprintln!("ferry hook: would pull {}", outcome.path);
+            } else {
+                eprintln!("ferry hook: pulled {}", outcome.path);
+            }
         }
-        Err(e) => {
+        Ok(_) => {}
+        Err(error) => {
             // Don't fail the hook — deny would surprise the user. Just log.
-            eprintln!("ferry hook: pull {rel} failed: {e:#}");
+            eprintln!("ferry hook: pull {rel} failed: {error:#}");
         }
     }
     Ok(())

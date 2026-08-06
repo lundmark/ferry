@@ -7,6 +7,7 @@
 
 use crate::commands::remote_hash;
 use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
+use crate::commands::file_transfer::{TransferOutcome, TransferStatus};
 use crate::commands::{state_path_for, ExecutionMode};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -250,77 +251,62 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
 /// downloads when the remote wins. Refuses on conflict without `force`
 /// exactly like `run()` does.
 ///
-/// Returns `Ok(true)` if a pull was required (whether applied or previewed),
-/// `Ok(false)` if no action was needed (InSync / LocalOnly).
-pub fn pull_one(config_path: &Path, rel: &str, force: bool, mode: ExecutionMode) -> Result<bool> {
-    let cfg = Config::load(config_path)?;
-    let local_root = cfg.paths.local_root.clone();
-    let state_path = state_path_for(&local_root, mode);
-    let mut state = StateFile::load_or_default(&state_path)?;
+/// Returns a structured outcome for the requested path and never writes to
+/// stdout or stderr. Callers decide whether and how to report the outcome.
+pub fn pull_one(
+    config_path: &Path,
+    rel: &str,
+    force: bool,
+    mode: ExecutionMode,
+) -> Result<TransferOutcome> {
+    (|| {
+        let cfg = Config::load(config_path)?;
+        let local_root = cfg.paths.local_root.clone();
+        let state_path = state_path_for(&local_root, mode);
+        let mut state = StateFile::load_or_default(&state_path)?;
 
-    let mut ftp = Ftp::connect(
-        &cfg.connection.host,
-        cfg.connection.port,
-        &cfg.connection.user,
-        &cfg.connection.password,
-        cfg.connection.passive,
-    )?;
+        let mut ftp = Ftp::connect(
+            &cfg.connection.host,
+            cfg.connection.port,
+            &cfg.connection.user,
+            &cfg.connection.password,
+            cfg.connection.passive,
+        )?;
 
-    let local_path = local_root.join(rel);
-    let local_hash = if local_path.exists() {
-        Some(hash_file(&local_path)?)
-    } else {
-        None
-    };
+        let local_path = local_root.join(rel);
+        let local_hash = if local_path.exists() {
+            Some(hash_file(&local_path)?)
+        } else {
+            None
+        };
 
-    let remote_path = remote_join(&cfg.paths.remote_root, rel);
-    // Probe remote existence via SIZE; treat any SIZE error as "not present"
-    // so brand-new local files or typo'd rels don't blow up the hook.
-    let remote_exists = ftp.size(&remote_path).is_ok();
-    if !remote_exists && local_hash.is_none() {
-        anyhow::bail!("neither local nor remote has {rel}");
-    }
+        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+        // Probe remote existence via SIZE; treat any SIZE error as "not present"
+        // so brand-new local files or typo'd rels don't blow up the hook.
+        let remote_exists = ftp.size(&remote_path).is_ok();
+        if !remote_exists && local_hash.is_none() {
+            anyhow::bail!("neither local nor remote has {rel}");
+        }
 
-    let rh = if remote_exists {
-        Some(crate::commands::remote_hash::compute(
-            &mut ftp,
-            &mut state,
-            rel,
-            &remote_path,
-            true,
-        )?)
-    } else {
-        None
-    };
-    let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
-    let known = state.files.get(rel).map(|r| r.sha256.as_str());
-    let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
-
-    let mut pull_required = false;
-    match st {
-        FileState::InSync | FileState::LocalOnly => {}
-        FileState::RemoteOnly | FileState::RemoteChanged => {
-            let rh_inner = rh.as_ref().expect("rh set when remote_exists");
-            let bytes = match &rh_inner.bytes {
-                Some(b) => b.clone(),
-                None => ftp
-                    .download(&remote_path)
-                    .with_context(|| format!("downloading {remote_path}"))?,
-            };
-            download_one(
+        let rh = if remote_exists {
+            Some(remote_hash::compute(
                 &mut ftp,
                 &mut state,
-                &local_path,
                 rel,
                 &remote_path,
-                &bytes,
-                &rh_inner.sha256,
-                mode,
-            )?;
-            pull_required = true;
-        }
-        FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
-            if force {
+                true,
+            )?)
+        } else {
+            None
+        };
+        let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
+        let known = state.files.get(rel).map(|r| r.sha256.as_str());
+        let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
+
+        let status = match st {
+            FileState::InSync => TransferStatus::Unchanged,
+            FileState::LocalOnly => TransferStatus::SkippedMissingSource,
+            FileState::RemoteOnly | FileState::RemoteChanged => {
                 let rh_inner = rh.as_ref().expect("rh set when remote_exists");
                 let bytes = match &rh_inner.bytes {
                     Some(b) => b.clone(),
@@ -338,20 +324,42 @@ pub fn pull_one(config_path: &Path, rel: &str, force: bool, mode: ExecutionMode)
                     &rh_inner.sha256,
                     mode,
                 )?;
-                pull_required = true;
-            } else {
-                return Err(crate::error::Exit::Conflict(format!(
-                    "conflict ({st:?}) on {rel}: local changes present; pass --force to override",
-                ))
-                .into());
+                TransferStatus::Transferred
             }
-        }
-    }
+            FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
+                if !force {
+                    return Err(crate::error::Exit::Conflict(format!(
+                        "conflict ({st:?}) on {rel}: local changes present; pass --force to override",
+                    ))
+                    .into());
+                }
+                let rh_inner = rh.as_ref().expect("rh set when remote_exists");
+                let bytes = match &rh_inner.bytes {
+                    Some(b) => b.clone(),
+                    None => ftp
+                        .download(&remote_path)
+                        .with_context(|| format!("downloading {remote_path}"))?,
+                };
+                download_one(
+                    &mut ftp,
+                    &mut state,
+                    &local_path,
+                    rel,
+                    &remote_path,
+                    &bytes,
+                    &rh_inner.sha256,
+                    mode,
+                )?;
+                TransferStatus::Transferred
+            }
+        };
 
-    if mode.should_apply() {
-        state.save(&state_path)?;
-    }
-    Ok(pull_required)
+        if mode.should_apply() {
+            state.save(&state_path)?;
+        }
+        Ok(TransferOutcome::new(rel, status))
+    })()
+    .with_context(|| format!("pull {rel}"))
 }
 
 /// In [`ExecutionMode::Apply`], write `bytes` to `local_path` atomically (via
