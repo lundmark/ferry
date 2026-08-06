@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use lsp_server::{Connection, Message, Notification};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, MessageType, ServerCapabilities,
     ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
@@ -48,44 +52,52 @@ impl<O: FileOperations> Server<O> {
         Self { operations }
     }
 
+    #[cfg(test)]
     fn handle_notification(&mut self, connection: &Connection, notification: Notification) {
+        for message in self.process_notification(notification) {
+            let _ = connection.sender.send(message);
+        }
+    }
+
+    fn process_notification(&mut self, notification: Notification) -> Vec<Message> {
         match notification.method.as_str() {
             "textDocument/didOpen" => {
                 if let Ok(params) =
                     serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
                 {
-                    self.handle_file_event(
-                        connection,
-                        params.text_document.uri.as_str(),
-                        Event::Open,
-                    );
+                    return self
+                        .handle_file_event(params.text_document.uri.as_str(), Event::Open)
+                        .into_iter()
+                        .collect();
                 }
             }
             "textDocument/didSave" => {
                 if let Ok(params) =
                     serde_json::from_value::<DidSaveTextDocumentParams>(notification.params)
                 {
-                    self.handle_file_event(
-                        connection,
-                        params.text_document.uri.as_str(),
-                        Event::Save,
-                    );
+                    return self
+                        .handle_file_event(params.text_document.uri.as_str(), Event::Save)
+                        .into_iter()
+                        .collect();
                 }
             }
             _ => {}
         }
+        Vec::new()
     }
 
-    fn handle_file_event(&mut self, connection: &Connection, uri: &str, event: Event) {
+    fn handle_file_event(&mut self, uri: &str, event: Event) -> Option<Message> {
         let Some(path) = uri_to_path(uri) else {
-            return;
+            return None;
         };
         let resolved = match crate::project::resolve_file(&path, true) {
             Ok(Some(resolved)) => resolved,
-            Ok(None) => return,
+            Ok(None) => return None,
             Err(error) => {
-                show_warning(connection, format!("ferry: {}: {error:#}", path.display()));
-                return;
+                return Some(warning_message(format!(
+                    "ferry: {}; run a Ferry task for details",
+                    safe_error_summary(&error)
+                )));
             }
         };
 
@@ -94,7 +106,7 @@ impl<O: FileOperations> Server<O> {
             Event::Save => resolved.config.editor.push_on_save,
         };
         if !enabled {
-            return;
+            return None;
         }
 
         let result = match event {
@@ -110,11 +122,13 @@ impl<O: FileOperations> Server<O> {
             ),
         };
         if let Err(error) = result {
-            show_warning(
-                connection,
-                format!("ferry: {}: {error:#}", resolved.relative_path),
-            );
+            return Some(warning_message(format!(
+                "ferry: {}: {}; run a Ferry task for details",
+                resolved.relative_path,
+                safe_error_summary(&error)
+            )));
         }
+        None
     }
 }
 
@@ -139,21 +153,82 @@ pub fn capabilities() -> ServerCapabilities {
     }
 }
 
-pub fn main_loop<O: FileOperations>(connection: Connection, mut server: Server<O>) -> Result<()> {
-    for message in &connection.receiver {
-        match message {
-            Message::Request(request) => {
-                if connection.handle_shutdown(&request)? {
+pub fn main_loop<O: FileOperations + Send + 'static>(
+    connection: Connection,
+    mut server: Server<O>,
+) -> Result<()> {
+    let (work_sender, work_receiver) = mpsc::channel::<Notification>();
+    let (outbound_sender, outbound_receiver) = mpsc::channel::<Message>();
+    let running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&running);
+
+    // Deliberately detached: a transport can block indefinitely. The worker
+    // owns no clone of the LSP sender, so it cannot keep the stdio writer alive
+    // after the protocol loop exits.
+    let _worker = thread::spawn(move || {
+        while worker_running.load(Ordering::Acquire) {
+            let Ok(notification) = work_receiver.recv() else {
+                return;
+            };
+            if !worker_running.load(Ordering::Acquire) {
+                return;
+            }
+            for message in server.process_notification(notification) {
+                if outbound_sender.send(message).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let result = protocol_loop(&connection, &work_sender, &outbound_receiver);
+    running.store(false, Ordering::Release);
+    drop(work_sender);
+    result
+}
+
+fn protocol_loop(
+    connection: &Connection,
+    work_sender: &mpsc::Sender<Notification>,
+    outbound_receiver: &mpsc::Receiver<Message>,
+) -> Result<()> {
+    loop {
+        while let Ok(message) = outbound_receiver.try_recv() {
+            if connection.sender.send(message).is_err() {
+                return Ok(());
+            }
+        }
+
+        match connection.receiver.try_recv() {
+            Ok(Message::Request(request)) => {
+                if handle_request(connection, request)? {
                     return Ok(());
                 }
             }
-            Message::Notification(notification) => {
-                server.handle_notification(&connection, notification);
+            Ok(Message::Notification(notification)) => {
+                if work_sender.send(notification).is_err() {
+                    return Ok(());
+                }
             }
-            Message::Response(_) => {}
+            Ok(Message::Response(_)) => {}
+            Err(error) if error.is_empty() => thread::sleep(Duration::from_millis(5)),
+            Err(_) => return Ok(()),
         }
     }
-    Ok(())
+}
+
+fn handle_request(connection: &Connection, request: Request) -> Result<bool> {
+    if request.method == "shutdown" {
+        return Ok(connection.handle_shutdown(&request)?);
+    }
+
+    let response = Response::new_err(
+        request.id,
+        ErrorCode::MethodNotFound as i32,
+        "unsupported request".to_string(),
+    );
+    let _ = connection.sender.send(Message::Response(response));
+    Ok(false)
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -172,7 +247,7 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded.as_ref()))
 }
 
-fn show_warning(connection: &Connection, message: String) {
+fn warning_message(message: String) -> Message {
     let notification = Notification::new(
         "window/showMessage".to_string(),
         ShowMessageParams {
@@ -180,7 +255,20 @@ fn show_warning(connection: &Connection, message: String) {
             message,
         },
     );
-    let _ = connection.sender.send(Message::Notification(notification));
+    Message::Notification(notification)
+}
+
+fn safe_error_summary(error: &anyhow::Error) -> &'static str {
+    for source in error.chain() {
+        if let Some(exit) = source.downcast_ref::<crate::error::Exit>() {
+            return match exit {
+                crate::error::Exit::Conflict(_) => "conflict",
+                crate::error::Exit::Config(_) => "configuration error",
+                crate::error::Exit::Auth(_) => "connection/authentication error",
+            };
+        }
+    }
+    "operation failed"
 }
 
 #[cfg(test)]
@@ -190,9 +278,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::str::FromStr;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     use anyhow::{Result, anyhow};
-    use lsp_server::{Connection, Message, Notification};
+    use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
     use lsp_types::{
         DidOpenTextDocumentParams, DidSaveTextDocumentParams, MessageType, ShowMessageParams,
         TextDocumentIdentifier, TextDocumentItem, Uri,
@@ -221,6 +312,7 @@ mod tests {
     enum Failure {
         Conflict,
         Generic,
+        SensitiveAuth,
     }
 
     struct FakeOperations {
@@ -260,6 +352,10 @@ mod tests {
                     Err(crate::error::Exit::Conflict("changed".into()).into())
                 }
                 Some(Failure::Generic) => Err(anyhow!("transport unavailable")),
+                Some(Failure::SensitiveAuth) => Err(crate::error::Exit::Auth(format!(
+                    "login rejected for {REVIEW_SECRET}"
+                ))
+                .into()),
                 None => Ok(TransferOutcome::new(rel, self.status)),
             }
         }
@@ -331,6 +427,10 @@ mod tests {
                 ),
             )
             .unwrap();
+        }
+
+        fn set_raw_config(&self, config: &str) {
+            fs::write(&self.config_path, config).unwrap();
         }
     }
 
@@ -493,6 +593,96 @@ mod tests {
         automatic_failure_emits_warning(Failure::Generic);
     }
 
+    const REVIEW_SECRET: &str = "REVIEW_SECRET_SENTINEL";
+
+    #[test]
+    fn automatic_resolution_config_error_never_discloses_source_text() {
+        let fixture = Fixture::new("");
+        fixture.set_raw_config(&format!(
+            "[connection]\nhost = \"example.invalid\"\nuser = \"u\"\n\
+             password = \"{REVIEW_SECRET}\n[paths]\nlocal_root = \".\"\nremote_root = \"/\"\n"
+        ));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (server_connection, client_connection) = Connection::memory();
+        let mut server = Server::new(FakeOperations::successful(calls));
+
+        server.handle_notification(&server_connection, did_open(fixture.uri()));
+
+        let warning = warning(&client_connection).expect("expected warning notification");
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert!(warning.message.contains("configuration error"));
+        assert!(!warning.message.contains(REVIEW_SECRET));
+    }
+
+    #[test]
+    fn automatic_operation_auth_error_never_discloses_details() {
+        let fixture = Fixture::new("");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (server_connection, client_connection) = Connection::memory();
+        let mut server = Server::new(FakeOperations::failing(calls, Failure::SensitiveAuth));
+
+        server.handle_notification(&server_connection, did_open(fixture.uri()));
+
+        let warning = warning(&client_connection).expect("expected warning notification");
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert!(warning.message.contains("src/nested/hello world.c"));
+        assert!(warning.message.contains("connection/authentication error"));
+        assert!(!warning.message.contains(REVIEW_SECRET));
+    }
+
+    struct CorruptingConfigOperations;
+
+    impl FileOperations for CorruptingConfigOperations {
+        fn pull(
+            &mut self,
+            config_path: &Path,
+            _rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            fs::write(
+                config_path,
+                format!(
+                    "[connection]\nhost = \"example.invalid\"\nuser = \"u\"\n\
+                     password = \"{REVIEW_SECRET}\n[paths]\nremote_root = \"/\"\n"
+                ),
+            )?;
+            crate::config::Config::load(config_path)?;
+            unreachable!("malformed config must fail")
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn automatic_second_config_load_error_never_discloses_source_text() {
+        let fixture = Fixture::new("");
+        let (server_connection, client_connection) = Connection::memory();
+        let mut server = Server::new(CorruptingConfigOperations);
+
+        server.handle_notification(&server_connection, did_open(fixture.uri()));
+
+        let warning = warning(&client_connection).expect("expected warning notification");
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert!(warning.message.contains("src/nested/hello world.c"));
+        assert!(warning.message.contains("configuration error"));
+        assert!(!warning.message.contains(REVIEW_SECRET));
+    }
+
     #[test]
     fn automatic_success_outcomes_are_silent() {
         let fixture = Fixture::new("");
@@ -528,6 +718,193 @@ mod tests {
                 ..ServerCapabilities::default()
             }
         );
+    }
+
+    struct SendOperations;
+
+    impl FileOperations for SendOperations {
+        fn pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    fn send_shutdown(client: &Connection, id: i32) {
+        client
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(id),
+                "shutdown".to_string(),
+                (),
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "exit".to_string(),
+                (),
+            )))
+            .unwrap();
+    }
+
+    fn response_with_id(message: Message, id: i32) -> Response {
+        match message {
+            Message::Response(response) if response.id == RequestId::from(id) => response,
+            other => panic!("expected response {id}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_loop_replies_method_not_found_to_unsupported_requests() {
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(SendOperations)));
+        client_connection
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(41),
+                "workspace/unsupported".to_string(),
+                (),
+            )))
+            .unwrap();
+
+        let unsupported = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(150))
+            .ok();
+        send_shutdown(&client_connection, 42);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        loop_thread.join().unwrap().unwrap();
+
+        let unsupported = response_with_id(unsupported.expect("unsupported request response"), 41);
+        assert_eq!(
+            unsupported.error.expect("JSON-RPC error").code,
+            ErrorCode::MethodNotFound as i32
+        );
+        assert!(response_with_id(shutdown, 42).error.is_none());
+    }
+
+    struct BlockingOperations {
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+    }
+
+    impl FileOperations for BlockingOperations {
+        fn pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            self.started.send(()).unwrap();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.finished.send(()).unwrap();
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn main_loop_shutdown_does_not_wait_for_blocked_file_operation() {
+        let fixture = Fixture::new("");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let operations = BlockingOperations {
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let (loop_done_tx, loop_done_rx) = mpsc::sync_channel(1);
+        let loop_thread = thread::spawn(move || {
+            let result = main_loop(server_connection, Server::new(operations));
+            loop_done_tx.send(()).unwrap();
+            result
+        });
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull should start");
+
+        send_shutdown(&client_connection, 51);
+        let prompt_shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(150))
+            .ok();
+        let prompt_loop_exit = loop_done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_ok();
+        let writer_disconnected = prompt_loop_exit
+            && client_connection
+                .receiver
+                .try_recv()
+                .expect_err("worker must not retain the LSP sender")
+                .is_disconnected();
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked operation should be released");
+        loop_thread.join().unwrap().unwrap();
+
+        let shutdown = response_with_id(
+            prompt_shutdown.expect("shutdown response must not wait for file operation"),
+            51,
+        );
+        assert!(shutdown.error.is_none());
+        assert!(prompt_loop_exit, "main loop should terminate promptly");
+        assert!(writer_disconnected, "worker must not retain the LSP sender");
     }
 
     #[test]
