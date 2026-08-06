@@ -96,10 +96,19 @@ impl<O: FileOperations> Server<O> {
         Vec::new()
     }
 
+    #[cfg(test)]
     fn process_request(&mut self, request: Request) -> Vec<Message> {
         match request.method.as_str() {
             CODE_ACTION_METHOD => vec![Message::Response(code_actions(request))],
-            EXECUTE_COMMAND_METHOD => self.execute_command(request),
+            EXECUTE_COMMAND_METHOD => match prepare_execute_command(request) {
+                PreparedRequest::Ready { id, command } => {
+                    vec![
+                        Message::Response(Response::new_ok(id, ())),
+                        self.process_command(command),
+                    ]
+                }
+                PreparedRequest::Immediate(messages) => messages,
+            },
             _ => vec![Message::Response(Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
@@ -108,79 +117,30 @@ impl<O: FileOperations> Server<O> {
         }
     }
 
-    fn execute_command(&mut self, request: Request) -> Vec<Message> {
-        let id = request.id;
-        let params = match serde_json::from_value::<ExecuteCommandParams>(request.params) {
-            Ok(params) => params,
-            Err(_) => {
-                return vec![Message::Response(invalid_params(
-                    id,
-                    "invalid execute-command parameters",
-                ))];
-            }
-        };
-        if !ACTION_COMMANDS.contains(&params.command.as_str()) || params.arguments.len() != 1 {
-            return vec![Message::Response(invalid_params(
-                id,
-                "invalid Ferry command or arguments",
-            ))];
-        }
-        let Some(uri) = params.arguments[0].as_str() else {
-            return vec![Message::Response(invalid_params(
-                id,
-                "expected one file URI argument",
-            ))];
-        };
-        let Some(path) = uri_to_path(uri) else {
-            return vec![Message::Response(invalid_params(
-                id,
-                "expected one file URI argument",
-            ))];
-        };
-        let resolved = match crate::project::resolve_file(&path, true) {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
-                return vec![Message::Response(invalid_params(
-                    id,
-                    "file is outside a Ferry project",
-                ))];
-            }
-            Err(error) => {
-                return operation_response(
-                    id,
-                    warning_message(format!(
-                        "ferry: {}; run a Ferry task for details",
-                        safe_error_summary(&error)
-                    )),
-                );
-            }
-        };
-        let relative_path = resolved.relative_path;
-        let feedback = match params.command.as_str() {
-            PULL_COMMAND => transfer_feedback(
-                &relative_path,
+    fn process_command(&mut self, command: PreparedCommand) -> Message {
+        match command.action {
+            ActionCommand::Pull => transfer_feedback(
+                &command.relative_path,
                 self.operations.pull(
-                    &resolved.config_path,
-                    &relative_path,
+                    &command.config_path,
+                    &command.relative_path,
                     /* force = */ false,
                 ),
             ),
-            PUSH_COMMAND => transfer_feedback(
-                &relative_path,
+            ActionCommand::Push => transfer_feedback(
+                &command.relative_path,
                 self.operations.push(
-                    &resolved.config_path,
-                    &relative_path,
+                    &command.config_path,
+                    &command.relative_path,
                     /* force = */ false,
                 ),
             ),
-            COMPILE_COMMAND => compile_feedback(
-                &relative_path,
+            ActionCommand::Compile => compile_feedback(
+                &command.relative_path,
                 self.operations
-                    .compile(&resolved.config_path, &relative_path),
+                    .compile(&command.config_path, &command.relative_path),
             ),
-            _ => unreachable!("command was validated above"),
-        };
-        operation_response(id, feedback)
+        }
     }
 
     fn handle_file_event(&mut self, uri: &str, event: Event) -> Option<Message> {
@@ -259,6 +219,95 @@ fn code_actions(request: Request) -> Response {
 }
 
 #[derive(Clone, Copy)]
+enum ActionCommand {
+    Pull,
+    Push,
+    Compile,
+}
+
+struct PreparedCommand {
+    action: ActionCommand,
+    config_path: PathBuf,
+    relative_path: String,
+}
+
+enum PreparedRequest {
+    Ready {
+        id: lsp_server::RequestId,
+        command: PreparedCommand,
+    },
+    Immediate(Vec<Message>),
+}
+
+fn prepare_execute_command(request: Request) -> PreparedRequest {
+    let id = request.id;
+    let params = match serde_json::from_value::<ExecuteCommandParams>(request.params) {
+        Ok(params) => params,
+        Err(_) => {
+            return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
+                id,
+                "invalid execute-command parameters",
+            ))]);
+        }
+    };
+    let action = match params.command.as_str() {
+        PULL_COMMAND => ActionCommand::Pull,
+        PUSH_COMMAND => ActionCommand::Push,
+        COMPILE_COMMAND => ActionCommand::Compile,
+        _ => {
+            return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
+                id,
+                "invalid Ferry command or arguments",
+            ))]);
+        }
+    };
+    if params.arguments.len() != 1 {
+        return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
+            id,
+            "invalid Ferry command or arguments",
+        ))]);
+    }
+    let Some(uri) = params.arguments[0].as_str() else {
+        return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
+            id,
+            "expected one file URI argument",
+        ))]);
+    };
+    let Some(path) = uri_to_path(uri) else {
+        return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
+            id,
+            "expected one file URI argument",
+        ))]);
+    };
+    let resolved = match crate::project::resolve_file(&path, true) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
+                id,
+                "file is outside a Ferry project",
+            ))]);
+        }
+        Err(error) => {
+            return PreparedRequest::Immediate(operation_response(
+                id,
+                warning_message(format!(
+                    "ferry: {}; run a Ferry task for details",
+                    safe_error_summary(&error)
+                )),
+            ));
+        }
+    };
+    PreparedRequest::Ready {
+        id,
+        command: PreparedCommand {
+            action,
+            config_path: resolved.config_path,
+            relative_path: resolved.relative_path,
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Event {
     Open,
     Save,
@@ -289,7 +338,7 @@ pub fn capabilities() -> ServerCapabilities {
 
 enum Work {
     Notification(Notification),
-    Request(Request),
+    Command(PreparedCommand),
 }
 
 pub fn main_loop<O: FileOperations + Send + 'static>(
@@ -314,7 +363,7 @@ pub fn main_loop<O: FileOperations + Send + 'static>(
             }
             let messages = match work {
                 Work::Notification(notification) => server.process_notification(notification),
-                Work::Request(request) => server.process_request(request),
+                Work::Command(command) => vec![server.process_command(command)],
             };
             for message in messages {
                 if outbound_sender.send(message).is_err() {
@@ -376,7 +425,28 @@ fn handle_request(
     }
 
     if request.method == EXECUTE_COMMAND_METHOD {
-        return Ok(work_sender.send(Work::Request(request)).is_err());
+        match prepare_execute_command(request) {
+            PreparedRequest::Ready { id, command } => {
+                let response = if work_sender.send(Work::Command(command)).is_ok() {
+                    Response::new_ok(id, ())
+                } else {
+                    Response::new_err(
+                        id,
+                        ErrorCode::InternalError as i32,
+                        "Ferry operation worker unavailable".to_string(),
+                    )
+                };
+                return Ok(connection.sender.send(Message::Response(response)).is_err());
+            }
+            PreparedRequest::Immediate(messages) => {
+                for message in messages {
+                    if connection.sender.send(message).is_err() {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+        }
     }
 
     let response = Response::new_err(
@@ -1694,6 +1764,72 @@ mod tests {
         assert!(action.error.is_none());
         assert_eq!(action.result.unwrap().as_array().unwrap().len(), 3);
         assert!(response_with_id(prompt_shutdown, 142).error.is_none());
+    }
+
+    #[test]
+    fn execute_command_responds_before_blocked_operation_and_shutdown() {
+        let fixture = Fixture::new("");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let operations = BlockingOperations {
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let (loop_done_tx, loop_done_rx) = mpsc::sync_channel(1);
+        let loop_thread = thread::spawn(move || {
+            let result = main_loop(server_connection, Server::new(operations));
+            loop_done_tx.send(()).unwrap();
+            result
+        });
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                151,
+                PULL_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("manual pull should start");
+
+        let prompt_command = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(500))
+            .ok();
+        send_shutdown(&client_connection, 152);
+        let prompt_shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response");
+        let prompt_loop_exit = loop_done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let writer_disconnected = prompt_loop_exit
+            && client_connection
+                .receiver
+                .try_recv()
+                .expect_err("worker must not retain the LSP sender")
+                .is_disconnected();
+
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked operation should be released");
+        loop_thread.join().unwrap().unwrap();
+
+        let command = response_with_id(
+            prompt_command.expect("command response must precede blocked operation"),
+            151,
+        );
+        assert!(command.error.is_none());
+        assert_eq!(command.result, Some(serde_json::Value::Null));
+        assert!(response_with_id(prompt_shutdown, 152).error.is_none());
+        assert!(prompt_loop_exit, "main loop should terminate promptly");
+        assert!(writer_disconnected, "worker must not retain the LSP sender");
     }
 
     #[test]
