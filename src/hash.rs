@@ -8,9 +8,12 @@ pub fn hash_file(path: &Path) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = file.read(&mut buf)
+        let n = file
+            .read(&mut buf)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))

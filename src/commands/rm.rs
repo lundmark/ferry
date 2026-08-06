@@ -7,8 +7,8 @@
 //! may not escape the sync roots, and deleting a directory demands
 //! `--recursive`.
 
-use crate::commands::{state_path_for, ExecutionMode};
 use crate::commands::walk::{remote_join, safe_arg, walk_local, walk_remote};
+use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::ignored::Matcher;
@@ -285,7 +285,10 @@ mod tests {
     fn collects_root_and_nested_dirs_but_not_ancestors() {
         // Deleting under "src/old": we clean up src/old and src/old/sub, never
         // the ancestor "src".
-        assert_eq!(dirs("src/old/sub/a.html", "src/old"), vec!["src/old", "src/old/sub"]);
+        assert_eq!(
+            dirs("src/old/sub/a.html", "src/old"),
+            vec!["src/old", "src/old/sub"]
+        );
     }
 
     #[test]

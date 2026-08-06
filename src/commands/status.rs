@@ -1,10 +1,10 @@
-use crate::commands::{remote_hash, state_path_for, ExecutionMode};
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::commands::{ExecutionMode, remote_hash, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_file;
 use crate::ignored::Matcher;
-use crate::state::{classify, StateFile};
+use crate::state::{StateFile, classify};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::Path;

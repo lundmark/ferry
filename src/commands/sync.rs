@@ -17,16 +17,16 @@
 //! user says "just sync it already," last-write-wins from the local side
 //! since that's the side the user is actively editing.
 
-use crate::commands::{state_path_for, ExecutionMode};
 use crate::commands::pull::download_one;
 use crate::commands::push::upload_one;
 use crate::commands::remote_hash;
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_file;
 use crate::ignored::Matcher;
-use crate::state::{classify, FileState, StateFile};
+use crate::state::{FileState, StateFile, classify};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -131,7 +131,8 @@ pub fn run(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
                 let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
                 let bytes_owned: Vec<u8> = match &rh_inner.bytes {
                     Some(b) => b.clone(),
-                    None => ftp.download(&remote_path)
+                    None => ftp
+                        .download(&remote_path)
                         .with_context(|| format!("downloading {remote_path}"))?,
                 };
                 download_one(
@@ -157,8 +158,9 @@ pub fn run(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
                 // wins — sync's "force" is the user telling us to just push
                 // their working copy as the canonical version.
                 if force {
-                    let bytes = std::fs::read(local_root.join(rel))
-                        .with_context(|| format!("reading local {}", local_root.join(rel).display()))?;
+                    let bytes = std::fs::read(local_root.join(rel)).with_context(|| {
+                        format!("reading local {}", local_root.join(rel).display())
+                    })?;
                     let new_hash = local_hash
                         .as_deref()
                         .expect("local_hash set when on_local is true");

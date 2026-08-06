@@ -1,12 +1,12 @@
 //! Requires Docker. Run with: cargo test --test push_integration -- --ignored
-use std::process::Command;
-use testcontainers::{
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-    Container, GenericImage, ImageExt,
-};
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
+use std::process::Command;
+use testcontainers::{
+    Container, GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::SyncRunner,
+};
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -53,7 +53,8 @@ fn push_uploads_new_and_local_changed_files() {
     let keep_bytes: &[u8] = b"both sides agree on keep\n";
     let update_remote_original: &[u8] = b"original update content\n";
     ftp.upload_bytes("/keep.txt", keep_bytes).unwrap();
-    ftp.upload_bytes("/update.txt", update_remote_original).unwrap();
+    ftp.upload_bytes("/update.txt", update_remote_original)
+        .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
@@ -126,15 +127,24 @@ fn push_uploads_new_and_local_changed_files() {
 
     // keep.txt on remote should be untouched (InSync no-op).
     let keep_remote_after = ftp.download("/keep.txt").unwrap();
-    assert_eq!(keep_remote_after, keep_bytes, "keep.txt should be unchanged");
+    assert_eq!(
+        keep_remote_after, keep_bytes,
+        "keep.txt should be unchanged"
+    );
 
     // State should reflect the new hashes for the uploaded files.
     let new_state =
         ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
-    let upd_rec = new_state.files.get("update.txt").expect("update.txt in state");
+    let upd_rec = new_state
+        .files
+        .get("update.txt")
+        .expect("update.txt in state");
     assert_eq!(upd_rec.sha256, hash_bytes(update_local_new));
     assert_eq!(upd_rec.size, update_local_new.len() as u64);
-    let new_rec = new_state.files.get("newfile.txt").expect("newfile.txt in state");
+    let new_rec = new_state
+        .files
+        .get("newfile.txt")
+        .expect("newfile.txt in state");
     assert_eq!(new_rec.sha256, hash_bytes(newfile_bytes));
     assert_eq!(new_rec.size, newfile_bytes.len() as u64);
 }

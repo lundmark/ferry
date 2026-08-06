@@ -14,7 +14,12 @@ fn init_writes_config_and_updates_gitignore() {
     let cwd = dir.path();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .args(["init", "--no-validate", "--config", cfg_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-validate",
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -117,12 +122,12 @@ fn init_dry_run_does_not_write_config_or_gitignore() {
 #[test]
 #[ignore]
 fn validates_existing_local_against_remote() {
+    use ferry::ftp::Ftp;
     use testcontainers::{
+        GenericImage, ImageExt,
         core::{IntoContainerPort, WaitFor},
         runners::SyncRunner,
-        GenericImage, ImageExt,
     };
-    use ferry::ftp::Ftp;
 
     // Spin up the FTP server. Same image + creds as tests/ftp_integration.rs
     // so we share the pattern reviewers already know.
@@ -168,7 +173,12 @@ fn validates_existing_local_against_remote() {
         host = host,
         port = port,
     );
-    child.stdin.as_mut().unwrap().write_all(answers.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(answers.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -182,9 +192,12 @@ fn validates_existing_local_against_remote() {
 
     // State file should exist and contain ONLY shared.txt.
     let state_path = local_root.join(".ferry").join("state.json");
-    let state_text = std::fs::read_to_string(&state_path)
-        .expect(".ferry/state.json should have been seeded");
-    assert!(state_text.contains("shared.txt"), "state missing shared.txt: {state_text}");
+    let state_text =
+        std::fs::read_to_string(&state_path).expect(".ferry/state.json should have been seeded");
+    assert!(
+        state_text.contains("shared.txt"),
+        "state missing shared.txt: {state_text}"
+    );
     assert!(
         !state_text.contains("local_only.txt"),
         "local-only entry must not be seeded: {state_text}",
@@ -200,7 +213,10 @@ fn validates_existing_local_against_remote() {
 
     // Local files unchanged.
     assert_eq!(std::fs::read(local_root.join("shared.txt")).unwrap(), b"X");
-    assert_eq!(std::fs::read(local_root.join("local_only.txt")).unwrap(), b"L");
+    assert_eq!(
+        std::fs::read(local_root.join("local_only.txt")).unwrap(),
+        b"L"
+    );
     assert_eq!(
         std::fs::read(local_root.join("differs.txt")).unwrap(),
         b"local-version",
@@ -220,7 +236,12 @@ fn init_refuses_when_config_exists() {
     std::fs::write(&cfg_path, "junk").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
-        .args(["init", "--no-validate", "--config", cfg_path.to_str().unwrap()])
+        .args([
+            "init",
+            "--no-validate",
+            "--config",
+            cfg_path.to_str().unwrap(),
+        ])
         .current_dir(dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

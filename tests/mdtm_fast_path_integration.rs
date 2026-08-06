@@ -32,13 +32,13 @@
 //! follow-up integration test (out of scope for this task) could add a
 //! download counter to instrument the speedup directly.
 
+use ferry::ftp::Ftp;
 use std::process::Command;
 use testcontainers::{
+    Container, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::SyncRunner,
-    Container, GenericImage, ImageExt,
 };
-use ferry::ftp::Ftp;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -109,7 +109,10 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
     // Sanity: state recorded what we expect.
     let state =
         ferry::state::StateFile::load_or_default(&local_root.join(".ferry/state.json")).unwrap();
-    let rec = state.files.get("hello.txt").expect("hello.txt in state after sync");
+    let rec = state
+        .files
+        .get("hello.txt")
+        .expect("hello.txt in state after sync");
     assert_eq!(rec.size, bytes.len() as u64);
 
     // Now run `status` — fast path territory. Nothing has changed; the
@@ -154,10 +157,8 @@ fn mdtm_fast_path_preserves_in_sync_on_unchanged_tree() {
     // happened to need the fast path on this file (cache miss because
     // sync wrote then we read same mtime). Either Some(true) or None is
     // acceptable; Some(false) would indicate a regression.
-    let state_after = ferry::state::StateFile::load_or_default(
-        &local_root.join(".ferry/state.json"),
-    )
-    .unwrap();
+    let state_after =
+        ferry::state::StateFile::load_or_default(&local_root.join(".ferry/state.json")).unwrap();
     assert!(
         state_after.server_supports_mdtm != Some(false),
         "server_supports_mdtm should not be cached as false against a server that supports MDTM; got {:?}",

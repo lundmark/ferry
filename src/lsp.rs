@@ -160,9 +160,7 @@ impl<O: FileOperations> Server<O> {
     }
 
     fn handle_file_event(&mut self, uri: &str, event: Event) -> Option<Message> {
-        let Some(path) = uri_to_path(uri) else {
-            return None;
-        };
+        let path = uri_to_path(uri)?;
         let resolved = match crate::project::resolve_file(&path, true) {
             Ok(Some(resolved)) => resolved,
             Ok(None) => return None,

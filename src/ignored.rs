@@ -15,7 +15,9 @@ impl Matcher {
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        self.gi.matched_path_or_any_parents(path, is_dir).is_ignore()
+        self.gi
+            .matched_path_or_any_parents(path, is_dir)
+            .is_ignore()
     }
 }
 

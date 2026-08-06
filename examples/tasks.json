@@ -1,35 +1,50 @@
 [
   {
-    "label": "FTP: push current file",
+    "label": "Ferry: pull current file",
     "command": "ferry",
-    "args": ["push", "$ZED_RELATIVE_FILE"],
+    "args": ["pull", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
     "reveal": "on_error"
   },
   {
-    "label": "FTP: pull current file",
+    "label": "Ferry: push current file",
     "command": "ferry",
-    "args": ["pull", "$ZED_RELATIVE_FILE"],
+    "args": ["push", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
     "reveal": "on_error"
   },
   {
-    "label": "FTP: delete current file",
+    "label": "Ferry: compile-check current file",
     "command": "ferry",
-    "args": ["rm", "$ZED_RELATIVE_FILE"],
+    "args": ["cc", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
     "reveal": "on_error"
   },
   {
-    "label": "FTP: status",
+    "label": "Ferry: project-wide status",
     "command": "ferry",
     "args": ["status"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
     "reveal": "always"
   },
   {
-    "label": "FTP: sync all",
+    "label": "Ferry: project-wide sync",
     "command": "ferry",
     "args": ["sync"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
     "reveal": "always"
+  },
+  {
+    "label": "Ferry: DELETE current file locally and remotely",
+    "command": "ferry",
+    "args": ["rm", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
+    "use_new_terminal": false,
+    "reveal": "on_error"
   }
 ]

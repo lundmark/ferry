@@ -1,12 +1,12 @@
 //! Requires Docker. Run with: cargo test --test pull_integration -- --ignored
-use std::process::Command;
-use testcontainers::{
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-    Container, GenericImage, ImageExt,
-};
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
+use std::process::Command;
+use testcontainers::{
+    Container, GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::SyncRunner,
+};
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -97,7 +97,10 @@ fn pull_downloads_new_and_remote_changed_files() {
 
     // update.txt should be overwritten with the remote contents.
     let update_local = std::fs::read(local_root.join("update.txt")).unwrap();
-    assert_eq!(update_local, update_remote, "update.txt should be overwritten");
+    assert_eq!(
+        update_local, update_remote,
+        "update.txt should be overwritten"
+    );
 
     // State should now have entries for both files with the new hashes.
     let new_state =
@@ -105,7 +108,10 @@ fn pull_downloads_new_and_remote_changed_files() {
     let keep_rec = new_state.files.get("keep.txt").expect("keep.txt in state");
     assert_eq!(keep_rec.sha256, hash_bytes(keep_remote));
     assert_eq!(keep_rec.size, keep_remote.len() as u64);
-    let upd_rec = new_state.files.get("update.txt").expect("update.txt in state");
+    let upd_rec = new_state
+        .files
+        .get("update.txt")
+        .expect("update.txt in state");
     assert_eq!(upd_rec.sha256, hash_bytes(update_remote));
     assert_eq!(upd_rec.size, update_remote.len() as u64);
 }

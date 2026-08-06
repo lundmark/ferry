@@ -16,10 +16,8 @@ and pushed as you and your agents work.
 ## Status
 
 Functional and unit-tested. The FTP integration tests are gated behind a live
-Docker daemon (they spin up a real `vsftpd` container), and the end-to-end
-smoke test of the editor `tasks.json` flow has **not yet been run** in this
-environment because Docker was unavailable. Expect to verify the round-trip
-against your own server before relying on it.
+Docker daemon because they spin up a real `vsftpd` container. Verify the
+round-trip against your own server before relying on Ferry for important data.
 
 ## Installation
 
@@ -74,26 +72,29 @@ Previewed actions use future-tense output such as `would push`, `would pull`,
 also suppresses its normally hidden state-cache update. The observational
 `ls` and `cc` / `check` commands otherwise behave normally.
 
-## Tasks.json integration
+## Zed Task Picker integration
 
 Copy [`examples/tasks.json`](examples/tasks.json) into your project's
 `.zed/tasks.json` (or merge the entries with your existing tasks). Then in
-Zed, open the command palette and run `task: spawn` to pick one of:
+Zed, open the command palette and run `task: spawn`. The example provides:
 
-- `FTP: push current file`
-- `FTP: pull current file`
-- `FTP: delete current file`
-- `FTP: status`
-- `FTP: sync all`
+- current-file Pull, Push, and Compile-check tasks;
+- a clearly labelled project-wide Status task;
+- a clearly labelled project-wide Sync task; and
+- a destructive current-file Delete task.
 
-The per-file tasks use Zed's `$ZED_RELATIVE_FILE` variable so they operate on
-whichever buffer is active.
+Current-file tasks pass Zed's absolute `$ZED_FILE` path and run from
+`$ZED_DIRNAME`, so Ferry can find the nearest project configuration. Status
+and Sync run from `$ZED_WORKTREE_ROOT`. Status is the safe way to inspect the
+whole project. Project-wide Sync is conflict-aware and does not use force, but
+it may transfer files throughout the configured project; review Status first.
+There are deliberately no whole-tree Pull, Push, or force tasks.
 
-`FTP: delete current file` runs `ferry rm`, which removes the file on the
-server **and** the local copy (and drops its sync record). It is deliberately
-destructive and does not prompt, so it only ever acts on the paths you name —
-a bare `rm` with no path is refused. To delete a whole directory subtree, run
-`ferry rm --recursive <dir>` from a terminal.
+> **Destructive:** `Ferry: DELETE current file locally and remotely` runs
+> `ferry rm`, which removes the named file on the server **and** the local copy
+> (and drops its sync record) without prompting. A bare `rm` with no path is
+> refused. To delete a directory subtree, explicitly run
+> `ferry rm --recursive <dir>` from a terminal.
 
 ## Claude Code / Codex hook
 
@@ -135,22 +136,46 @@ Behaviour:
 - On failure, logs to stderr (which the LLM host surfaces to you) but
   never denies the tool call.
 
-## Auto-pull on open (Zed extension)
+## Native Zed integration
 
-For a hands-off workflow where opening a file automatically pulls the current
-remote version, install the companion extension at
-[`extensions/ferry/`](extensions/ferry/README.md). It attaches a minimal
-language server to `.c`/`.h` files that shells out to `ferry pull --force`
-on `textDocument/didOpen`. Install with:
+The companion extension at [`extensions/ferry/`](extensions/ferry/README.md)
+starts `ferry-lsp` for Zed's C language. The language server handles file-open
+and file-save events directly and offers manual file actions. Install it with:
 
 ```sh
 cargo install --path .          # installs both ferry and ferry-lsp
 cd extensions/ferry
-zed --dev-extension .            # or use the Extensions palette
+zed --dev-extension .           # or use Extensions: Install Dev Extension
 ```
 
-See the extension's README for behaviour details and the "brief flash of
-stale content" caveat inherent to the approach.
+Configure the editor behavior in the project's `.ferry.toml`:
+
+```toml
+[editor]
+pull_on_open = true
+push_on_save = false
+```
+
+Both values shown are the defaults: Pull on open is enabled, while Push on
+save is opt-in. For nested projects, the nearest `.ferry.toml` above the file
+wins. The configuration is read again on every open, save, and manual action,
+so changes apply on the next event without restarting Zed.
+
+Automatic Pull and the optional automatic Push are always non-force and
+conflict-safe. A conflict or other failure produces a warning; automatic
+success is silent. Zed initially opens the on-disk file, so it can briefly
+show stale content before its external-file watcher observes a successful
+Pull. No open or save event performs a whole-tree sync.
+
+For an explicit operation, open the lightbulb menu or press `Ctrl-.` and pick
+exactly one of `Ferry: Pull`, `Ferry: Push`, or `Ferry: Compile-check`. Manual
+actions report results with Info or Warning notifications. The Task Picker
+tasks described above are terminal-backed alternatives when you want command
+output, project Status/Sync, or the destructive Delete command.
+
+The extension attaches only to Zed's C language by default. `.h` files are
+covered when Zed classifies them as C; see the extension README if your header
+is attached to a different language.
 
 ## Remote compile checks (`cc`)
 
@@ -222,6 +247,11 @@ These are stable so you can branch on them from shell scripts or task runners.
 - **"Conflict: ..."** — run `ferry status` to see which files diverge, then
   either `pull`/`push` the side you want to keep, or re-run with `--force` to
   blow away the other side.
+- **"remote presence ... is indeterminate"** — single-file transfers try
+  `SIZE`, then an exact `NLST` lookup. A server that supports neither `SIZE`
+  nor an authoritative exact-`NLST` absence (for example, it errors when the
+  requested name is missing) cannot safely prove absence. Ferry therefore
+  refuses to create a new remote or local counterpart instead of guessing.
 
 ## Development
 

@@ -1,12 +1,12 @@
 //! Requires Docker. Run with: cargo test --test sync_integration -- --ignored
-use std::process::Command;
-use testcontainers::{
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-    Container, GenericImage, ImageExt,
-};
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
+use std::process::Command;
+use testcontainers::{
+    Container, GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::SyncRunner,
+};
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -92,7 +92,10 @@ fn sync_noop_when_in_sync() {
 
     // Remote file unchanged.
     let remote_after = ftp.download("/agree.txt").unwrap();
-    assert_eq!(remote_after, bytes, "remote should be untouched on noop sync");
+    assert_eq!(
+        remote_after, bytes,
+        "remote should be untouched on noop sync"
+    );
 
     // State should still have the same single entry. We allow re-serialization
     // to change formatting in principle, but since neither files nor
@@ -119,8 +122,10 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     let remote_changed_new: &[u8] = b"remote-edited content\n";
 
     // Seed remote: local-changed.txt still matches known; remote-changed.txt has new content.
-    ftp.upload_bytes("/local-changed.txt", local_changed_known).unwrap();
-    ftp.upload_bytes("/remote-changed.txt", remote_changed_new).unwrap();
+    ftp.upload_bytes("/local-changed.txt", local_changed_known)
+        .unwrap();
+    ftp.upload_bytes("/remote-changed.txt", remote_changed_new)
+        .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
@@ -187,10 +192,16 @@ fn sync_uploads_local_and_downloads_remote_in_one_pass() {
     // State should now reflect the post-sync hashes for both files.
     let new_state =
         ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
-    let lc_rec = new_state.files.get("local-changed.txt").expect("local-changed in state");
+    let lc_rec = new_state
+        .files
+        .get("local-changed.txt")
+        .expect("local-changed in state");
     assert_eq!(lc_rec.sha256, hash_bytes(local_changed_new));
     assert_eq!(lc_rec.size, local_changed_new.len() as u64);
-    let rc_rec = new_state.files.get("remote-changed.txt").expect("remote-changed in state");
+    let rc_rec = new_state
+        .files
+        .get("remote-changed.txt")
+        .expect("remote-changed in state");
     assert_eq!(rc_rec.sha256, hash_bytes(remote_changed_new));
     assert_eq!(rc_rec.size, remote_changed_new.len() as u64);
 }
@@ -277,7 +288,10 @@ fn sync_refuses_both_changed_then_obeys_force() {
     );
     // Local should be unchanged (it's the winner).
     let local_after_force = std::fs::read(local_root.join("conflict.txt")).unwrap();
-    assert_eq!(local_after_force, local_bytes, "local should still be local");
+    assert_eq!(
+        local_after_force, local_bytes,
+        "local should still be local"
+    );
 
     let new_state =
         ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();

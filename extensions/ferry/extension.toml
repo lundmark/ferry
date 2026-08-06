@@ -1,9 +1,9 @@
 id = "ferry"
 name = "Ferry"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 authors = ["Simon Lundmark <simon@dagg.ai>"]
-description = "Auto-pull files from an FTP server when opened. Attaches a minimal language server to C files that shells out to `ferry pull` on textDocument/didOpen."
+description = "Configurable pull-on-open and push-on-save for Ferry projects, with manual pull, push, and compile-check file actions."
 repository = "https://github.com/simon/zed_ftp"
 
 # Attach the LSP to Zed's built-in C language. C headers (.h) are covered

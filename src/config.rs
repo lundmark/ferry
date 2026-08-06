@@ -49,14 +49,25 @@ pub struct Editor {
 
 impl Default for Editor {
     fn default() -> Self {
-        Self { pull_on_open: true, push_on_save: false }
+        Self {
+            pull_on_open: true,
+            push_on_save: false,
+        }
     }
 }
 
-fn default_port() -> u16 { 21 }
-fn default_udp_port() -> u16 { 3203 }
-fn default_true() -> bool { true }
-fn default_local_root() -> PathBuf { PathBuf::from(".") }
+fn default_port() -> u16 {
+    21
+}
+fn default_udp_port() -> u16 {
+    3203
+}
+fn default_true() -> bool {
+    true
+}
+fn default_local_root() -> PathBuf {
+    PathBuf::from(".")
+}
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -64,21 +75,18 @@ impl Config {
         // process exits 3 (config problem) rather than 1 (generic). The path
         // and underlying I/O / parse message are preserved inside the
         // `Exit::Config(...)` payload so the user still sees what went wrong.
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            crate::error::Exit::Config(format!("reading {}: {e}", path.display()))
-        })?;
-        let mut cfg: Config = toml::from_str(&text).map_err(|e| {
-            crate::error::Exit::Config(format!("parsing {}: {e}", path.display()))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| crate::error::Exit::Config(format!("reading {}: {e}", path.display())))?;
+        let mut cfg: Config = toml::from_str(&text)
+            .map_err(|e| crate::error::Exit::Config(format!("parsing {}: {e}", path.display())))?;
         // Resolve local_root relative to the config file's directory. Without
         // this, invoking ferry from a different CWD (as the Claude Code
         // hook does) makes `local_root = "."` point at the wrong tree.
-        if cfg.paths.local_root.is_relative() {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    cfg.paths.local_root = parent.join(&cfg.paths.local_root);
-                }
-            }
+        if cfg.paths.local_root.is_relative()
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            cfg.paths.local_root = parent.join(&cfg.paths.local_root);
         }
         Ok(cfg)
     }
@@ -147,7 +155,10 @@ mod tests {
 
         assert_eq!(
             cfg.editor,
-            Editor { pull_on_open: false, push_on_save: true }
+            Editor {
+                pull_on_open: false,
+                push_on_save: true
+            }
         );
     }
 

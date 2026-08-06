@@ -3,7 +3,7 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 const LC_TIMEOUT: Duration = Duration::from_secs(3);
 const LC_RETRIES: u32 = 3;
@@ -79,17 +79,26 @@ impl CompileClient {
             .with_context(|| format!("resolving {host}:{udp_port}"))?
             .next()
             .ok_or_else(|| anyhow!("no address for {host}:{udp_port}"))?;
-        Ok(Self { addr, timeout: LC_TIMEOUT, retries: LC_RETRIES })
+        Ok(Self {
+            addr,
+            timeout: LC_TIMEOUT,
+            retries: LC_RETRIES,
+        })
     }
 
     pub fn with_addr(addr: SocketAddr) -> Self {
-        Self { addr, timeout: LC_TIMEOUT, retries: LC_RETRIES }
+        Self {
+            addr,
+            timeout: LC_TIMEOUT,
+            retries: LC_RETRIES,
+        }
     }
 
     pub fn check(&self, user: &str, password: &str, path: &str) -> Result<CheckResult> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let sock = UdpSocket::bind(("0.0.0.0", 0)).context("binding UDP socket")?;
-        sock.set_read_timeout(Some(self.timeout)).context("set_read_timeout")?;
+        sock.set_read_timeout(Some(self.timeout))
+            .context("set_read_timeout")?;
         let req = encode_request(id, user, password, path);
 
         for _attempt in 0..self.retries {
@@ -121,7 +130,11 @@ impl CompileClient {
                 }
             }
         }
-        bail!("no complete reply from {} after {} attempts", self.addr, self.retries)
+        bail!(
+            "no complete reply from {} after {} attempts",
+            self.addr,
+            self.retries
+        )
     }
 }
 
@@ -163,16 +176,31 @@ mod tests {
         let mut m: BTreeMap<u32, ReplyChunk> = BTreeMap::new();
         m.insert(
             1,
-            ReplyChunk { id: 1, seq: 1, total: 2, ok: false, payload: "a\n".into() },
+            ReplyChunk {
+                id: 1,
+                seq: 1,
+                total: 2,
+                ok: false,
+                payload: "a\n".into(),
+            },
         );
         assert_eq!(reassemble(&m, 2), None);
         m.insert(
             2,
-            ReplyChunk { id: 1, seq: 2, total: 2, ok: false, payload: "b\n".into() },
+            ReplyChunk {
+                id: 1,
+                seq: 2,
+                total: 2,
+                ok: false,
+                payload: "b\n".into(),
+            },
         );
         assert_eq!(
             reassemble(&m, 2),
-            Some(CheckResult { ok: false, diagnostics: "a\nb\n".into() })
+            Some(CheckResult {
+                ok: false,
+                diagnostics: "a\nb\n".into()
+            })
         );
     }
 
@@ -188,7 +216,7 @@ mod tests {
             let mut buf = [0u8; 2048];
             let (n, from) = server.recv_from(&mut buf).unwrap();
             let req = std::str::from_utf8(&buf[..n]).unwrap();
-            let id: u32 = req.splitn(7, '\t').nth(1).unwrap().parse().unwrap();
+            let id: u32 = req.split('\t').nth(1).unwrap().parse().unwrap();
             server
                 .send_to(
                     format!("LCOMPILE\t{id}\tRPLY\t1\t2\tFAIL\tx.c:1: error: bad\n").as_bytes(),

@@ -34,8 +34,8 @@ pub enum RemotePresence {
 /// Determine whether `path` names a remote file without failing open.
 ///
 /// A successful `SIZE` proves presence. Servers that do not support `SIZE`
-/// are common, so its error is followed by a listing of the parent directory.
-/// A successful listing proves either presence or absence; when neither
+/// are common, so its error is followed by an exact `NLST` lookup. An
+/// authoritative exact lookup proves either presence or absence; when neither
 /// operation succeeds we preserve both errors and make no transfer decision.
 pub fn probe_remote_file<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Result<RemotePresence> {
     match remote.file_size(path) {
@@ -102,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn size_failure_falls_back_to_listing_an_existing_file() {
+    fn size_failure_falls_back_to_exact_lookup_for_an_existing_file() {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![file("target.txt", 7)])),
@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn size_failure_accepts_a_listing_that_echoes_the_full_file_path() {
+    fn size_failure_accepts_an_exact_lookup_of_the_full_file_path() {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![file("/home/test/target.txt", 7)])),
@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn size_failure_listing_proves_a_file_is_missing() {
+    fn size_failure_exact_lookup_proves_a_file_is_missing() {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![])),
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn size_and_listing_failure_is_indeterminate() {
+    fn size_and_exact_lookup_failure_is_indeterminate() {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Err(anyhow::anyhow!("LIST permission denied"))),
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_parent_listing_cannot_prove_exact_file_absence() {
+    fn incomplete_exact_lookup_cannot_prove_file_absence() {
         let mut remote = ScriptedRemote {
             size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
             listing: Some(Ok(vec![file("other.txt", 3)])),

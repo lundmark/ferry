@@ -69,10 +69,11 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                 let before = local_paths.len();
                 walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;
                 found_here += local_paths.len() - before;
-            } else if local_full.is_file() && !matcher.is_ignored(&local_full, false) {
-                if local_paths.insert(rel_no_slash.to_string()) {
-                    found_here += 1;
-                }
+            } else if local_full.is_file()
+                && !matcher.is_ignored(&local_full, false)
+                && local_paths.insert(rel_no_slash.to_string())
+            {
+                found_here += 1;
             }
 
             // Remote: subtree walk, or single-file resolution.
@@ -90,10 +91,10 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
 
             // Add matches under this arg to targets. Exact match first,
             // then prefix expansion for the folder case.
-            if local_paths.contains(rel_no_slash) || remote_paths.contains(rel_no_slash) {
-                if !matcher.is_ignored(&local_root.join(rel_no_slash), false) {
-                    out.insert(rel_no_slash.to_string());
-                }
+            if (local_paths.contains(rel_no_slash) || remote_paths.contains(rel_no_slash))
+                && !matcher.is_ignored(&local_root.join(rel_no_slash), false)
+            {
+                out.insert(rel_no_slash.to_string());
             }
             let prefix = format!("{rel_no_slash}/");
             for path in local_paths.iter().chain(remote_paths.iter()) {
