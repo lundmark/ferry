@@ -72,24 +72,44 @@ pub fn resolve_file(path: &Path, migrate_legacy: bool) -> Result<Option<Resolved
     }))
 }
 
+fn canonicalize_path_or_new_file(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(path)
+                        .with_context(|| format!("reading symlink {}", path.display()))?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        path.parent()
+                            .context("symlink path has no parent")?
+                            .join(target)
+                    };
+                    canonicalize_path_or_new_file(&target)
+                }
+                Ok(_) => Err(error)
+                    .with_context(|| format!("canonicalizing existing path {}", path.display())),
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = path.parent().context("new file path has no parent")?;
+                    let name = path.file_name().context("new file path has no file name")?;
+                    Ok(canonicalize_path_or_new_file(parent)?.join(name))
+                }
+                Err(metadata_error) => {
+                    Err(metadata_error).with_context(|| format!("checking path {}", path.display()))
+                }
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("canonicalizing file {}", path.display())),
+    }
+}
+
 pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> {
     let local_root = local_root
         .canonicalize()
         .with_context(|| format!("canonicalizing local_root {}", local_root.display()))?;
-    let path = match path.canonicalize() {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().context("new file path has no parent")?;
-            let name = path.file_name().context("new file path has no file name")?;
-            parent
-                .canonicalize()
-                .with_context(|| format!("canonicalizing parent {}", parent.display()))?
-                .join(name)
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("canonicalizing file {}", path.display()));
-        }
-    };
+    let path = canonicalize_path_or_new_file(path)?;
 
     let relative = path.strip_prefix(&local_root).map_err(|_| {
         anyhow::anyhow!(
@@ -209,6 +229,22 @@ mod tests {
         assert!(error.to_string().contains("outside local_root"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_symlink_escape_from_local_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let dangling_target = outside.join("new.c");
+        symlink(&dangling_target, mirror.join("link.c")).unwrap();
+
+        let error = relative_to_local_root(&mirror, &mirror.join("link.c")).unwrap_err();
+        assert!(error.to_string().contains("outside local_root"));
+    }
     #[test]
     fn migration_moves_legacy_state_from_descendant_local_root() {
         let tmp = tempfile::tempdir().unwrap();
