@@ -7,6 +7,8 @@ pub struct Config {
     pub paths: Paths,
     #[serde(default)]
     pub sync: Sync,
+    #[serde(default)]
+    pub editor: Editor,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -35,6 +37,20 @@ pub struct Sync {
     pub ignore: Vec<String>,
     #[serde(default)]
     pub include: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct Editor {
+    #[serde(default = "default_true")]
+    pub pull_on_open: bool,
+    #[serde(default)]
+    pub push_on_save: bool,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self { pull_on_open: true, push_on_save: false }
+    }
 }
 
 fn default_port() -> u16 { 21 }
@@ -92,6 +108,47 @@ mod tests {
         assert!(cfg.connection.passive);
         assert_eq!(cfg.paths.remote_root, "/var/www/site");
         assert_eq!(cfg.sync.ignore.len(), 2);
+    }
+
+    #[test]
+    fn editor_defaults_preserve_pull_and_disable_push() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [connection]
+            host = "h"
+            user = "u"
+            password = "p"
+            [paths]
+            remote_root = "/"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.editor.pull_on_open);
+        assert!(!cfg.editor.push_on_save);
+    }
+
+    #[test]
+    fn parses_explicit_editor_settings() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [connection]
+            host = "h"
+            user = "u"
+            password = "p"
+            [paths]
+            remote_root = "/"
+            [editor]
+            pull_on_open = false
+            push_on_save = true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.editor,
+            Editor { pull_on_open: false, push_on_save: true }
+        );
     }
 
     #[test]
