@@ -8,7 +8,7 @@
 //! `--recursive`.
 
 use crate::commands::{state_path_for, ExecutionMode};
-use crate::commands::walk::{remote_join, safe_rel, walk_local, walk_remote};
+use crate::commands::walk::{remote_join, safe_arg, walk_local, walk_remote};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::ignored::Matcher;
@@ -33,9 +33,12 @@ pub fn run(
 
     // Validate/normalize every path up front, before opening a connection, so a
     // bad argument fails fast with no side effects.
-    let rels: Vec<String> = paths.iter().map(|p| safe_rel(p)).collect::<Result<_>>()?;
-
     let local_root = cfg.paths.local_root.clone();
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|path| safe_arg(&local_root, path))
+        .collect::<Result<_>>()?;
+
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;

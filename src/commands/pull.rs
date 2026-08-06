@@ -6,7 +6,7 @@
 //! else) cannot wipe your working tree.
 
 use crate::commands::remote_hash;
-use crate::commands::walk::{collect_remote_arg, remote_join, walk_local, walk_remote};
+use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
 use crate::commands::{state_path_for, ExecutionMode};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| safe_arg(&local_root, path))
+        .collect::<Result<_>>()?;
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
@@ -50,14 +54,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         all.into_iter().collect()
     } else {
         let mut out: BTreeSet<String> = BTreeSet::new();
-        for p in paths {
-            let rel = normalize_rel(p);
-            if Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
-                anyhow::bail!("refusing path {p:?}: must be a relative path under local_root with no '..' segments");
-            }
-            if rel.is_empty() {
-                anyhow::bail!("refusing empty path arg");
-            }
+        for rel in &paths {
             let rel_no_slash = rel.trim_end_matches('/');
             let local_full = local_root.join(rel_no_slash);
             let mut found_here = 0usize;
@@ -242,13 +239,6 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     }
 
     Ok(())
-}
-
-/// Normalize a user-supplied path argument into the relative form used as
-/// state-file keys: forward slashes, no leading `./`.
-fn normalize_rel(p: &str) -> String {
-    let s = p.replace('\\', "/");
-    s.trim_start_matches("./").to_string()
 }
 
 /// Fast single-file pull that bypasses the local + remote tree walks used

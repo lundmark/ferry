@@ -31,6 +31,16 @@ pub fn safe_rel(p: &str) -> Result<String> {
     Ok(rel.trim_end_matches('/').to_string())
 }
 
+/// Normalize a path argument relative to `local_root`. Absolute paths are
+/// accepted only when their canonical location is contained by that root.
+pub fn safe_arg(local_root: &Path, input: &str) -> Result<String> {
+    let path = Path::new(input);
+    if path.is_absolute() {
+        return crate::project::relative_to_local_root(local_root, path);
+    }
+    safe_rel(input)
+}
+
 /// Walk the local mirror, populating `out` with relative paths (forward-slash
 /// separated). Skips files matched by the ignore matcher and the `.ferry`
 /// state directory.
@@ -584,6 +594,28 @@ mod tests {
     #[test]
     fn safe_rel_rejects_absolute() {
         assert!(safe_rel("/etc/passwd").is_err());
+    }
+
+
+    #[test]
+    fn absolute_arg_inside_root_becomes_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("sub/file.c");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            safe_arg(tmp.path(), file.to_str().unwrap()).unwrap(),
+            "sub/file.c"
+        );
+    }
+
+    #[test]
+    fn absolute_arg_outside_root_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("file.c");
+        std::fs::write(&file, "").unwrap();
+        assert!(safe_arg(root.path(), file.to_str().unwrap()).is_err());
     }
 
     #[test]

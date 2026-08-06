@@ -223,3 +223,143 @@ remote_root = "/"
     assert!(!current_state_dir.join("state.json").exists());
     assert_eq!(std::fs::read_dir(&current_state_dir).unwrap().count(), 0);
 }
+
+#[test]
+fn finds_config_upward() {
+    let project = tempfile::tempdir().unwrap();
+    let nested = project.path().join("nested/deeper");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        project.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+
+    let out = bin().arg("status").current_dir(&nested).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ftp connect 127.0.0.1:1"),
+        "ancestor config was not used; stderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("reading .ferry.toml"),
+        "status looked only in the nested directory; stderr={stderr}",
+    );
+}
+
+fn recent_state(target: &str) -> ferry::state::StateFile {
+    let now = chrono::Utc::now();
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        target.into(),
+        ferry::state::FileRecord {
+            sha256: "known".into(),
+            size: 12,
+            remote_mtime: now,
+            last_synced: now,
+        },
+    );
+    state
+}
+
+fn hook_with_target(project: &std::path::Path, target: &std::path::Path) -> std::process::Output {
+    let mut child = bin()
+        .args(["hook", "--cooldown", "3600"])
+        .current_dir(project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.as_mut().unwrap(),
+        &serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": target},
+        }),
+    )
+    .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn hook_migrates_descendant_local_root_state() {
+    let project = tempfile::tempdir().unwrap();
+    let local_root = project.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let target = local_root.join("target.txt");
+    std::fs::write(&target, b"local bytes\n").unwrap();
+    std::fs::write(
+        project.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+local_root = "mirror"
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let legacy = local_root.join(ferry::names::LEGACY_STATE_DIR).join("state.json");
+    recent_state("target.txt").save(&legacy).unwrap();
+    std::fs::create_dir(local_root.join(ferry::names::STATE_DIR)).unwrap();
+
+    let output = hook_with_target(project.path(), &target);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    assert!(stderr.contains("within 3600s cooldown, skipping pull"), "stderr={stderr}");
+    assert!(!stderr.contains("pull failed"), "stderr={stderr}");
+    assert!(local_root.join(ferry::names::STATE_DIR).join("state.json").exists());
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn hook_reads_legacy_state_when_migration_fails() {
+    let project = tempfile::tempdir().unwrap();
+    let local_root = project.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let target = local_root.join("target.txt");
+    std::fs::write(&target, b"local bytes\n").unwrap();
+    std::fs::write(
+        project.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+local_root = "mirror"
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let legacy = local_root.join(ferry::names::LEGACY_STATE_DIR).join("state.json");
+    recent_state("target.txt").save(&legacy).unwrap();
+    std::fs::write(local_root.join(ferry::names::STATE_DIR), b"blocks migration").unwrap();
+    let legacy_before = std::fs::read(&legacy).unwrap();
+
+    let output = hook_with_target(project.path(), &target);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    assert!(stderr.contains("warning"), "stderr={stderr}");
+    assert!(stderr.contains("within 3600s cooldown, skipping pull"), "stderr={stderr}");
+    assert!(!stderr.contains("pull failed"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+}

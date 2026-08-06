@@ -11,20 +11,17 @@ use crate::udp::CompileClient;
 /// if any file failed to compile or errored in transport.
 pub fn run(config_path: &Path, paths: &[String]) -> Result<()> {
     let cfg = Config::load(config_path)?;
+    let paths: Vec<(&String, String)> = paths
+        .iter()
+        .map(|path| Ok((path, walk::safe_arg(&cfg.paths.local_root, path)?)))
+        .collect::<Result<_>>()?;
     let client = CompileClient::new(&cfg.connection.host, cfg.connection.udp_port)?;
 
     let mut any_fail = false;
-    for p in paths {
+    for (p, rel) in paths {
         // Normalize the user path (reject absolute / `..`) and map to the remote
         // mudlib path the same way push/rm do. The server also canonicalizes.
-        let remote = match walk::safe_rel(p) {
-            Ok(rel) => walk::remote_join(&cfg.paths.remote_root, &rel),
-            Err(e) => {
-                any_fail = true;
-                eprintln!("{p}: error: {e:#}");
-                continue;
-            }
-        };
+        let remote = walk::remote_join(&cfg.paths.remote_root, &rel);
 
         match client.check(&cfg.connection.user, &cfg.connection.password, &remote) {
             Ok(res) if res.ok => {

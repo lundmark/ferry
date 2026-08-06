@@ -6,7 +6,7 @@
 //! own deliberate command.
 
 use crate::commands::remote_hash;
-use crate::commands::walk::{collect_remote_arg, remote_join, safe_rel, walk_local, walk_remote};
+use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
 use crate::commands::{state_path_for, ExecutionMode};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -21,6 +21,10 @@ use std::path::Path;
 pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|path| safe_arg(&local_root, path))
+        .collect::<Result<_>>()?;
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
@@ -43,8 +47,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
         walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
     } else {
-        for p in paths {
-            let rel_no_slash = safe_rel(p)?;
+        for rel_no_slash in &paths {
             let local_full = local_root.join(&rel_no_slash);
             if local_full.is_dir() {
                 walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;

@@ -62,20 +62,31 @@ fn run() -> i32 {
     let cli = Cli::parse();
     let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
     let explicit_config = cli.config.is_some();
-    let cfg = cli.config.unwrap_or_else(|| {
-        if mode.is_dry_run() {
-            ferry::names::config_path_for_read(std::path::Path::new("."))
-        } else {
-            std::path::PathBuf::from(ferry::names::CONFIG_FILE)
-        }
-    });
-    // Auto-migrate legacy `.zed-ftp` config/state to the current `.ferry` names
-    // when using the default config location. Best-effort: a migration failure
-    // is a warning, not a hard stop — the command below will surface any real
-    // "config not found" error itself.
-    if !explicit_config && mode.should_apply() {
-        if let Err(e) = ferry::names::migrate_legacy(std::path::Path::new(".")) {
+    let mut cfg = cli.config.unwrap_or_else(|| default_config_path(&cli.cmd));
+    let is_hook = matches!(&cli.cmd, Cmd::Hook { .. });
+    let should_load_config = !matches!(&cli.cmd, Cmd::Init { .. })
+        && !matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty());
+    if !is_hook && mode.should_apply() {
+        let config_dir = cfg.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if let Err(e) = ferry::names::migrate_legacy(config_dir) {
             eprintln!("warning: {e:#}");
+        }
+        if !explicit_config {
+            cfg = ferry::names::config_path_for_read(config_dir);
+        }
+
+        if should_load_config {
+            match ferry::config::Config::load(&cfg) {
+                Ok(config) => {
+                    if let Err(e) = ferry::names::migrate_legacy(&config.paths.local_root) {
+                        eprintln!("warning: {e:#}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    return classify_exit(&e);
+                }
+            }
         }
     }
     let result: anyhow::Result<()> = match cli.cmd {
@@ -101,6 +112,20 @@ fn run() -> i32 {
     }
 }
 
+fn default_config_path(cmd: &Cmd) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    default_config_path_at(cmd, &cwd)
+}
+
+fn default_config_path_at(cmd: &Cmd, cwd: &std::path::Path) -> std::path::PathBuf {
+    if matches!(cmd, Cmd::Init { .. }) {
+        return std::path::PathBuf::from(ferry::names::CONFIG_FILE);
+    }
+    ferry::project::find_config_upward(cwd)
+        .map(|location| location.config_path)
+        .unwrap_or_else(|| ferry::names::config_path_for_read(cwd))
+}
+
 /// Map an anyhow error onto a process exit code. We check both the root
 /// error and the entire `.chain()` so an `Exit::*` wrapped by a later
 /// `.with_context(...)` still resolves to its specific exit code.
@@ -124,5 +149,24 @@ fn code_for(exit: &ferry::Exit) -> i32 {
     match exit {
         Exit::Conflict(_) => 2,
         Exit::Config(_) | Exit::Auth(_) => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_default_config_stays_in_cwd() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(project.path().join(ferry::names::CONFIG_FILE), "ancestor").unwrap();
+
+        let init = Cmd::Init { no_validate: true };
+        assert_eq!(
+            default_config_path_at(&init, &nested),
+            std::path::PathBuf::from(ferry::names::CONFIG_FILE),
+        );
     }
 }
