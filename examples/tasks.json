@@ -5,7 +5,8 @@
     "args": ["pull", "$ZED_FILE"],
     "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
-    "reveal": "on_error"
+    "reveal": "always",
+    "hide": "on_success"
   },
   {
     "label": "Ferry: push current file",
@@ -13,7 +14,8 @@
     "args": ["push", "$ZED_FILE"],
     "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
-    "reveal": "on_error"
+    "reveal": "always",
+    "hide": "on_success"
   },
   {
     "label": "Ferry: compile-check current file",
@@ -21,7 +23,8 @@
     "args": ["cc", "$ZED_FILE"],
     "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
-    "reveal": "on_error"
+    "reveal": "always",
+    "hide": "on_success"
   },
   {
     "label": "Ferry: project-wide status",
@@ -45,6 +48,7 @@
     "args": ["rm", "$ZED_FILE"],
     "cwd": "$ZED_DIRNAME",
     "use_new_terminal": false,
-    "reveal": "on_error"
+    "reveal": "always",
+    "hide": "on_success"
   }
 ]

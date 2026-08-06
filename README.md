@@ -140,13 +140,16 @@ Behaviour:
 
 The companion extension at [`extensions/ferry/`](extensions/ferry/README.md)
 starts `ferry-lsp` for Zed's C language. The language server handles file-open
-and file-save events directly and offers manual file actions. Install it with:
+and file-save events directly and offers manual file actions. Install the
+binaries first:
 
 ```sh
 cargo install --path .          # installs both ferry and ferry-lsp
-cd extensions/ferry
-zed --dev-extension .           # or use Extensions: Install Dev Extension
 ```
+
+Then open Zed's Extensions page and click `Install Dev Extension`, or run the
+`zed: install dev extension` action. Select this repository's
+`extensions/ferry` directory.
 
 Configure the editor behavior in the project's `.ferry.toml`:
 

@@ -22,14 +22,8 @@ not provide completion, hover, or language diagnostics.
 
 ## Install the extension in Zed
 
-From this directory, run:
-
-```sh
-zed --dev-extension .
-```
-
-Alternatively, run `Extensions: Install Dev Extension` from Zed's command
-palette and select this directory.
+Open Zed's Extensions page and click `Install Dev Extension`, or run the
+`zed: install dev extension` action. Select this `extensions/ferry` directory.
 
 ## Configuration
 
