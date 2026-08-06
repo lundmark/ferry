@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::commands::walk;
 use crate::config::Config;
@@ -137,7 +137,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    use anyhow::{anyhow, Result};
+    use anyhow::{Result, anyhow};
 
     use super::*;
     use crate::config::{Connection, Editor, Paths, Sync};
