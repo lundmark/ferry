@@ -33,10 +33,9 @@ impl CompileTransport for CompileClient {
 /// Check-compile files and return all per-file outcomes without printing.
 pub fn check_files(config_path: &Path, paths: &[String]) -> Result<Vec<FileCheckResult>> {
     let cfg = Config::load(config_path)?;
-    let paths = checked_paths(&cfg, paths)?;
-    let client = CompileClient::new(&cfg.connection.host, cfg.connection.udp_port)?;
-
-    check_resolved_with(&cfg, &paths, &client)
+    check_with_factory(&cfg, paths, || {
+        CompileClient::new(&cfg.connection.host, cfg.connection.udp_port)
+    })
 }
 
 /// `ferry cc <paths...>` — print per-file check results and return an error
@@ -70,15 +69,22 @@ pub fn run(config_path: &Path, paths: &[String]) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-fn check_with<T: CompileTransport + ?Sized>(
+fn check_with_factory<T, F>(
     cfg: &Config,
     paths: &[String],
-    transport: &T,
-) -> Result<Vec<FileCheckResult>> {
+    make_transport: F,
+) -> Result<Vec<FileCheckResult>>
+where
+    T: CompileTransport,
+    F: FnOnce() -> Result<T>,
+{
     let paths = checked_paths(cfg, paths)?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let transport = make_transport()?;
 
-    check_resolved_with(cfg, &paths, transport)
+    Ok(check_resolved_with(cfg, &paths, &transport))
 }
 
 fn checked_paths(cfg: &Config, paths: &[String]) -> Result<Vec<String>> {
@@ -92,13 +98,13 @@ fn check_resolved_with<T: CompileTransport + ?Sized>(
     cfg: &Config,
     paths: &[String],
     transport: &T,
-) -> Result<Vec<FileCheckResult>> {
+) -> Vec<FileCheckResult> {
     paths
         .iter()
         .map(|path| {
             let remote = walk::remote_join(&cfg.paths.remote_root, path);
             match transport.check(&cfg.connection.user, &cfg.connection.password, &remote) {
-                Ok(result) => Ok(FileCheckResult {
+                Ok(result) => FileCheckResult {
                     path: path.clone(),
                     status: if result.ok {
                         FileCheckStatus::Passed
@@ -106,12 +112,12 @@ fn check_resolved_with<T: CompileTransport + ?Sized>(
                         FileCheckStatus::Failed
                     },
                     diagnostics: result.diagnostics,
-                }),
-                Err(error) => Ok(FileCheckResult {
+                },
+                Err(error) => FileCheckResult {
                     path: path.clone(),
                     status: FileCheckStatus::TransportError(format!("{error:#}")),
                     diagnostics: String::new(),
-                }),
+                },
             }
         })
         .collect()
@@ -127,8 +133,9 @@ fn print_diag(diagnostics: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     use anyhow::{anyhow, Result};
 
@@ -138,14 +145,14 @@ mod tests {
 
     struct FakeTransport {
         responses: RefCell<VecDeque<Result<CheckResult>>>,
-        paths: RefCell<Vec<String>>,
+        paths: Rc<RefCell<Vec<String>>>,
     }
 
     impl FakeTransport {
         fn new(responses: impl IntoIterator<Item = Result<CheckResult>>) -> Self {
             Self {
                 responses: RefCell::new(responses.into_iter().collect()),
-                paths: RefCell::new(Vec::new()),
+                paths: Rc::new(RefCell::new(Vec::new())),
             }
         }
     }
@@ -177,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn check_with_collects_ordered_results_and_continues_after_transport_error() {
+    fn check_with_factory_creates_one_transport_and_collects_ordered_results() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path().to_path_buf());
         let transport = FakeTransport::new([
@@ -191,17 +198,24 @@ mod tests {
             }),
             Err(anyhow!("UDP timed out")),
         ]);
+        let checked_paths = transport.paths.clone();
+        let factory_calls = Cell::new(0);
 
-        let results = check_with(
+        let results = check_with_factory(
             &cfg,
             &[
                 "one.c".to_string(),
                 "two.c".to_string(),
                 "three.c".to_string(),
             ],
-            &transport,
+            || {
+                factory_calls.set(factory_calls.get() + 1);
+                Ok(transport)
+            },
         )
         .unwrap();
+
+        assert_eq!(factory_calls.get(), 1);
 
         assert_eq!(
             results,
@@ -224,7 +238,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            *transport.paths.borrow(),
+            *checked_paths.borrow(),
             vec![
                 "/mudlib/one.c".to_string(),
                 "/mudlib/two.c".to_string(),
@@ -234,7 +248,23 @@ mod tests {
     }
 
     #[test]
-    fn check_with_normalizes_safe_absolute_paths_and_validates_all_inputs_before_transport() {
+    fn check_with_factory_returns_empty_without_creating_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path().to_path_buf());
+        let factory_calls = Cell::new(0);
+
+        let results = check_with_factory(&cfg, &[], || {
+            factory_calls.set(factory_calls.get() + 1);
+            Ok(FakeTransport::new(std::iter::empty()))
+        })
+        .unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(factory_calls.get(), 0);
+    }
+
+    #[test]
+    fn check_with_factory_normalizes_safe_absolute_paths_and_validates_before_creation() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path().to_path_buf());
         let safe_absolute = root.path().join("nested/safe.c");
@@ -244,18 +274,24 @@ mod tests {
             diagnostics: String::new(),
         })]);
 
-        let results = check_with(&cfg, &[safe_absolute.display().to_string()], &transport).unwrap();
+        let results = check_with_factory(&cfg, &[safe_absolute.display().to_string()], || {
+            Ok(transport)
+        })
+        .unwrap();
         assert_eq!(results[0].path, "nested/safe.c");
 
-        let no_calls = FakeTransport::new(std::iter::empty());
+        let factory_calls = Cell::new(0);
         let outside = root.path().parent().unwrap().join("outside.c");
-        let error = check_with(
+        let error = check_with_factory(
             &cfg,
             &["valid.c".to_string(), outside.display().to_string()],
-            &no_calls,
+            || {
+                factory_calls.set(factory_calls.get() + 1);
+                Ok(FakeTransport::new(std::iter::empty()))
+            },
         )
         .unwrap_err();
         assert!(error.to_string().contains("outside local_root"));
-        assert!(no_calls.paths.borrow().is_empty());
+        assert_eq!(factory_calls.get(), 0);
     }
 }
