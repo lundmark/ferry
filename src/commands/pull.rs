@@ -289,35 +289,78 @@ fn write_local_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 struct StagedLocalWrite {
     tmp: PathBuf,
     target: PathBuf,
+    created_dirs: Vec<PathBuf>,
     committed: bool,
 }
 
 fn stage_local_write(path: &Path, bytes: &[u8]) -> Result<StagedLocalWrite> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent dir {}", parent.display()))?;
-    }
-
+    let created_dirs = create_missing_parent_dirs(path)?;
     let tmp = tmp_path(path);
-    let write_result = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&tmp)
-            .with_context(|| format!("writing temp file {}", tmp.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("writing temp file {}", tmp.display()))?;
-        file.flush()
-            .with_context(|| format!("flushing temp file {}", tmp.display()))?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-
-    Ok(StagedLocalWrite {
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            remove_created_dirs(&created_dirs);
+            return Err(error).with_context(|| format!("creating temp file {}", tmp.display()));
+        }
+    };
+    let staged = StagedLocalWrite {
         tmp,
         target: path.to_path_buf(),
+        created_dirs,
         committed: false,
-    })
+    };
+
+    let write_result = (|| -> Result<()> {
+        file.write_all(bytes)
+            .with_context(|| format!("writing temp file {}", staged.tmp.display()))?;
+        file.flush()
+            .with_context(|| format!("flushing temp file {}", staged.tmp.display()))?;
+        Ok(())
+    })();
+    drop(file);
+    write_result?;
+
+    Ok(staged)
+}
+
+fn create_missing_parent_dirs(path: &Path) -> Result<Vec<PathBuf>> {
+    let Some(parent) = path.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut missing = Vec::new();
+    let mut current = parent;
+    while !current.as_os_str().is_empty() && !current.exists() {
+        missing.push(current.to_path_buf());
+        let Some(next) = current.parent() else {
+            break;
+        };
+        current = next;
+    }
+
+    let mut created = Vec::new();
+    for directory in missing.iter().rev() {
+        match std::fs::create_dir(directory) {
+            Ok(()) => created.push(directory.clone()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => {
+                remove_created_dirs(&created);
+                return Err(error)
+                    .with_context(|| format!("creating parent dir {}", directory.display()));
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn remove_created_dirs(created_dirs: &[PathBuf]) {
+    for directory in created_dirs.iter().rev() {
+        let _ = std::fs::remove_dir(directory);
+    }
 }
 
 impl StagedLocalWrite {
@@ -338,6 +381,7 @@ impl Drop for StagedLocalWrite {
     fn drop(&mut self) {
         if !self.committed {
             let _ = std::fs::remove_file(&self.tmp);
+            remove_created_dirs(&self.created_dirs);
         }
     }
 }
@@ -364,4 +408,86 @@ fn record_download(
             last_synced: Utc::now(),
         },
     );
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::{stage_local_write, tmp_path};
+
+    #[test]
+    fn staging_preserves_a_preexisting_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("page.txt");
+        let tmp = tmp_path(&target);
+        let original_target = b"original target";
+        let original_tmp = b"another writer's staged bytes";
+        std::fs::write(&target, original_target).unwrap();
+        std::fs::write(&tmp, original_tmp).unwrap();
+
+        let rejected = match stage_local_write(&target, b"replacement") {
+            Ok(staged) => {
+                drop(staged);
+                false
+            }
+            Err(_) => true,
+        };
+
+        assert!(rejected);
+        assert_eq!(std::fs::read(&target).unwrap(), original_target);
+        assert_eq!(std::fs::read(&tmp).unwrap(), original_tmp);
+    }
+
+    #[test]
+    fn staging_rejects_a_second_writer_without_changing_first_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("page.txt");
+        let tmp = tmp_path(&target);
+        let first_bytes = b"first writer";
+
+        let first = stage_local_write(&target, first_bytes).unwrap();
+        let second_rejected = match stage_local_write(&target, b"second writer") {
+            Ok(staged) => {
+                drop(staged);
+                false
+            }
+            Err(_) => true,
+        };
+
+        assert!(second_rejected);
+        assert_eq!(std::fs::read(&tmp).unwrap(), first_bytes);
+        drop(first);
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_preserves_a_preexisting_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("page.txt");
+        let tmp = tmp_path(&target);
+        let symlink_target = dir.path().join("do-not-touch.txt");
+        let original = b"unrelated bytes";
+        std::fs::write(&symlink_target, original).unwrap();
+        symlink(&symlink_target, &tmp).unwrap();
+
+        let rejected = match stage_local_write(&target, b"replacement") {
+            Ok(staged) => {
+                drop(staged);
+                false
+            }
+            Err(_) => true,
+        };
+
+        assert!(rejected);
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&symlink_target).unwrap(), original);
+        assert!(!target.exists());
+    }
 }

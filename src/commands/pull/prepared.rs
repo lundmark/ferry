@@ -28,6 +28,15 @@ impl LocalIdentity {
             Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
         }
     }
+
+    fn capture_for_apply(path: &Path, rel: &str) -> Result<Self> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(Self::Present(crate::hash::hash_file(path)?)),
+            Ok(_) => Err(local_identity_conflict(rel)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::Missing),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -206,7 +215,7 @@ where
             .into());
         }
 
-        let saved_local = LocalIdentity::capture(&local_path)?;
+        let saved_local = LocalIdentity::capture_for_apply(&local_path, &relative_path)?;
         if saved_local != expected_local {
             return Err(local_identity_conflict(&relative_path));
         }
@@ -233,7 +242,7 @@ where
         };
         let outcome = TransferOutcome::new(&relative_path, status);
 
-        if LocalIdentity::capture(&local_path)? != saved_local {
+        if LocalIdentity::capture_for_apply(&local_path, &relative_path)? != saved_local {
             return Err(local_identity_conflict(&relative_path));
         }
 
@@ -277,22 +286,25 @@ fn remote_file_for_install(
     remote_path: &str,
     remote_hash: RemoteHash,
 ) -> Result<RemoteFile> {
+    let mtime = remote_hash.mtime;
     let bytes = match remote_hash.bytes {
         Some(bytes) => bytes,
         None => ftp
             .download(remote_path)
             .with_context(|| format!("downloading {remote_path}"))?,
     };
+    Ok(remote_file_from_payload(bytes, mtime))
+}
+
+fn remote_file_from_payload(bytes: Vec<u8>, mtime: DateTime<Utc>) -> RemoteFile {
     let size = bytes.len() as u64;
-    let mtime = ftp
-        .mtime(remote_path)
-        .with_context(|| format!("fetching mtime for {remote_path}"))?;
-    Ok(RemoteFile {
+    let sha256 = hash_bytes(&bytes);
+    RemoteFile {
         bytes,
-        sha256: remote_hash.sha256,
+        sha256,
         size,
         mtime,
-    })
+    }
 }
 
 fn local_identity_conflict(rel: &str) -> anyhow::Error {
@@ -561,5 +573,114 @@ remote_root = "/remote"
         assert_eq!(std::fs::read(&local_path).unwrap(), original_local);
         assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
         assert!(!super::super::tmp_path(&local_path).exists());
+    }
+
+    #[test]
+    fn denied_missing_install_removes_only_created_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_root = dir.path().join("site");
+        let nested_parent = local_root.join("new/deep");
+        let local_path = nested_parent.join("page.txt");
+        let config_path = dir.path().join("ferry.toml");
+        let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+        std::fs::create_dir(&local_root).unwrap();
+        std::fs::write(local_root.join("keep.txt"), b"keep").unwrap();
+        write_config(&config_path, &local_root);
+        let prepared = PreparedPull {
+            config_path,
+            local_root: local_root.clone(),
+            local_path: local_path.clone(),
+            relative_path: "new/deep/page.txt".to_string(),
+            expected_local: LocalIdentity::Missing,
+            action: PreparedAction::Install(RemoteFile {
+                bytes: b"denied remote bytes".to_vec(),
+                sha256: hash_bytes(b"denied remote bytes"),
+                size: b"denied remote bytes".len() as u64,
+                mtime: Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap(),
+            }),
+        };
+
+        let error = apply_prepared_pull_if(prepared, ExecutionMode::Apply, || false).unwrap_err();
+
+        assert!(error.downcast_ref::<crate::error::Exit>().is_some());
+        assert!(!local_path.exists());
+        assert!(!super::super::tmp_path(&local_path).exists());
+        assert!(!local_root.join("new").exists());
+        assert!(local_root.is_dir());
+        assert_eq!(std::fs::read(local_root.join("keep.txt")).unwrap(), b"keep");
+        assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn apply_maps_a_file_replaced_by_a_directory_to_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_root = dir.path().join("site");
+        let local_path = local_root.join("page.txt");
+        let config_path = dir.path().join("ferry.toml");
+        let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let original_state = br#"{
+  "version": 1,
+  "files": {},
+  "server_supports_mdtm": true
+}"#;
+        std::fs::write(&local_path, b"file at preparation").unwrap();
+        std::fs::write(&state_path, original_state).unwrap();
+        write_config(&config_path, &local_root);
+        let prepared = PreparedPull {
+            config_path,
+            local_root,
+            local_path: local_path.clone(),
+            relative_path: "page.txt".to_string(),
+            expected_local: LocalIdentity::capture(&local_path).unwrap(),
+            action: PreparedAction::Install(RemoteFile {
+                bytes: b"remote bytes".to_vec(),
+                sha256: hash_bytes(b"remote bytes"),
+                size: b"remote bytes".len() as u64,
+                mtime: Utc.with_ymd_and_hms(2026, 8, 7, 12, 30, 0).unwrap(),
+            }),
+        };
+        std::fs::remove_file(&local_path).unwrap();
+        std::fs::create_dir(&local_path).unwrap();
+        let authorization_calls = std::cell::Cell::new(0);
+
+        let error = apply_prepared_pull_if(prepared, ExecutionMode::Apply, || {
+            authorization_calls.set(authorization_calls.get() + 1);
+            true
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<crate::error::Exit>()
+                .is_some_and(|exit| matches!(exit, crate::error::Exit::Conflict(_))),
+            "got: {error:#}"
+        );
+        assert_eq!(authorization_calls.get(), 0);
+        assert!(local_path.is_dir());
+        assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+        assert!(!super::super::tmp_path(&local_path).exists());
+    }
+
+    #[test]
+    fn remote_file_identity_comes_from_payload_not_stale_cache_metadata() {
+        let mtime = Utc.with_ymd_and_hms(2026, 8, 7, 13, 0, 0).unwrap();
+        let cached = RemoteHash {
+            sha256: "stale cached hash".to_string(),
+            size: 9_999,
+            mtime,
+            from_cache: true,
+            bytes: None,
+        };
+        let payload = b"actual downloaded payload";
+
+        let remote = remote_file_from_payload(payload.to_vec(), cached.mtime);
+
+        assert_eq!(remote.bytes, payload);
+        assert_eq!(remote.sha256, hash_bytes(payload));
+        assert_eq!(remote.size, payload.len() as u64);
+        assert_eq!(remote.mtime, mtime);
+        assert_ne!(remote.sha256, cached.sha256);
+        assert_ne!(remote.size, cached.size);
     }
 }
