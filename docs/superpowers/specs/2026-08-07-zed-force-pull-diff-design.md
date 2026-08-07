@@ -1,6 +1,6 @@
 # Zed Force Pull and Remote Diff Design
 
-**Date:** 2026-08-07  
+**Date:** 2026-08-07
 **Status:** Approved in conversation; pending written-spec review
 
 ## Objective
