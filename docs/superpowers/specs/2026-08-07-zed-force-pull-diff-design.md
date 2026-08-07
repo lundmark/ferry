@@ -83,13 +83,17 @@ not hide or disable manual Code Actions.
 When the user selects Compare with Remote, Ferry:
 
 1. resolves the active file through the nearest Ferry project;
-2. refuses the command if that document is dirty in Zed;
+2. refuses the command if that document is dirty in Zed and records the clean
+   document revision plus the saved local-file identity;
 3. retrieves the current remote bytes without modifying the local file or
    persisted Ferry state;
 4. writes a unique, read-only snapshot in Ferry's private process-temporary
    directory;
-5. launches `zed --diff <local-path> <snapshot-path>`; and
-6. reports an error in Zed if retrieval, snapshot creation, or launch fails.
+5. immediately before launch, rechecks that the document is still clean at the
+   recorded revision and that the saved local identity is unchanged;
+6. launches `zed --diff <local-path> <snapshot-path>` only if both guards still
+   match; and
+7. reports an error in Zed if retrieval, snapshot creation, or launch fails.
 
 The saved local version is the old/left side of the diff. The incoming remote
 version is the new/right side. Compare never pulls, updates a state hash, or
@@ -124,10 +128,17 @@ Cancellation may be silent; all actual failures produce a warning.
 
 ### Normal Pull and Dirty Documents
 
-Normal manual Pull also refuses to run on a dirty document. An automatic
-pull-on-open is skipped if Zed opens a restored buffer whose contents already
-differ from the saved disk file. These guards prevent Ferry from changing the
-disk underneath an unsaved editor buffer.
+Normal manual Pull also refuses to run on a dirty document. It uses a two-phase
+read/commit path: remote retrieval and classification prepare a result without
+writing, then Ferry rechecks the clean document revision and saved local
+identity immediately before any atomic replacement. A `didChange` received
+while retrieval is pending invalidates the commit and produces a save-and-retry
+warning.
+
+An automatic pull-on-open is skipped if Zed opens a restored buffer whose
+contents already differ from the saved disk file, and uses the same final guard
+if the user edits while its remote work is pending. These guards prevent Ferry
+from changing the disk underneath an unsaved editor buffer.
 
 Push and Compile-check retain their existing behavior. Save notifications mark
 a document clean before any configured push-on-save work is queued.
@@ -193,15 +204,28 @@ handle `didOpen`, `didChange`, `didSave`, and `didClose`:
 
 - On `didOpen`, compare the supplied buffer text with the saved disk bytes.
   Mark the document dirty if they differ.
-- On any valid `didChange`, mark the document dirty. Ferry does not need to
-  reconstruct or retain the full editor buffer.
+- On any valid `didChange`, advance its document revision, mark the document
+  dirty, and invalidate pending Pull, Compare, or Force Pull work for that
+  document. Ferry does not need to reconstruct or retain the full editor
+  buffer.
 - On `didSave`, mark it clean and preserve the existing optional push-on-save
   behavior.
 - On `didClose`, remove its tracking entry.
 
-The tracker is updated synchronously in the protocol loop before relevant
-work is queued. The protocol state is accessible for the final Force Pull
-cleanliness check. Malformed notifications do not clear a dirty flag.
+The tracker is updated synchronously in the protocol loop before relevant work
+is queued. Each guarded operation records the current document revision and
+uses a one-shot operation token. A processed `didChange` cancels the token;
+the final side-effect step must atomically claim an uncancelled token for the
+same clean revision immediately before a disk replacement or diff launch. If
+the edit wins that race, the operation aborts. If the final claim wins, a later
+edit is treated as occurring after the clean-state commit point. Malformed
+notifications do not clear a dirty flag.
+
+Remote preparation results return to the protocol coordinator before their
+side effect. Compare is revalidated before the coordinator launches Zed.
+Normal Pull and Force Pull are revalidated before the coordinator queues their
+guarded installer, and the installer claims the token at its final mutation
+boundary. The guarded local-identity check remains the disk-level backstop.
 
 Code Actions remain visible for dirty files so the commands stay discoverable;
 execution produces a concise `save the file and retry` warning.
@@ -280,11 +304,24 @@ authentication details.
 ~~~text
 Code Action
   -> validate URI and Ferry project
-  -> reject dirty document
+  -> reject dirty document and record clean revision/local identity
   -> worker retrieves remote bytes without mutation
   -> worker creates unique snapshot
-  -> worker spawns `zed --diff local snapshot`
+  -> protocol coordinator rechecks clean revision/local identity
+  -> coordinator claims operation token
+  -> coordinator spawns `zed --diff local snapshot`
   -> Zed displays native diff
+~~~
+
+### Normal Pull flow
+
+~~~text
+Code Action or enabled open event
+  -> reject dirty document and record clean revision/local identity
+  -> worker prepares normal pull without mutation
+  -> protocol coordinator rechecks clean revision/local identity
+  -> worker claims operation token at the commit boundary
+  -> guarded atomic replacement and Ferry state update when remote wins
 ~~~
 
 ### Force Pull flow
@@ -296,8 +333,8 @@ Code Action
   -> worker retrieves remote bytes and captures local identity
   -> protocol loop sends Zed confirmation request
   -> user confirms
-  -> protocol loop rechecks clean document
-  -> worker verifies saved local identity
+  -> protocol loop rechecks clean document revision/local identity
+  -> worker claims operation token and verifies saved local identity
   -> atomic local replacement and Ferry state update
   -> Zed file watcher observes saved-file change
 ~~~
@@ -308,7 +345,9 @@ User-visible warnings include the relative path and a safe summary. They never
 include passwords or raw configuration contents.
 
 - Dirty buffer: `save the file and retry`; no network or local mutation when
-  detected before work begins.
+  detected before work begins. If an edit arrives during remote work, Ferry
+  discards prepared data, removes any unlaunched comparison snapshot, and does
+  not launch a diff, replace the local file, or update state.
 - Missing remote: report that the remote file does not exist; no snapshot,
   local write, or state update.
 - Authentication/transport/configuration failure: retain Ferry's safe error
@@ -331,6 +370,13 @@ transferred.
 - The protocol loop never blocks on FTP, filesystem installation, a GUI
   process, or user confirmation.
 - Compare never persists Ferry state or changes the project tree.
+- A processed `didChange` invalidates pending Pull, Compare, and Force Pull
+  work unless its final side-effect token was already claimed for the same
+  clean revision.
+- Compare revalidates document revision and saved local identity immediately
+  before opening Zed's diff.
+- Normal Pull revalidates document revision and saved local identity at its
+  guarded commit boundary.
 - Force Pull writes only bytes that were retrieved before the confirmation and
   only over the exact saved local identity that was confirmed.
 - An unsaved document is never knowingly overwritten on disk.
@@ -373,6 +419,8 @@ LSP tests cover:
 - incremental sync capabilities and open/change/save/close dirty transitions;
 - a restored dirty buffer is detected on open;
 - normal Pull, Compare, and Force Pull reject dirty documents;
+- edits received while normal Pull or Compare remote work is pending invalidate
+  the prepared operation, causing no disk write, state update, or diff launch;
 - automatic pull-on-open is skipped for a restored dirty buffer;
 - Force Pull sends a warning-level `window/showMessageRequest` with the two
   approved action labels;
@@ -438,7 +486,8 @@ remote fixture, not the live 3S remote tree:
 - Compare opens Zed's native diff with saved local content on the left and
   current remote content on the right.
 - Compare never modifies the local file or Ferry state.
-- Pull, Compare, and Force Pull refuse dirty Zed documents.
+- Pull, Compare, and Force Pull refuse dirty Zed documents, including edits
+  received while their asynchronous preparation is pending.
 - Force Pull requires explicit Zed confirmation and overwrites only the saved
   local identity that was confirmed.
 - Cancel, dismissal, remote failure, local races, snapshot failure, and launch
