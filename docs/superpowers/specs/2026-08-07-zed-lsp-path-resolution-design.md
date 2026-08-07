@@ -35,4 +35,6 @@ extension verifies the Zed API integration.
 
 After the automated suite passes, rebuild/reload the installed development
 extension and confirm Zed's log reports `ferry-lsp` starting from the installed
-Cargo path rather than its extension work directory.
+Cargo path rather than its extension work directory. Perform that check in a
+temporary Ferry project with dummy connection values and
+`pull_on_open = false`, so opening the test C file cannot contact a live server.
