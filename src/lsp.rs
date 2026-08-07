@@ -22,12 +22,15 @@ use lsp_types::{
 use crate::commands::ExecutionMode;
 use crate::commands::cc::{self, FileCheckResult};
 use crate::commands::file_transfer::TransferOutcome;
+use crate::commands::pull::{LocalIdentity, fetch_remote_one};
 use document_state::{DocumentTracker, OperationGuard};
 
 pub const PULL_COMMAND: &str = "ferry.pull";
+pub const COMPARE_COMMAND: &str = "ferry.compare";
 pub const PUSH_COMMAND: &str = "ferry.push";
 pub const COMPILE_COMMAND: &str = "ferry.compile";
-pub const ACTION_COMMANDS: &[&str] = &[PULL_COMMAND, PUSH_COMMAND, COMPILE_COMMAND];
+pub const ACTION_COMMANDS: &[&str] =
+    &[PULL_COMMAND, COMPARE_COMMAND, PUSH_COMMAND, COMPILE_COMMAND];
 
 const CODE_ACTION_METHOD: &str = "textDocument/codeAction";
 const EXECUTE_COMMAND_METHOD: &str = "workspace/executeCommand";
@@ -38,9 +41,63 @@ pub trait FileOperations {
     fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome>;
 
     fn compile(&mut self, config_path: &Path, rel: &str) -> Result<FileCheckResult>;
+
+    fn compare(&mut self, _request: CompareRequest) -> Result<CompareOutcome> {
+        anyhow::bail!("native diff is unavailable")
+    }
+
+    fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+        Arc::new(|| Ok(()))
+    }
 }
 
-pub struct FerryOperations;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompareOutcome {
+    Opened,
+    Cancelled,
+}
+
+pub struct CompareRequest {
+    config_path: PathBuf,
+    relative_path: String,
+    local_path: PathBuf,
+    guard: OperationGuard,
+}
+
+impl CompareRequest {
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    pub fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub fn local_path(&self) -> &Path {
+        &self.local_path
+    }
+
+    /// Claim authorization immediately before launching the comparison.
+    ///
+    /// Returns `false` when an editor change or shutdown cancelled the work.
+    pub fn try_claim(&self) -> bool {
+        self.guard.try_claim()
+    }
+}
+
+pub struct FerryOperations {
+    snapshots: diff::SharedSnapshotStore,
+    launcher: Box<dyn diff::DiffLauncher>,
+}
+
+impl FerryOperations {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            snapshots: diff::SharedSnapshotStore::new()?,
+            launcher: Box::new(diff::ZedDiffLauncher),
+        })
+    }
+}
 
 impl FileOperations for FerryOperations {
     fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
@@ -57,6 +114,29 @@ impl FileOperations for FerryOperations {
             .next()
             .context("compile check returned no result")
     }
+
+    fn compare(&mut self, request: CompareRequest) -> Result<CompareOutcome> {
+        let CompareRequest {
+            config_path,
+            relative_path,
+            local_path,
+            guard,
+        } = request;
+        compare_file_with(
+            &self.snapshots,
+            self.launcher.as_mut(),
+            &config_path,
+            &relative_path,
+            &local_path,
+            guard,
+            |config_path, relative_path| Ok(fetch_remote_one(config_path, relative_path)?.bytes),
+        )
+    }
+
+    fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+        let shutdown = self.snapshots.shutdown_handle();
+        Arc::new(move || shutdown.shutdown())
+    }
 }
 
 #[derive(Clone)]
@@ -65,6 +145,7 @@ struct ShutdownBoundary {
 }
 
 impl ShutdownBoundary {
+    #[cfg(test)]
     fn noop() -> Self {
         Self {
             shutdown: Arc::new(|| Ok(())),
@@ -76,6 +157,34 @@ impl ShutdownBoundary {
     }
 }
 
+fn compare_file_with<F>(
+    snapshots: &diff::SharedSnapshotStore,
+    launcher: &mut dyn diff::DiffLauncher,
+    config_path: &Path,
+    relative_path: &str,
+    local_path: &Path,
+    guard: OperationGuard,
+    fetch: F,
+) -> Result<CompareOutcome>
+where
+    F: FnOnce(&Path, &str) -> Result<Vec<u8>>,
+{
+    let saved_local = LocalIdentity::capture(local_path)?;
+    anyhow::ensure!(
+        matches!(saved_local, LocalIdentity::Present(_)),
+        "Compare requires a saved local file"
+    );
+    let remote_bytes = fetch(config_path, relative_path)?;
+    let snapshot = snapshots.prepare_snapshot(local_path, &remote_bytes)?;
+    if LocalIdentity::capture(local_path)? != saved_local {
+        return Ok(CompareOutcome::Cancelled);
+    }
+    match snapshots.launch_and_retain(local_path, snapshot, guard, launcher)? {
+        diff::LaunchOutcome::Launched => Ok(CompareOutcome::Opened),
+        diff::LaunchOutcome::Cancelled => Ok(CompareOutcome::Cancelled),
+    }
+}
+
 pub struct Server<O: FileOperations> {
     operations: O,
     shutdown: ShutdownBoundary,
@@ -83,9 +192,12 @@ pub struct Server<O: FileOperations> {
 
 impl<O: FileOperations> Server<O> {
     pub fn new(operations: O) -> Self {
+        let shutdown = ShutdownBoundary {
+            shutdown: operations.shutdown_callback(),
+        };
         Self {
             operations,
-            shutdown: ShutdownBoundary::noop(),
+            shutdown,
         }
     }
 
@@ -180,7 +292,7 @@ impl<O: FileOperations> Server<O> {
             }
         };
         if matches!(command.action, ActionCommand::Pull)
-            && guard.is_some_and(|guard| !guard.try_claim())
+            && guard.as_ref().is_some_and(|guard| !guard.try_claim())
         {
             return save_first_warning(&resolved.relative_path);
         }
@@ -200,6 +312,28 @@ impl<O: FileOperations> Server<O> {
                 self.operations
                     .compile(&resolved.config_path, &resolved.relative_path),
             ),
+            ActionCommand::Compare => {
+                let Some(guard) = guard else {
+                    return save_first_warning(&resolved.relative_path);
+                };
+                match self.operations.compare(CompareRequest {
+                    config_path: resolved.config_path,
+                    relative_path: resolved.relative_path.clone(),
+                    local_path: command.absolute_path,
+                    guard,
+                }) {
+                    Ok(CompareOutcome::Opened) => info_message(format!(
+                        "ferry: {}: opened native diff",
+                        resolved.relative_path
+                    )),
+                    Ok(CompareOutcome::Cancelled) => save_first_warning(&resolved.relative_path),
+                    Err(error) => warning_message(format!(
+                        "ferry: {}: {}; run a Ferry task for details",
+                        resolved.relative_path,
+                        safe_error_summary(&error)
+                    )),
+                }
+            }
         }
     }
 
@@ -267,6 +401,7 @@ fn code_actions(request: Request) -> Response {
         .map(|_| {
             [
                 ("Ferry: Pull", PULL_COMMAND),
+                ("Ferry: Compare with Remote", COMPARE_COMMAND),
                 ("Ferry: Push", PUSH_COMMAND),
                 ("Ferry: Compile-check", COMPILE_COMMAND),
             ]
@@ -287,6 +422,7 @@ fn code_actions(request: Request) -> Response {
 #[derive(Clone, Copy)]
 enum ActionCommand {
     Pull,
+    Compare,
     Push,
     Compile,
 }
@@ -318,6 +454,7 @@ fn prepare_execute_command(request: Request) -> PreparedRequest {
     };
     let action = match params.command.as_str() {
         PULL_COMMAND => ActionCommand::Pull,
+        COMPARE_COMMAND => ActionCommand::Compare,
         PUSH_COMMAND => ActionCommand::Push,
         COMPILE_COMMAND => ActionCommand::Compile,
         _ => {
@@ -660,27 +797,28 @@ fn handle_request(
     if request.method == EXECUTE_COMMAND_METHOD {
         match prepare_execute_command(request) {
             PreparedRequest::Ready { id, command } => {
-                let guard = if matches!(command.action, ActionCommand::Pull) {
-                    match coordinator
-                        .documents
-                        .begin_clean_operation(&command.absolute_path)
-                    {
-                        Ok(guard) => Some(guard),
-                        Err(_) => {
-                            for message in operation_response(
-                                id,
-                                save_first_warning(&command.initial_relative_path),
-                            ) {
-                                if connection.sender.send(message).is_err() {
-                                    return Ok(true);
+                let guard =
+                    if matches!(command.action, ActionCommand::Pull | ActionCommand::Compare) {
+                        match coordinator
+                            .documents
+                            .begin_clean_operation(&command.absolute_path)
+                        {
+                            Ok(guard) => Some(guard),
+                            Err(_) => {
+                                for message in operation_response(
+                                    id,
+                                    save_first_warning(&command.initial_relative_path),
+                                ) {
+                                    if connection.sender.send(message).is_err() {
+                                        return Ok(true);
+                                    }
                                 }
+                                return Ok(false);
                             }
-                            return Ok(false);
                         }
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
                 let response = if work_sender.send(Work::Command { command, guard }).is_ok() {
                     Response::new_ok(id, ())
                 } else {
@@ -871,6 +1009,25 @@ mod tests {
         status: TransferStatus,
         compile_status: FileCheckStatus,
         diagnostics: String,
+    }
+
+    #[derive(Default)]
+    struct TestDiffLauncher {
+        calls: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+        fail: bool,
+    }
+
+    impl diff::DiffLauncher for TestDiffLauncher {
+        fn launch(&mut self, local: &Path, remote: &Path) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((local.to_path_buf(), remote.to_path_buf()));
+            if self.fail {
+                anyhow::bail!("launcher sentinel")
+            }
+            Ok(())
+        }
     }
 
     impl FakeOperations {
@@ -1332,6 +1489,7 @@ mod tests {
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec![
                         PULL_COMMAND.to_string(),
+                        COMPARE_COMMAND.to_string(),
                         PUSH_COMMAND.to_string(),
                         COMPILE_COMMAND.to_string(),
                     ],
@@ -1457,6 +1615,11 @@ mod tests {
                 {
                     "title": "Ferry: Pull",
                     "command": "ferry.pull",
+                    "arguments": [uri]
+                },
+                {
+                    "title": "Ferry: Compare with Remote",
+                    "command": "ferry.compare",
                     "arguments": [uri]
                 },
                 {
@@ -1617,6 +1780,299 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn compare_command_is_acknowledged_without_pull_push_or_compile() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
+
+        let (response, messages) = process_server_request(
+            &mut server,
+            execute_command_request(82, "ferry.compare", vec![uri]),
+        );
+
+        assert!(response.error.is_none());
+        assert_eq!(response.result, Some(serde_json::Value::Null));
+        assert_eq!(messages.len(), 1);
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn compare_request_public_api_exposes_paths_and_one_shot_authorization() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        let config = directory.path().join("config.toml");
+        fs::write(&local, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let request = CompareRequest {
+            config_path: config.clone(),
+            relative_path: "local.c".to_string(),
+            local_path: local.clone(),
+            guard: documents.begin_clean_operation(&local).unwrap(),
+        };
+
+        assert_eq!(request.config_path(), config);
+        assert_eq!(request.relative_path(), "local.c");
+        assert_eq!(request.local_path(), local);
+        assert!(request.try_claim());
+        assert!(!request.try_claim());
+    }
+
+    #[test]
+    fn compare_success_fetches_once_launches_local_then_remote_and_retains_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        let config = directory.path().join("config.toml");
+        fs::write(&local, b"saved local bytes").unwrap();
+        fs::write(&config, b"config sentinel").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let guard = documents.begin_clean_operation(&local).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let shutdown = snapshots.shutdown_handle();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut launcher = TestDiffLauncher {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+        let mut fetches = 0;
+
+        let outcome = compare_file_with(
+            &snapshots,
+            &mut launcher,
+            &config,
+            "local.c",
+            &local,
+            guard,
+            |observed_config, observed_rel| {
+                fetches += 1;
+                assert_eq!(observed_config, config);
+                assert_eq!(observed_rel, "local.c");
+                Ok(b"remote bytes\0\xff".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CompareOutcome::Opened);
+        assert_eq!(fetches, 1);
+        let launched = calls.lock().unwrap().clone();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].0, local);
+        assert!(launched[0].1.is_absolute());
+        assert_eq!(fs::read(&launched[0].1).unwrap(), b"remote bytes\0\xff");
+        assert!(
+            fs::metadata(&launched[0].1)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(fs::read(&local).unwrap(), b"saved local bytes");
+        assert_eq!(fs::read(&config).unwrap(), b"config sentinel");
+        assert!(
+            launched[0].1.exists(),
+            "successful snapshot must be retained"
+        );
+
+        shutdown.shutdown().unwrap();
+        assert!(!launched[0].1.exists(), "shutdown must remove the snapshot");
+    }
+
+    #[test]
+    fn compare_retrieval_failure_does_not_create_or_launch_a_diff() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        fs::write(&local, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let guard = documents.begin_clean_operation(&local).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let shutdown = snapshots.shutdown_handle();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut launcher = TestDiffLauncher {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+        let mut fetches = 0;
+
+        let error = compare_file_with(
+            &snapshots,
+            &mut launcher,
+            Path::new("unused.toml"),
+            "local.c",
+            &local,
+            guard,
+            |_, _| {
+                fetches += 1;
+                Err(anyhow!("retrieval sentinel"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fetches, 1);
+        assert!(format!("{error:#}").contains("retrieval sentinel"));
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&local).unwrap(), b"saved local bytes");
+        shutdown.shutdown().unwrap();
+    }
+
+    #[test]
+    fn compare_snapshot_creation_failure_is_independent_and_does_not_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        fs::write(&local, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let guard = documents.begin_clean_operation(&local).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        snapshots.shutdown_handle().shutdown().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut launcher = TestDiffLauncher {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+        let mut fetches = 0;
+
+        let error = compare_file_with(
+            &snapshots,
+            &mut launcher,
+            Path::new("unused.toml"),
+            "local.c",
+            &local,
+            guard,
+            |_, _| {
+                fetches += 1;
+                Ok(b"remote bytes".to_vec())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fetches, 1, "retrieval succeeds before snapshot injection");
+        assert!(format!("{error:#}").contains("closed"));
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&local).unwrap(), b"saved local bytes");
+    }
+
+    #[test]
+    fn compare_launcher_failure_drops_snapshot_and_does_not_mutate_local() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        fs::write(&local, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let guard = documents.begin_clean_operation(&local).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let shutdown = snapshots.shutdown_handle();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut launcher = TestDiffLauncher {
+            calls: Arc::clone(&calls),
+            fail: true,
+        };
+
+        let error = compare_file_with(
+            &snapshots,
+            &mut launcher,
+            Path::new("unused.toml"),
+            "local.c",
+            &local,
+            guard,
+            |_, _| Ok(b"remote bytes".to_vec()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("launcher sentinel"));
+        let launched = calls.lock().unwrap().clone();
+        assert_eq!(launched.len(), 1);
+        assert!(
+            !launched[0].1.exists(),
+            "failed snapshot must not be retained"
+        );
+        assert_eq!(fs::read(&local).unwrap(), b"saved local bytes");
+        shutdown.shutdown().unwrap();
+    }
+
+    #[test]
+    fn compare_local_identity_change_cancels_before_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        fs::write(&local, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let guard = documents.begin_clean_operation(&local).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let shutdown = snapshots.shutdown_handle();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut launcher = TestDiffLauncher {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+
+        let outcome = compare_file_with(
+            &snapshots,
+            &mut launcher,
+            Path::new("unused.toml"),
+            "local.c",
+            &local,
+            guard,
+            |_, _| {
+                fs::write(&local, b"changed local bytes").unwrap();
+                Ok(b"remote bytes".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CompareOutcome::Cancelled);
+        assert!(calls.lock().unwrap().is_empty());
+        shutdown.shutdown().unwrap();
+    }
+
+    #[test]
+    fn compare_missing_saved_local_file_fails_before_retrieval() {
+        let directory = tempfile::tempdir().unwrap();
+        let tracked = directory.path().join("tracked.c");
+        let missing = directory.path().join("missing.c");
+        fs::write(&tracked, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents
+            .open(tracked.clone(), "saved local bytes")
+            .unwrap();
+        let guard = documents.begin_clean_operation(&tracked).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let shutdown = snapshots.shutdown_handle();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut launcher = TestDiffLauncher {
+            calls: Arc::clone(&calls),
+            fail: false,
+        };
+        let mut fetches = 0;
+
+        let error = compare_file_with(
+            &snapshots,
+            &mut launcher,
+            Path::new("unused.toml"),
+            "missing.c",
+            &missing,
+            guard,
+            |_, _| {
+                fetches += 1;
+                Ok(b"remote bytes".to_vec())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fetches, 0);
+        assert!(format!("{error:#}").contains("saved local file"));
+        assert!(calls.lock().unwrap().is_empty());
+        shutdown.shutdown().unwrap();
+    }
+
+    #[test]
+    fn compare_ferry_operations_constructor_is_fallible_and_shutdown_is_real() {
+        let operations = FerryOperations::new().unwrap();
+        (operations.shutdown_callback())().unwrap();
     }
 
     #[test]
@@ -2286,7 +2742,7 @@ mod tests {
         let action_messages = receive_request_messages(&client_connection, 130, 1);
         let actions = response_with_id(action_messages.into_iter().next().unwrap(), 130);
         assert!(actions.error.is_none());
-        assert_eq!(actions.result.unwrap().as_array().unwrap().len(), 3);
+        assert_eq!(actions.result.unwrap().as_array().unwrap().len(), 4);
 
         let mut feedback = Vec::new();
         for (id, command) in [
@@ -2435,6 +2891,538 @@ mod tests {
         started: mpsc::SyncSender<()>,
         release: Arc<(Mutex<bool>, Condvar)>,
         finished: mpsc::SyncSender<()>,
+    }
+
+    struct BlockingCompareOperations {
+        snapshots: diff::SharedSnapshotStore,
+        launcher: TestDiffLauncher,
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+        stopped: Option<mpsc::SyncSender<()>>,
+        guard_probe: Option<mpsc::SyncSender<OperationGuard>>,
+        fetches: Arc<AtomicUsize>,
+        non_compare_calls: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BlockingCompareOperations {
+        fn drop(&mut self) {
+            if let Some(stopped) = &self.stopped {
+                let _ = stopped.send(());
+            }
+        }
+    }
+
+    impl FileOperations for BlockingCompareOperations {
+        fn pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            self.non_compare_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            self.non_compare_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            self.non_compare_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+
+        fn compare(&mut self, request: CompareRequest) -> Result<CompareOutcome> {
+            let CompareRequest {
+                config_path,
+                relative_path,
+                local_path,
+                guard,
+            } = request;
+            if let Some(guard_probe) = &self.guard_probe {
+                guard_probe.send(guard.clone()).unwrap();
+            }
+            let started = self.started.clone();
+            let release = Arc::clone(&self.release);
+            let finished = self.finished.clone();
+            let fetches = Arc::clone(&self.fetches);
+            compare_file_with(
+                &self.snapshots,
+                &mut self.launcher,
+                &config_path,
+                &relative_path,
+                &local_path,
+                guard,
+                move |_, _| {
+                    fetches.fetch_add(1, AtomicOrdering::SeqCst);
+                    started.send(()).unwrap();
+                    let (lock, wake) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    finished.send(()).unwrap();
+                    Ok(b"remote compare bytes".to_vec())
+                },
+            )
+        }
+
+        fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+            let shutdown = self.snapshots.shutdown_handle();
+            Arc::new(move || shutdown.shutdown())
+        }
+    }
+
+    fn release_barrier(release: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, wake) = &**release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+
+    #[test]
+    fn compare_blocked_retrieval_did_change_cancels_with_one_save_retry_warning() {
+        let fixture = Fixture::new("");
+        let original_local = fs::read(&fixture.file_path).unwrap();
+        let original_config = fs::read(&fixture.config_path).unwrap();
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let launcher_calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let non_compare_calls = Arc::new(AtomicUsize::new(0));
+        let operations = BlockingCompareOperations {
+            snapshots,
+            launcher: TestDiffLauncher {
+                calls: Arc::clone(&launcher_calls),
+                fail: false,
+            },
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+            stopped: None,
+            guard_probe: None,
+            fetches: Arc::clone(&fetches),
+            non_compare_calls: Arc::clone(&non_compare_calls),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                301,
+                COMPARE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("compare retrieval must block");
+
+        let acknowledgement = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("command response must not wait for retrieval");
+        let acknowledgement = response_with_id(acknowledgement, 301);
+        assert!(acknowledgement.error.is_none());
+        assert_eq!(acknowledgement.result, Some(serde_json::Value::Null));
+
+        client_connection
+            .sender
+            .send(Message::Notification(did_change(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(code_action_request(302, &fixture.uri())))
+            .unwrap();
+        let responsive_action = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("code action proves didChange was processed while retrieval blocked");
+        let responsive_action = response_with_id(responsive_action, 302);
+        assert_eq!(
+            responsive_action.result.unwrap().as_array().unwrap().len(),
+            4
+        );
+
+        release_barrier(&release);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retrieval must finish after release");
+        let feedback = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled Compare feedback");
+        let feedback = match feedback {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
+            }
+            other => panic!("expected Compare warning, got {other:?}"),
+        };
+        assert_eq!(feedback.typ, MessageType::WARNING);
+        assert_eq!(
+            feedback.message,
+            "ferry: src/nested/hello world.c: save the file and retry"
+        );
+        assert!(client_connection.receiver.try_recv().is_err());
+        assert_eq!(fetches.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(non_compare_calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(launcher_calls.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&fixture.file_path).unwrap(), original_local);
+        assert_eq!(fs::read(&fixture.config_path).unwrap(), original_config);
+
+        finish_loop(&client_connection, loop_thread, 303);
+    }
+
+    #[test]
+    fn compare_shutdown_while_retrieval_blocked_cleans_root_and_prevents_late_launch() {
+        let fixture = Fixture::new("");
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let root = snapshots.root_path().unwrap();
+        let snapshot_shutdown = snapshots.shutdown_handle();
+        let launcher_calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
+        let (guard_tx, guard_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let non_compare_calls = Arc::new(AtomicUsize::new(0));
+        let operations = BlockingCompareOperations {
+            snapshots,
+            launcher: TestDiffLauncher {
+                calls: Arc::clone(&launcher_calls),
+                fail: false,
+            },
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+            stopped: Some(stopped_tx),
+            guard_probe: Some(guard_tx),
+            fetches: Arc::clone(&fetches),
+            non_compare_calls: Arc::clone(&non_compare_calls),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                311,
+                COMPARE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("compare retrieval must block");
+        let guard = guard_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Compare must expose its still-pending guard to the test");
+        let acknowledgement = client_connection
+            .receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("prompt Compare acknowledgement");
+        assert!(response_with_id(acknowledgement, 311).error.is_none());
+
+        send_shutdown_request(&client_connection, 312);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response while exit is withheld");
+        assert!(response_with_id(shutdown, 312).error.is_none());
+        assert!(!guard.try_claim(), "shutdown must cancel the pending guard");
+        assert!(snapshot_shutdown.is_closed().unwrap());
+        assert!(
+            !root.exists(),
+            "shutdown must remove the exact snapshot root"
+        );
+
+        release_barrier(&release);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retrieval must finish after release");
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker must stop after blocked retrieval returns");
+        assert_eq!(fetches.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(non_compare_calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(launcher_calls.lock().unwrap().is_empty());
+        assert!(
+            client_connection.receiver.try_recv().is_err(),
+            "released worker must not emit late feedback"
+        );
+
+        send_exit(&client_connection);
+        loop_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn compare_success_feedback_retains_snapshot_until_real_protocol_shutdown() {
+        let fixture = Fixture::new("");
+        let original_local = fs::read(&fixture.file_path).unwrap();
+        let original_config = fs::read(&fixture.config_path).unwrap();
+        let state_path = fixture
+            .config_path
+            .parent()
+            .unwrap()
+            .join(crate::names::STATE_DIR);
+        let snapshots = diff::SharedSnapshotStore::new().unwrap();
+        let root = snapshots.root_path().unwrap();
+        let launcher_calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, _started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, _finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(true), Condvar::new()));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let non_compare_calls = Arc::new(AtomicUsize::new(0));
+        let operations = BlockingCompareOperations {
+            snapshots,
+            launcher: TestDiffLauncher {
+                calls: Arc::clone(&launcher_calls),
+                fail: false,
+            },
+            started: started_tx,
+            release,
+            finished: finished_tx,
+            stopped: None,
+            guard_probe: None,
+            fetches: Arc::clone(&fetches),
+            non_compare_calls: Arc::clone(&non_compare_calls),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                321,
+                COMPARE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let messages = receive_request_messages(&client_connection, 321, 2);
+        let mut info = None;
+        for message in messages {
+            match message {
+                Message::Response(response) => {
+                    assert!(response.error.is_none());
+                    assert_eq!(response.result, Some(serde_json::Value::Null));
+                }
+                Message::Notification(notification)
+                    if notification.method == "window/showMessage" =>
+                {
+                    assert!(
+                        info.replace(
+                            serde_json::from_value::<ShowMessageParams>(notification.params)
+                                .unwrap()
+                        )
+                        .is_none()
+                    );
+                }
+                other => panic!("unexpected Compare message: {other:?}"),
+            }
+        }
+        let info = info.expect("Compare success feedback");
+        assert_eq!(info.typ, MessageType::INFO);
+        assert_eq!(
+            info.message,
+            "ferry: src/nested/hello world.c: opened native diff"
+        );
+        let launched = launcher_calls.lock().unwrap().clone();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].0, fixture.file_path);
+        assert!(launched[0].1.exists(), "snapshot retained after launch");
+        assert_eq!(fetches.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(non_compare_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(fs::read(&fixture.file_path).unwrap(), original_local);
+        assert_eq!(fs::read(&fixture.config_path).unwrap(), original_config);
+        assert!(!state_path.exists(), "Compare must not create Ferry state");
+
+        send_shutdown_request(&client_connection, 322);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response while exit withheld");
+        assert!(response_with_id(shutdown, 322).error.is_none());
+        assert!(!launched[0].1.exists());
+        assert!(!root.exists());
+        send_exit(&client_connection);
+        loop_thread.join().unwrap().unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    enum CompareFailureStage {
+        Retrieval,
+        SnapshotCreation,
+        Launcher,
+    }
+
+    struct FailingCompareOperations {
+        snapshots: diff::SharedSnapshotStore,
+        launcher: TestDiffLauncher,
+        stage: CompareFailureStage,
+    }
+
+    impl FileOperations for FailingCompareOperations {
+        fn pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+
+        fn compare(&mut self, request: CompareRequest) -> Result<CompareOutcome> {
+            let CompareRequest {
+                config_path,
+                relative_path,
+                local_path,
+                guard,
+            } = request;
+            let stage = self.stage;
+            compare_file_with(
+                &self.snapshots,
+                &mut self.launcher,
+                &config_path,
+                &relative_path,
+                &local_path,
+                guard,
+                move |_, _| match stage {
+                    CompareFailureStage::Retrieval => {
+                        Err(anyhow!("{REVIEW_SECRET} retrieval sentinel"))
+                    }
+                    CompareFailureStage::SnapshotCreation | CompareFailureStage::Launcher => {
+                        Ok(b"remote bytes".to_vec())
+                    }
+                },
+            )
+        }
+
+        fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+            let shutdown = self.snapshots.shutdown_handle();
+            Arc::new(move || shutdown.shutdown())
+        }
+    }
+
+    #[test]
+    fn compare_runtime_failures_each_emit_one_safe_warning() {
+        for stage in [
+            CompareFailureStage::Retrieval,
+            CompareFailureStage::SnapshotCreation,
+            CompareFailureStage::Launcher,
+        ] {
+            let fixture = Fixture::new("");
+            let original_local = fs::read(&fixture.file_path).unwrap();
+            let original_config = fs::read(&fixture.config_path).unwrap();
+            let state_path = fixture
+                .config_path
+                .parent()
+                .unwrap()
+                .join(crate::names::STATE_DIR);
+            let snapshots = diff::SharedSnapshotStore::new().unwrap();
+            if matches!(stage, CompareFailureStage::SnapshotCreation) {
+                snapshots.shutdown_handle().shutdown().unwrap();
+            }
+            let operations = FailingCompareOperations {
+                snapshots,
+                launcher: TestDiffLauncher {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    fail: matches!(stage, CompareFailureStage::Launcher),
+                },
+                stage,
+            };
+            let (server_connection, client_connection) = Connection::memory();
+            let loop_thread =
+                thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+            client_connection
+                .sender
+                .send(Message::Notification(did_open(fixture.uri())))
+                .unwrap();
+            client_connection
+                .sender
+                .send(Message::Request(execute_command_request(
+                    331,
+                    COMPARE_COMMAND,
+                    vec![serde_json::to_value(fixture.uri()).unwrap()],
+                )))
+                .unwrap();
+
+            let messages = receive_request_messages(&client_connection, 331, 2);
+            let warnings = messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::Response(response) => {
+                        assert!(response.error.is_none());
+                        assert_eq!(response.result, Some(serde_json::Value::Null));
+                        None
+                    }
+                    Message::Notification(notification)
+                        if notification.method == "window/showMessage" =>
+                    {
+                        Some(
+                            serde_json::from_value::<ShowMessageParams>(notification.params)
+                                .unwrap(),
+                        )
+                    }
+                    other => panic!("unexpected Compare failure message: {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].typ, MessageType::WARNING);
+            assert_eq!(
+                warnings[0].message,
+                "ferry: src/nested/hello world.c: operation failed; run a Ferry task for details"
+            );
+            assert!(!warnings[0].message.contains(REVIEW_SECRET));
+            assert!(!warnings[0].message.contains("sentinel"));
+            assert_eq!(fs::read(&fixture.file_path).unwrap(), original_local);
+            assert_eq!(fs::read(&fixture.config_path).unwrap(), original_config);
+            assert!(!state_path.exists());
+
+            finish_loop(&client_connection, loop_thread, 332);
+        }
     }
 
     impl FileOperations for QueueBlockingOperations {
@@ -2728,7 +3716,7 @@ mod tests {
             141,
         );
         assert!(action.error.is_none());
-        assert_eq!(action.result.unwrap().as_array().unwrap().len(), 3);
+        assert_eq!(action.result.unwrap().as_array().unwrap().len(), 4);
         assert!(response_with_id(prompt_shutdown, 142).error.is_none());
     }
 

@@ -141,6 +141,12 @@ pub(crate) struct PreparedSnapshot {
     file: NamedTempFile,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LaunchOutcome {
+    Launched,
+    Cancelled,
+}
+
 impl PreparedSnapshot {
     pub(crate) fn path(&self) -> &Path {
         self.file.path()
@@ -701,7 +707,7 @@ impl SharedSnapshotStore {
         snapshot: PreparedSnapshot,
         guard: OperationGuard,
         launcher: &mut L,
-    ) -> Result<()>
+    ) -> Result<LaunchOutcome>
     where
         L: DiffLauncher + ?Sized,
     {
@@ -717,20 +723,19 @@ impl SharedSnapshotStore {
         ensure!(local.is_absolute(), "local diff path must be absolute");
         validate_active_root(&root)?;
         validate_prepared_snapshot(&root, &snapshot)?;
-        ensure!(
-            guard.try_claim(),
-            "diff operation was cancelled before launch"
-        );
+        if !guard.try_claim() {
+            return Ok(LaunchOutcome::Cancelled);
+        }
 
         launcher
             .launch(local, snapshot.path())
             .context("launching Zed native diff")?;
         state.retained.push(snapshot);
-        Ok(())
+        Ok(LaunchOutcome::Launched)
     }
 
     #[cfg(test)]
-    fn root_path(&self) -> Result<PathBuf> {
+    pub(crate) fn root_path(&self) -> Result<PathBuf> {
         let state = self.inner.lock()?;
         state
             .root
@@ -774,7 +779,7 @@ impl SnapshotShutdown {
     }
 
     #[cfg(test)]
-    fn is_closed(&self) -> Result<bool> {
+    pub(crate) fn is_closed(&self) -> Result<bool> {
         Ok(self.inner.lock()?.closed)
     }
 
@@ -1566,11 +1571,11 @@ mod tests {
         tracker.change(&local);
         let mut launcher = RecordingLauncher::default();
 
-        let error = store
+        let outcome = store
             .launch_and_retain(&local, snapshot, guard, &mut launcher)
-            .unwrap_err();
+            .unwrap();
 
-        assert!(format!("{error:#}").contains("cancelled"));
+        assert_eq!(outcome, super::LaunchOutcome::Cancelled);
         assert!(launcher.calls.is_empty());
         assert!(!snapshot_path.exists());
         shutdown.shutdown().unwrap();
