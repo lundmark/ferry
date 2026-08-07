@@ -73,20 +73,7 @@ pub fn fetch_remote_one(config_path: &Path, rel: &str) -> Result<RemoteFile> {
             anyhow::bail!("remote has no {rel}");
         }
 
-        let bytes = ftp
-            .download(&remote_path)
-            .with_context(|| format!("downloading {remote_path}"))?;
-        let size = bytes.len() as u64;
-        let sha256 = hash_bytes(&bytes);
-        let mtime = ftp
-            .mtime(&remote_path)
-            .with_context(|| format!("fetching mtime for {remote_path}"))?;
-        Ok(RemoteFile {
-            bytes,
-            sha256,
-            size,
-            mtime,
-        })
+        retrieve_remote_file(&mut ftp, &remote_path)
     })()
     .with_context(|| format!("pull {rel}"))
 }
@@ -271,6 +258,53 @@ pub fn pull_one(
     apply_prepared_pull(prepare_pull_one(config_path, rel, force)?, mode)
 }
 
+trait RemoteFileRetrieval {
+    fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>>;
+    fn size(&mut self, remote_path: &str) -> Result<u64>;
+    fn download(&mut self, remote_path: &str) -> Result<Vec<u8>>;
+}
+
+impl RemoteFileRetrieval for Ftp {
+    fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
+        Ftp::mtime(self, remote_path)
+    }
+
+    fn size(&mut self, remote_path: &str) -> Result<u64> {
+        Ftp::size(self, remote_path)
+    }
+
+    fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
+        Ftp::download(self, remote_path)
+    }
+}
+
+fn retrieve_remote_file<R: RemoteFileRetrieval>(
+    remote: &mut R,
+    remote_path: &str,
+) -> Result<RemoteFile> {
+    let mtime_before = remote
+        .mtime(remote_path)
+        .with_context(|| format!("fetching mtime for {remote_path} before download"))?;
+    let size_before = remote.size(remote_path).ok();
+
+    let bytes = remote
+        .download(remote_path)
+        .with_context(|| format!("downloading {remote_path}"))?;
+
+    let mtime_after = remote
+        .mtime(remote_path)
+        .with_context(|| format!("fetching mtime for {remote_path} after download"))?;
+    let size_after = remote.size(remote_path).ok();
+
+    let size_changed =
+        matches!((size_before, size_after), (Some(before), Some(after)) if before != after);
+    if mtime_before != mtime_after || size_changed {
+        anyhow::bail!("remote changed while downloading {remote_path}");
+    }
+
+    Ok(remote_file_from_payload(bytes, mtime_before))
+}
+
 fn connect(cfg: &Config) -> Result<Ftp> {
     Ftp::connect(
         &cfg.connection.host,
@@ -319,7 +353,7 @@ mod tests {
     use crate::hash::hash_bytes;
     use crate::state::StateFile;
     use chrono::{TimeZone, Utc};
-    use std::path::Path;
+    use std::{collections::VecDeque, path::Path};
 
     fn write_config(path: &Path, local_root: &Path) {
         std::fs::write(
@@ -682,5 +716,127 @@ remote_root = "/remote"
         assert_eq!(remote.mtime, mtime);
         assert_ne!(remote.sha256, cached.sha256);
         assert_ne!(remote.size, cached.size);
+    }
+
+    struct ScriptedRetrieval {
+        mtimes: VecDeque<DateTime<Utc>>,
+        sizes: VecDeque<Option<u64>>,
+        bytes: Option<Vec<u8>>,
+        events: Vec<&'static str>,
+    }
+
+    impl ScriptedRetrieval {
+        fn new(
+            mtimes: impl IntoIterator<Item = DateTime<Utc>>,
+            sizes: impl IntoIterator<Item = Option<u64>>,
+            bytes: &[u8],
+        ) -> Self {
+            Self {
+                mtimes: mtimes.into_iter().collect(),
+                sizes: sizes.into_iter().collect(),
+                bytes: Some(bytes.to_vec()),
+                events: Vec::new(),
+            }
+        }
+
+        fn assert_bracketed_one_download(&self) {
+            assert_eq!(self.events, ["mtime", "size", "download", "mtime", "size"]);
+            assert_eq!(
+                self.events
+                    .iter()
+                    .filter(|event| **event == "download")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    impl RemoteFileRetrieval for ScriptedRetrieval {
+        fn mtime(&mut self, _remote_path: &str) -> Result<DateTime<Utc>> {
+            self.events.push("mtime");
+            Ok(self.mtimes.pop_front().expect("scripted MDTM call"))
+        }
+
+        fn size(&mut self, _remote_path: &str) -> Result<u64> {
+            self.events.push("size");
+            self.sizes
+                .pop_front()
+                .expect("scripted SIZE call")
+                .ok_or_else(|| anyhow::anyhow!("SIZE unsupported"))
+        }
+
+        fn download(&mut self, _remote_path: &str) -> Result<Vec<u8>> {
+            self.events.push("download");
+            Ok(self.bytes.take().expect("exactly one RETR call"))
+        }
+    }
+
+    #[test]
+    fn remote_snapshot_brackets_exactly_one_download_with_metadata() {
+        let mtime = Utc.with_ymd_and_hms(2026, 8, 7, 14, 0, 0).unwrap();
+        let payload = b"stable remote payload";
+        let mut retrieval = ScriptedRetrieval::new(
+            [mtime, mtime],
+            [Some(payload.len() as u64), Some(payload.len() as u64)],
+            payload,
+        );
+
+        let remote = retrieve_remote_file(&mut retrieval, "/remote/page.txt").unwrap();
+
+        retrieval.assert_bracketed_one_download();
+        assert_eq!(remote.bytes, payload);
+        assert_eq!(remote.sha256, hash_bytes(payload));
+        assert_eq!(remote.size, payload.len() as u64);
+        assert_eq!(remote.mtime, mtime);
+    }
+
+    #[test]
+    fn remote_snapshot_rejects_changed_mtime_after_one_download() {
+        let before = Utc.with_ymd_and_hms(2026, 8, 7, 14, 0, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 8, 7, 14, 0, 1).unwrap();
+        let payload = b"raced remote payload";
+        let mut retrieval = ScriptedRetrieval::new(
+            [before, after],
+            [Some(payload.len() as u64), Some(payload.len() as u64)],
+            payload,
+        );
+
+        let error = retrieve_remote_file(&mut retrieval, "/remote/page.txt").unwrap_err();
+
+        retrieval.assert_bracketed_one_download();
+        assert!(
+            format!("{error:#}").contains("remote changed while downloading /remote/page.txt"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn remote_snapshot_rejects_changed_available_size_after_one_download() {
+        let mtime = Utc.with_ymd_and_hms(2026, 8, 7, 14, 0, 0).unwrap();
+        let payload = b"size-raced remote payload";
+        let mut retrieval = ScriptedRetrieval::new([mtime, mtime], [Some(10), Some(11)], payload);
+
+        let error = retrieve_remote_file(&mut retrieval, "/remote/page.txt").unwrap_err();
+
+        retrieval.assert_bracketed_one_download();
+        assert!(
+            format!("{error:#}").contains("remote changed while downloading /remote/page.txt"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn remote_snapshot_does_not_require_size_when_mtime_is_stable() {
+        let mtime = Utc.with_ymd_and_hms(2026, 8, 7, 14, 0, 0).unwrap();
+        let payload = b"stable payload without SIZE";
+        let mut retrieval = ScriptedRetrieval::new([mtime, mtime], [None, None], payload);
+
+        let remote = retrieve_remote_file(&mut retrieval, "/remote/page.txt").unwrap();
+
+        retrieval.assert_bracketed_one_download();
+        assert_eq!(remote.bytes, payload);
+        assert_eq!(remote.sha256, hash_bytes(payload));
+        assert_eq!(remote.size, payload.len() as u64);
+        assert_eq!(remote.mtime, mtime);
     }
 }

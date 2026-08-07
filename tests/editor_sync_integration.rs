@@ -573,6 +573,23 @@ fn fetch_remote_one_returns_bytes_without_mutating_local_or_state() {
 }
 
 #[test]
+fn fetch_remote_one_rejects_an_unsafe_path_before_loading_config() {
+    let local = tempfile::tempdir().unwrap();
+    let config = local.path().join(".ferry.toml");
+    let rel = "../escape";
+    std::fs::write(&config, b"this is not valid TOML = [").unwrap();
+
+    let error = fetch_remote_one(&config, rel).unwrap_err();
+    let diagnostic = format!("{error:#}");
+
+    assert!(diagnostic.contains(rel), "got: {diagnostic}");
+    assert!(
+        diagnostic.contains("must be a relative path under local_root with no '..' segments"),
+        "got: {diagnostic}"
+    );
+}
+
+#[test]
 #[ignore]
 fn prepared_force_pull_installs_the_fetched_remote_and_updates_state() {
     let fixture = start_ftp();
@@ -585,10 +602,12 @@ fn prepared_force_pull_installs_the_fetched_remote_and_updates_state() {
     let equal_bytes = b"same bytes still require a forced install\n\0";
     let local_path = local.path().join(rel);
     let equal_local_path = local.path().join(equal_rel);
+    let retained_equal_link_path = local.path().join("prepared/retained-equal-link.txt");
     let state_path = local.path().join(".ferry/state.json");
     std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
     std::fs::write(&local_path, local_bytes).unwrap();
     std::fs::write(&equal_local_path, equal_bytes).unwrap();
+    std::fs::hard_link(&equal_local_path, &retained_equal_link_path).unwrap();
     seed_state(local.path(), rel, local_bytes);
     seed_state(local.path(), equal_rel, equal_bytes);
     let mut ftp =
@@ -635,6 +654,18 @@ fn prepared_force_pull_installs_the_fetched_remote_and_updates_state() {
     assert_eq!(equal_record.sha256, hash_bytes(equal_bytes));
     assert_eq!(equal_record.size, equal_bytes.len() as u64);
     assert_eq!(equal_record.remote_mtime, equal_remote_mtime);
+
+    let post_install_bytes = b"target mutation after physical install\n";
+    std::fs::write(&equal_local_path, post_install_bytes).unwrap();
+    assert_eq!(
+        std::fs::read(&equal_local_path).unwrap(),
+        post_install_bytes
+    );
+    assert_eq!(
+        std::fs::read(&retained_equal_link_path).unwrap(),
+        equal_bytes,
+        "force apply must replace the equal-content target, not leave the original hard link"
+    );
 }
 
 #[test]
@@ -690,13 +721,19 @@ fn prepared_force_pull_requires_a_remote_file() {
 
     let error = prepare_force_pull_one(&config, rel).unwrap_err();
 
-    assert!(format!("{error:#}").contains(rel));
+    assert!(
+        format!("{error:#}").contains(&format!("remote has no {rel}")),
+        "got: {error:#}"
+    );
     assert_eq!(std::fs::read(&local_path).unwrap(), local_bytes);
     assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
 
     let absent_error = prepare_force_pull_one(&config, absent_rel).unwrap_err();
 
-    assert!(format!("{absent_error:#}").contains(absent_rel));
+    assert!(
+        format!("{absent_error:#}").contains(&format!("remote has no {absent_rel}")),
+        "got: {absent_error:#}"
+    );
     assert!(!absent_local_path.exists());
     assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
 }
