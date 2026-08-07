@@ -21,10 +21,10 @@
 Run:
 
 ```bash
-jq -e '.base_keymap == "SublimeText"' /home/simon/.var/app/dev.zed.Zed/config/zed/settings.json
+rg -n '^[[:space:]]*"base_keymap"[[:space:]]*:[[:space:]]*"SublimeText"[[:space:]]*,?[[:space:]]*$' /home/simon/.var/app/dev.zed.Zed/config/zed/settings.json
 ```
 
-Expected: exit 0 and output `true`.
+Expected: exit 0 and exactly one matching line containing the SublimeText property.
 
 - [ ] **Step 2: Run the failing binding check**
 
@@ -134,4 +134,3 @@ With a C file inside `/home/simon/code/3s` focused, press `Ctrl+.` and confirm t
 - [ ] **Step 5: Record completion**
 
 No implementation commit is expected because `keymap.json` is personal configuration outside the Ferry repository. Record the exact validation results and leave the committed design and plan documents on durable `main`.
-
