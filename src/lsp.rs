@@ -1,6 +1,8 @@
 mod diff;
 mod document_state;
 
+use std::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -414,6 +416,28 @@ enum Work {
     },
 }
 
+#[derive(Debug)]
+struct ShutdownFailures {
+    protocol_error: anyhow::Error,
+    cleanup_error: anyhow::Error,
+}
+
+impl fmt::Display for ShutdownFailures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Ferry shutdown cleanup also failed: {:#}",
+            self.cleanup_error
+        )
+    }
+}
+
+impl Error for ShutdownFailures {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.protocol_error.as_ref())
+    }
+}
+
 struct Coordinator {
     documents: DocumentTracker,
     running: Arc<AtomicBool>,
@@ -453,12 +477,16 @@ impl Coordinator {
         if self.shutdown_complete {
             return result;
         }
-        match result {
-            Err(error) => Err(error),
-            Ok(()) => Err(self
-                .cleanup_error
-                .take()
-                .unwrap_or_else(|| anyhow::anyhow!("Ferry shutdown cleanup did not complete"))),
+        match (result, self.cleanup_error.take()) {
+            (Err(protocol_error), Some(cleanup_error)) => {
+                Err(anyhow::Error::new(ShutdownFailures {
+                    protocol_error,
+                    cleanup_error,
+                }))
+            }
+            (Err(protocol_error), None) => Err(protocol_error),
+            (Ok(()), Some(cleanup_error)) => Err(cleanup_error),
+            (Ok(()), None) => Err(anyhow::anyhow!("Ferry shutdown cleanup did not complete")),
         }
     }
 }
@@ -1967,11 +1995,31 @@ mod tests {
             )))
             .unwrap();
 
-        thread::sleep(Duration::from_millis(50));
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                247,
+                COMPILE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let barrier_messages = receive_request_messages(&client, 247, 2);
 
-        assert!(client.receiver.try_recv().is_err());
-        assert!(calls.lock().unwrap().is_empty());
-        finish_loop(&client, loop_thread, 244);
+        assert!(barrier_messages.iter().all(|message| !matches!(
+            message,
+            Message::Notification(notification)
+                if serde_json::from_value::<ShowMessageParams>(notification.params.clone())
+                    .is_ok_and(|params| params.typ == MessageType::WARNING)
+        )));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[Call::Compile {
+                config_path: fixture.config_path.clone(),
+                rel: "src/nested/hello world.c".to_string(),
+            }],
+            "compile feedback is a FIFO barrier behind the disabled open"
+        );
+        finish_loop(&client, loop_thread, 248);
     }
 
     #[test]
@@ -2095,6 +2143,95 @@ mod tests {
 
         coordinator.begin_shutdown();
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn main_loop_finish_preserves_both_protocol_and_cleanup_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_shutdown = Arc::clone(&attempts);
+        let shutdown = ShutdownBoundary {
+            shutdown: Arc::new(move || {
+                attempts_for_shutdown.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(anyhow!("snapshot cleanup failed"))
+            }),
+        };
+        let mut coordinator = Coordinator::new(Arc::new(AtomicBool::new(true)), shutdown);
+        coordinator.begin_shutdown();
+
+        let error = coordinator
+            .finish(Err(anyhow!("protocol loop failed")))
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        let combined = error
+            .downcast_ref::<ShutdownFailures>()
+            .expect("both failures must remain structurally accessible");
+
+        assert_eq!(
+            format!("{:#}", combined.protocol_error),
+            "protocol loop failed"
+        );
+        assert_eq!(
+            format!("{:#}", combined.cleanup_error),
+            "snapshot cleanup failed"
+        );
+        assert!(rendered.contains("protocol loop failed"), "{rendered}");
+        assert!(rendered.contains("snapshot cleanup failed"), "{rendered}");
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn main_loop_failing_shutdown_preserves_protocol_and_cleanup_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_shutdown = Arc::clone(&attempts);
+        let server = Server::with_shutdown(SendOperations, move || {
+            attempts_for_shutdown.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(anyhow!("snapshot cleanup failed"))
+        });
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread = thread::spawn(move || main_loop(server_connection, server));
+        send_shutdown_request(&client_connection, 249);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response");
+        assert!(response_with_id(shutdown, 249).error.is_none());
+        client_connection
+            .sender
+            .send(Message::Request(Request::new(
+                RequestId::from(250),
+                "unexpected/duringShutdown".to_string(),
+                (),
+            )))
+            .unwrap();
+
+        let error = loop_thread.join().unwrap().unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains("unexpected message during shutdown"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("snapshot cleanup failed"), "{rendered}");
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn main_loop_finish_preserves_single_protocol_or_cleanup_error() {
+        let protocol_error =
+            Coordinator::new(Arc::new(AtomicBool::new(true)), ShutdownBoundary::noop())
+                .finish(Err(anyhow!("protocol only")))
+                .unwrap_err();
+        assert_eq!(format!("{protocol_error:#}"), "protocol only");
+
+        let cleanup_error = Coordinator::new(
+            Arc::new(AtomicBool::new(true)),
+            ShutdownBoundary {
+                shutdown: Arc::new(|| Err(anyhow!("cleanup only"))),
+            },
+        )
+        .finish(Ok(()))
+        .unwrap_err();
+        assert_eq!(format!("{cleanup_error:#}"), "cleanup only");
     }
 
     #[test]
@@ -2351,12 +2488,14 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let operations = ShutdownBlockingOperations {
             calls: Arc::clone(&calls),
             started: started_tx,
             release: Arc::clone(&release),
             finished: finished_tx,
+            stopped: stopped_tx,
         };
         let shutdown_count = Arc::new(AtomicUsize::new(0));
         let shutdown_count_for_loop = Arc::clone(&shutdown_count);
@@ -2413,7 +2552,9 @@ mod tests {
         finished_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("blocked preparation should be released");
-        thread::sleep(Duration::from_millis(50));
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should exit after the blocked operation returns");
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[Call::Push {
@@ -2439,6 +2580,13 @@ mod tests {
         started: mpsc::SyncSender<()>,
         release: Arc<(Mutex<bool>, Condvar)>,
         finished: mpsc::SyncSender<()>,
+        stopped: mpsc::SyncSender<()>,
+    }
+
+    impl Drop for ShutdownBlockingOperations {
+        fn drop(&mut self) {
+            let _ = self.stopped.send(());
+        }
     }
 
     impl FileOperations for ShutdownBlockingOperations {
