@@ -137,7 +137,8 @@ mod prepared;
 
 pub use prepared::{
     LocalIdentity, PreparedPull, RemoteFile, apply_prepared_pull,
-    fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one,
+    apply_prepared_pull_if, fetch_remote_one, prepare_force_pull_one,
+    prepare_pull_one, pull_one,
 };
 ```
 
@@ -213,13 +214,39 @@ Expose only read-only accessors needed by the LSP.
 
 - [ ] **Step 4: Implement guarded application**
 
-`apply_prepared_pull` must:
+Implement `apply_prepared_pull_if`, taking a one-shot authorization closure,
+and make `apply_prepared_pull` the CLI-compatible wrapper that passes
+`|| true`. The guarded function must:
 
 1. reload config and reject a changed `local_root`;
 2. recapture `LocalIdentity` and return `Exit::Conflict` on mismatch;
-3. return stored no-op status without mutation; or
-4. in Apply mode, load state, atomically write bytes, record supplied
-   hash/size/mtime plus `Utc::now()`, and save state.
+3. load and validate state and compute the new state record;
+4. for an Install, write and flush only the existing sibling temporary file;
+5. recapture the saved local identity after all fallible preflight;
+6. call the authorization closure immediately before the no-op result or the
+   temporary-file rename;
+7. remove the staged temporary and return a conflict when authorization fails;
+   or
+8. rename atomically and save state after authorization succeeds.
+
+Use this shape so the LSP can place `OperationGuard::try_claim` at the actual
+commit boundary without making the command core depend on LSP types:
+
+```rust
+pub fn apply_prepared_pull_if<F>(
+    prepared: PreparedPull,
+    mode: ExecutionMode,
+    authorize: F,
+) -> Result<TransferOutcome>
+where
+    F: FnOnce() -> bool;
+```
+
+Split the existing write helper into `stage_local_write` plus a small
+`StagedLocalWrite::commit`. Keep `write_local_atomic` as the wrapper used by
+whole-tree Pull/Sync/Init. No config load, state load, hash, snapshot write, or
+other fallible preflight may occur after `authorize`; only the sibling rename
+and state save follow it.
 
 Extract a metadata-only helper in `pull.rs`:
 
@@ -240,8 +267,7 @@ fn record_download(
 }
 ```
 
-Have existing `download_one` call this helper after obtaining mtime. Keep
-`write_local_atomic` as the only local write.
+Have existing `download_one` call this helper after obtaining mtime.
 
 - [ ] **Step 5: Put `pull_one` behind prepare/apply**
 
@@ -364,7 +390,8 @@ git commit -m "feat: prepare guarded remote file installs"
 
 Declare `mod document_state;`. Test matching/differing didOpen text, claim
 exactly once, didChange cancelling all same-file guards, didSave allowing only
-new guards, didClose cancellation/removal, and other-file independence.
+new guards, didClose cancellation/removal, other-file independence, and
+dropping a tracker cancelling every still-pending guard.
 
 - [ ] **Step 2: Verify RED**
 
@@ -405,6 +432,7 @@ pub(crate) fn open(&mut self, path: PathBuf, text: &str) -> Result<()>;
 pub(crate) fn change(&mut self, path: &Path);
 pub(crate) fn save(&mut self, path: &Path);
 pub(crate) fn close(&mut self, path: &Path);
+pub(crate) fn cancel_all(&mut self);
 pub(crate) fn begin_clean_operation(
     &mut self,
     path: &Path,
@@ -413,7 +441,10 @@ pub(crate) fn begin_clean_operation(
 
 `open` compares text bytes with disk. `change` increments revision, marks
 dirty, and cancels PENDING guards. `save` increments revision and marks clean.
-`close` cancels/removes. Missing tracking is an error.
+`close` cancels/removes. `cancel_all` cancels every live PENDING guard, and
+`Drop for DocumentTracker` calls it so shutdown, disconnect, and every early
+protocol-loop return invalidate detached-worker work. Missing tracking is an
+error.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -441,8 +472,9 @@ replace locking with unsafe broad cleanup.
 
 Test unique safe suffixes, exact bytes, Unix read-only mode, traversal
 containment, unretained deletion, retained lifetime, unlocked stale-root
-cleanup, locked-root preservation, and exact command arguments
-`zed --diff local remote`.
+cleanup, locked-root preservation, explicit shutdown removing the process root
+while worker-side clones still exist, post-shutdown creation/retention refusal,
+and exact command arguments `zed --diff local remote`.
 
 - [ ] **Step 3: Verify RED**
 
@@ -454,15 +486,29 @@ Expected: missing snapshot store/launcher.
 
 - [ ] **Step 4: Implement safe roots and snapshots**
 
-Create a `tempfile::TempDir` with exact prefix `ferry-lsp-diff-v1-`. Create
-and exclusively lock `.lock` for store lifetime. On startup, scan only direct
-temp-root children with that prefix; reject symlinks/non-directories, and
-remove a candidate only after exclusively locking its `.lock`. Never remove
-the platform temp root or an unresolved path.
+Implement a cloneable `SharedSnapshotStore` around an `Arc` whose inner
+state owns the process root, exclusive `.lock`, retained snapshots, a mutex,
+and a closed flag. It exposes a lightweight `SnapshotShutdown` handle retained
+by the protocol thread. `shutdown()` marks the store closed, drops retained
+files and the lock, and removes the exact process root even while a detached
+worker still owns a clone. Worker calls after closure fail safely.
+
+Create a `tempfile::TempDir` with exact prefix `ferry-lsp-diff-v1-` and lock
+`.lock` for store lifetime. On startup, scan only direct temp-root children
+with that prefix; reject symlinks/non-directories, and remove a candidate only
+after exclusively locking its `.lock`. Never remove the platform temp root or
+an unresolved path.
 
 Use `NamedTempFile` under the locked root with `remote-` plus a sanitized
 alphanumeric extension. Flush bytes, make read-only on Unix, return an owning
-`PreparedSnapshot`, retain only after successful launch.
+`PreparedSnapshot`, and retain only after successful launch.
+
+Provide `launch_and_retain` on the shared store. It holds the store mutex only
+for the bounded final critical section: confirm the store is open, claim the
+operation guard, spawn Zed, and retain the snapshot. FTP retrieval, snapshot
+writing, and local-identity preflight occur outside this mutex. Shutdown can
+therefore wait only for a short process-spawn section, never for FTP or a user
+prompt. If shutdown wins first, launch is refused and the snapshot drops.
 
 - [ ] **Step 5: Implement the launcher seam**
 
@@ -508,7 +554,9 @@ git commit -m "feat: prepare private Zed diff snapshots"
 Add didChange/didClose helpers. Expect `TextDocumentSyncKind::INCREMENTAL`.
 Add memory-loop tests proving matching open permits Pull, differing open and
 didChange refuse without operations, didSave permits a new Pull, and didClose
-makes stale commands fail safely.
+makes stale commands fail safely. Also block a guarded operation in preparation,
+shut down the protocol loop, release the worker, and assert that tracker drop
+cancelled the guard so no later write or diff launch occurs.
 
 - [ ] **Step 2: Verify RED**
 
@@ -530,6 +578,12 @@ didClose  -> tracker.close(path), no FTP work
 
 Malformed/non-file notifications never clear dirty state. Worker still
 re-resolves project/config before automatic work.
+
+Before moving `Server` into the detached worker, `main_loop` obtains its
+snapshot shutdown handle. Every protocol-loop exit first drops
+`DocumentTracker` (cancelling pending guards), then calls that handle, then
+marks the worker loop stopped. Cover shutdown requests, channel disconnects,
+and error returns through the same cleanup path.
 
 - [ ] **Step 4: Guard manual and automatic Pull acceptance**
 
@@ -590,29 +644,40 @@ cargo test compare_
 
 - [ ] **Step 3: Construct a fallible production runtime**
 
-Turn `FerryOperations` into a struct containing `SnapshotStore` and
-`Box<dyn DiffLauncher>`:
+Turn `FerryOperations` into a struct containing a clone of
+`SharedSnapshotStore` and `Box<dyn DiffLauncher>`. Extend the operations
+boundary with a default no-op shutdown handle for fakes; production returns a
+`SnapshotShutdown` clone:
 
 ```rust
 impl FerryOperations {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            snapshots: SnapshotStore::new()?,
+            snapshots: SharedSnapshotStore::new()?,
             launcher: Box::new(ZedDiffLauncher),
         })
+    }
+
+    fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle::Snapshots(self.snapshots.shutdown_handle())
     }
 }
 ```
 
-Update the binary to `Server::new(FerryOperations::new()?)`.
+`main_loop` clones the handle before moving operations into the detached
+worker and runs it on every protocol exit. Update the binary to
+`Server::new(FerryOperations::new()?)`.
 
 - [ ] **Step 4: Implement Compare on the worker**
 
-Capture local identity, call `fetch_remote_one`, create snapshot, claim guard
-immediately before launch, recapture/compare local identity, launch local first
-and snapshot second, retain snapshot only after spawn. Map cancelled guards to
-save-and-retry, not generic transport. Worker owns FTP/file/spawn work;
-protocol remains responsive.
+Capture local identity, call `fetch_remote_one`, create the snapshot, then
+recapture/compare local identity while the guard is still cancellable. Pass the
+prepared snapshot into `SharedSnapshotStore::launch_and_retain`; inside its
+short final critical section, check that shutdown has not closed the store,
+claim the guard, immediately spawn local first and snapshot second, and retain
+only after spawn. No config, state, hash, identity, or snapshot preflight occurs
+after the claim. Map cancellation to save-and-retry, not generic transport.
+Worker owns FTP/file/spawn work; protocol remains responsive.
 
 - [ ] **Step 5: Add command parsing and feedback**
 
@@ -628,7 +693,10 @@ Safe errors never expose config/auth details.
 - [ ] **Step 6: Verify the asynchronous edit race**
 
 Block fake retrieval, send didChange, release, then assert immediate command
-response, no launch/mutation, one warning, and prompt shutdown.
+response, no launch/mutation, one warning, and prompt shutdown. In a second
+case, shut down while retrieval is blocked, release it afterward, and prove
+tracker drop plus snapshot shutdown prevents a late launch and removes the
+exact process snapshot root.
 
 - [ ] **Step 7: Verify and commit**
 
@@ -672,18 +740,25 @@ fn prepare_pull(
     force: bool,
 ) -> Result<PreparedPull>;
 
-fn apply_pull(&mut self, prepared: PreparedPull) -> Result<TransferOutcome>;
+fn apply_pull(
+    &mut self,
+    prepared: PreparedPull,
+    guard: OperationGuard,
+) -> Result<TransferOutcome>;
 ```
 
-Production delegates to `prepare_pull_one` and
-`apply_prepared_pull(..., ExecutionMode::Apply)`.
+Production delegates to `prepare_pull_one` and then
+`apply_prepared_pull_if(prepared, ExecutionMode::Apply, || guard.try_claim())`.
+The fake seam must model the same late-claim ordering.
 
 - [ ] **Step 4: Claim at the final worker boundary**
 
-Prepare without mutation, call `guard.try_claim()` immediately before apply,
-drop/warn on failure, otherwise call core apply which independently checks disk
-identity. Always claim/revalidate even for a no-op outcome so an edit during
-remote preparation is reported as refusal.
+Prepare without mutation, then pass both the prepared value and still-PENDING
+guard to `apply_pull`. The core performs config, state, staged-write, and local
+identity preflight first; its authorization closure claims the guard immediately
+before the no-op result or atomic rename. If an edit or shutdown cancels first,
+the staged temporary is removed and no local/state mutation occurs. Always use
+this path for no-op outcomes so an edit during remote preparation is refused.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -760,17 +835,21 @@ ignore its later response.
 - [ ] **Step 5: Handle responses safely**
 
 For a matching response, deserialize `Option<MessageActionItem>`; require
-exact affirmative title, treat everything else as cancellation, re-resolve
-project/file, and queue apply only while the guard is pending. Worker claims
-immediately before `apply_prepared_pull`. Success uses transferred feedback;
-guard/identity failure uses save-and-retry/conflict feedback. Unknown IDs remain
-ignored.
+the exact affirmative title, treat everything else as cancellation, re-resolve
+project/file, and queue both the prepared value and still-PENDING guard. The
+worker calls `apply_pull(prepared, guard)`; production core finishes all
+config/state/staged-write/local-identity preflight and claims inside
+`apply_prepared_pull_if` immediately before rename. Success uses transferred
+feedback; guard/identity failure uses save-and-retry/conflict feedback. Unknown
+IDs remain ignored.
 
 - [ ] **Step 6: Preserve responsiveness**
 
 Extend blocked-worker tests so Code Actions, command acknowledgements,
 confirmation responses, and shutdown continue while FTP preparation is
-blocked. Worker retains no LSP sender clone.
+blocked. In particular, shut down with force preparation blocked, release it
+after protocol exit, and assert tracker drop prevents a late confirmation or
+write. Worker retains no LSP sender clone.
 
 - [ ] **Step 7: Verify and commit**
 
@@ -887,6 +966,8 @@ the process/action labels but may not invoke a 3S network action.
 - [ ] Both automatic editor settings default false; explicit project values remain authoritative.
 - [ ] Zed advertises the five actions in approved order.
 - [ ] Compare launches `zed --diff <local> <snapshot>` and changes no project/state data.
+- [ ] Guard claims happen after all preflight and immediately before rename or Zed spawn.
+- [ ] Protocol shutdown cancels pending operations and explicitly removes the snapshot root even if the detached worker is blocked.
 - [ ] Pull, Compare, and Force Pull reject initial dirtiness and edits during preparation.
 - [ ] Force Pull applies only after exact affirmative response and local identity recheck.
 - [ ] Cancel/dismissal/unknown response/shutdown/race/failure preserve local bytes and state.
