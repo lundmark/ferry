@@ -109,10 +109,15 @@ struct OwnedRoot {
     lock_file: Option<File>,
     lock_identity: Option<Handle>,
     quarantine: Option<Quarantine>,
+    deletion_started: bool,
     #[cfg(test)]
     fail_after_move: bool,
     #[cfg(test)]
     fail_next_delete: bool,
+    #[cfg(test)]
+    fail_after_lock_removal: bool,
+    #[cfg(test)]
+    fail_after_root_removal: bool,
 }
 
 enum RootLocation {
@@ -125,6 +130,11 @@ enum RootLocation {
 struct Quarantine {
     path: PathBuf,
     identity: Option<Handle>,
+}
+
+struct VerifiedQuarantinedOwnership {
+    root_present: bool,
+    lock_present: bool,
 }
 
 pub(crate) struct PreparedSnapshot {
@@ -196,10 +206,15 @@ impl OwnedRoot {
             lock_file: Some(lock_file),
             lock_identity: Some(lock_identity),
             quarantine: None,
+            deletion_started: false,
             #[cfg(test)]
             fail_after_move: false,
             #[cfg(test)]
             fail_next_delete: false,
+            #[cfg(test)]
+            fail_after_lock_removal: false,
+            #[cfg(test)]
+            fail_after_root_removal: false,
         })
     }
 
@@ -352,12 +367,16 @@ impl OwnedRoot {
             RootLocation::QuarantinedUnverified(path) => path.clone(),
             _ => return Ok(()),
         };
-        self.verify_quarantined_ownership(&moved_root)?;
+        self.verify_quarantined_ownership(&moved_root, false)?;
         self.location = RootLocation::QuarantinedVerified(moved_root);
         Ok(())
     }
 
-    fn verify_quarantined_ownership(&self, moved_root: &Path) -> Result<()> {
+    fn verify_quarantined_ownership(
+        &self,
+        moved_root: &Path,
+        allow_missing: bool,
+    ) -> Result<VerifiedQuarantinedOwnership> {
         self.verify_quarantine_identity()?;
         let quarantine_path = self
             .quarantine
@@ -369,17 +388,40 @@ impl OwnedRoot {
             moved_root.parent() == Some(quarantine_path.as_path()),
             "quarantined private snapshot root is misplaced"
         );
+
+        let expected_root = self
+            .root_identity
+            .as_ref()
+            .context("private snapshot root identity is unavailable")?;
+        let lock_file = self
+            .lock_file
+            .as_ref()
+            .context("private snapshot lock is unavailable")?;
+        let expected_lock = self
+            .lock_identity
+            .as_ref()
+            .context("private snapshot lock identity is unavailable")?;
+
+        let root_present = match fs::symlink_metadata(moved_root) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound && allow_missing => false,
+            Err(error) => {
+                return Err(error).context("inspecting quarantined private snapshot root");
+            }
+        };
+        if !root_present {
+            return Ok(VerifiedQuarantinedOwnership {
+                root_present: false,
+                lock_present: false,
+            });
+        }
+
         validate_active_root(moved_root)?;
         ensure!(
             fs::canonicalize(moved_root).context("resolving quarantined private snapshot root")?
                 == moved_root,
             "quarantined private snapshot root does not resolve to itself"
         );
-
-        let expected_root = self
-            .root_identity
-            .as_ref()
-            .context("private snapshot root identity is unavailable")?;
         let current_root = Handle::from_path(moved_root)
             .context("rechecking moved private snapshot root identity")?;
         ensure!(
@@ -388,22 +430,27 @@ impl OwnedRoot {
         );
 
         let moved_lock = moved_root.join(LOCK_NAME);
-        let lock_file = self
-            .lock_file
-            .as_ref()
-            .context("private snapshot lock is unavailable")?;
-        validate_lock_path(moved_root, &moved_lock, lock_file)?;
-        let expected_lock = self
-            .lock_identity
-            .as_ref()
-            .context("private snapshot lock identity is unavailable")?;
-        let current_lock = Handle::from_path(&moved_lock)
-            .context("rechecking moved private snapshot lock identity")?;
-        ensure!(
-            &current_lock == expected_lock,
-            "moved private snapshot lock identity does not match its owner"
-        );
-        Ok(())
+        let lock_present = match fs::symlink_metadata(&moved_lock) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::NotFound && allow_missing => false,
+            Err(error) => {
+                return Err(error).context("inspecting quarantined private snapshot lock");
+            }
+        };
+        if lock_present {
+            validate_lock_path(moved_root, &moved_lock, lock_file)?;
+            let current_lock = Handle::from_path(&moved_lock)
+                .context("rechecking moved private snapshot lock identity")?;
+            ensure!(
+                &current_lock == expected_lock,
+                "moved private snapshot lock identity does not match its owner"
+            );
+        }
+
+        Ok(VerifiedQuarantinedOwnership {
+            root_present: true,
+            lock_present,
+        })
     }
 
     fn delete_verified_quarantine(&mut self) -> Result<()> {
@@ -411,7 +458,7 @@ impl OwnedRoot {
             RootLocation::QuarantinedVerified(path) => path.clone(),
             _ => return Err(anyhow!("private snapshot quarantine is not verified")),
         };
-        self.verify_quarantined_ownership(&moved_root)?;
+        let ownership = self.verify_quarantined_ownership(&moved_root, self.deletion_started)?;
         let quarantine = self
             .quarantine
             .as_ref()
@@ -425,14 +472,48 @@ impl OwnedRoot {
             return Err(anyhow!("injected cleanup failure"));
         }
 
-        prepare_tree_for_removal(&quarantine)?;
-        fs::remove_dir_all(&quarantine).with_context(|| {
+        if ownership.root_present {
+            prepare_tree_for_removal(&moved_root)?;
+        }
+        self.deletion_started = true;
+
+        let moved_lock = moved_root.join(LOCK_NAME);
+        if ownership.lock_present {
+            fs::remove_file(&moved_lock).with_context(|| {
+                format!(
+                    "removing verified private snapshot lock {}",
+                    moved_lock.display()
+                )
+            })?;
+            #[cfg(test)]
+            if self.fail_after_lock_removal {
+                self.fail_after_lock_removal = false;
+                return Err(anyhow!("injected failure after lock removal"));
+            }
+        }
+
+        if ownership.root_present {
+            fs::remove_dir_all(&moved_root).with_context(|| {
+                format!(
+                    "removing verified private snapshot root {}",
+                    moved_root.display()
+                )
+            })?;
+            #[cfg(test)]
+            if self.fail_after_root_removal {
+                self.fail_after_root_removal = false;
+                return Err(anyhow!("injected failure after root removal"));
+            }
+        }
+
+        fs::remove_dir(&quarantine).with_context(|| {
             format!(
                 "removing verified private snapshot quarantine {}",
                 quarantine.display()
             )
         })?;
         self.location = RootLocation::Complete;
+        self.deletion_started = false;
         self.root_identity = None;
         self.lock_identity = None;
         self.lock_file = None;
@@ -466,6 +547,16 @@ impl OwnedRoot {
     #[cfg(test)]
     fn fail_next_delete_for_test(&mut self) {
         self.fail_next_delete = true;
+    }
+
+    #[cfg(test)]
+    fn fail_after_lock_removal_for_test(&mut self) {
+        self.fail_after_lock_removal = true;
+    }
+
+    #[cfg(test)]
+    fn fail_after_root_removal_for_test(&mut self) {
+        self.fail_after_root_removal = true;
     }
 }
 
@@ -851,12 +942,28 @@ fn validate_prepared_snapshot(root: &Path, snapshot: &PreparedSnapshot) -> Resul
 }
 
 fn cleanup_stale_roots(base: &Path) -> Result<()> {
-    cleanup_stale_roots_with_hook(base, |_, _| {})
+    cleanup_stale_roots_with_hooks(base, |_, _| {}, |_, root| root.cleanup())
 }
 
 fn cleanup_stale_roots_with_hook(
     base: &Path,
+    after_initial_identity: impl FnMut(&Path, &Path),
+) -> Result<()> {
+    cleanup_stale_roots_with_hooks(base, after_initial_identity, |_, root| root.cleanup())
+}
+
+#[cfg(test)]
+fn cleanup_stale_roots_with_candidate_cleanup(
+    base: &Path,
+    cleanup_candidate: impl FnMut(&Path, &mut OwnedRoot) -> Result<()>,
+) -> Result<()> {
+    cleanup_stale_roots_with_hooks(base, |_, _| {}, cleanup_candidate)
+}
+
+fn cleanup_stale_roots_with_hooks(
+    base: &Path,
     mut after_initial_identity: impl FnMut(&Path, &Path),
+    mut cleanup_candidate: impl FnMut(&Path, &mut OwnedRoot) -> Result<()>,
 ) -> Result<()> {
     for entry in fs::read_dir(base).context("reading private snapshot temporary base")? {
         let Ok(entry) = entry else {
@@ -949,12 +1056,9 @@ fn cleanup_stale_roots_with_hook(
         ) else {
             continue;
         };
-        root.cleanup().with_context(|| {
-            format!(
-                "cleaning stale private snapshot root {}",
-                candidate.display()
-            )
-        })?;
+        if cleanup_candidate(&candidate, &mut root).is_err() {
+            continue;
+        }
     }
     Ok(())
 }
@@ -1238,6 +1342,43 @@ mod tests {
         assert!(!stale.exists());
         assert!(store.root_path().unwrap().exists());
         shutdown.shutdown().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn stale_scanner_continues_after_one_candidate_cleanup_fails() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let preserved = recognizable_root(&canonical_base, "preservedfailure");
+        let removable = recognizable_root(&canonical_base, "removable");
+        fs::write(preserved.join("preserved-sentinel"), b"preserve").unwrap();
+        fs::write(removable.join("remove-sentinel"), b"remove").unwrap();
+        let mut injected = false;
+
+        let scan_result = super::cleanup_stale_roots_with_candidate_cleanup(
+            &canonical_base,
+            |candidate, root| {
+                if candidate == preserved {
+                    injected = true;
+                    Err(anyhow::anyhow!("injected per-candidate cleanup failure"))
+                } else {
+                    root.cleanup()
+                }
+            },
+        );
+
+        assert!(
+            scan_result.is_ok(),
+            "candidate failure escaped scanner: {:#}",
+            scan_result.unwrap_err()
+        );
+        assert!(injected);
+        assert_eq!(
+            fs::read(preserved.join("preserved-sentinel")).unwrap(),
+            b"preserve"
+        );
+        assert!(!removable.exists());
+        assert!(super::cleanup_stale_roots(&canonical_base.join("missing-base")).is_err());
     }
 
     #[cfg(any(unix, windows))]
@@ -1677,6 +1818,73 @@ mod tests {
         assert!(!pending.exists());
         assert!(shutdown.pending_cleanup_path_for_test().unwrap().is_none());
         shutdown.shutdown().unwrap();
+    }
+
+    #[test]
+    fn verified_cleanup_recovers_after_failure_after_lock_removal() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "partiallock");
+        fs::write(candidate.join("snapshot"), b"snapshot").unwrap();
+        let mut owned = captured_root(&canonical_base, &candidate);
+        owned.fail_after_lock_removal_for_test();
+
+        let error = owned.cleanup().unwrap_err();
+        let quarantine = owned.quarantine_path_for_test().unwrap().to_path_buf();
+        let moved_root = owned.cleanup_path_for_test().to_path_buf();
+
+        assert!(format!("{error:#}").contains("after lock removal"));
+        assert!(quarantine.exists());
+        assert!(moved_root.exists());
+        assert!(!moved_root.join(super::LOCK_NAME).exists());
+        assert_eq!(fs::read(moved_root.join("snapshot")).unwrap(), b"snapshot");
+
+        fs::write(moved_root.join(super::LOCK_NAME), b"replacement lock").unwrap();
+        let mismatch = owned.cleanup().unwrap_err();
+        assert!(format!("{mismatch:#}").contains("identity"));
+        assert_eq!(
+            fs::read(moved_root.join(super::LOCK_NAME)).unwrap(),
+            b"replacement lock"
+        );
+        fs::remove_file(moved_root.join(super::LOCK_NAME)).unwrap();
+
+        owned.cleanup().unwrap();
+
+        assert!(!quarantine.exists());
+        assert!(owned.is_cleanup_complete_for_test());
+    }
+
+    #[test]
+    fn verified_cleanup_recovers_after_failure_after_root_removal() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "partialroot");
+        fs::write(candidate.join("snapshot"), b"snapshot").unwrap();
+        let mut owned = captured_root(&canonical_base, &candidate);
+        owned.fail_after_root_removal_for_test();
+
+        let error = owned.cleanup().unwrap_err();
+        let quarantine = owned.quarantine_path_for_test().unwrap().to_path_buf();
+        let moved_root = owned.cleanup_path_for_test().to_path_buf();
+
+        assert!(format!("{error:#}").contains("after root removal"));
+        assert!(quarantine.exists());
+        assert!(!moved_root.exists());
+
+        fs::create_dir(&moved_root).unwrap();
+        fs::write(moved_root.join("replacement-sentinel"), b"must survive").unwrap();
+        let mismatch = owned.cleanup().unwrap_err();
+        assert!(format!("{mismatch:#}").contains("identity"));
+        assert_eq!(
+            fs::read(moved_root.join("replacement-sentinel")).unwrap(),
+            b"must survive"
+        );
+        fs::remove_dir_all(&moved_root).unwrap();
+
+        owned.cleanup().unwrap();
+
+        assert!(!quarantine.exists());
+        assert!(owned.is_cleanup_complete_for_test());
     }
 
     #[cfg(any(unix, windows))]
