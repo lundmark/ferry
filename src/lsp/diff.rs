@@ -460,8 +460,9 @@ fn same_file_identity(path_metadata: &Metadata, opened_metadata: &Metadata) -> b
 }
 
 #[cfg(not(unix))]
-fn same_file_identity(path_metadata: &Metadata, opened_metadata: &Metadata) -> bool {
-    path_metadata.file_type().is_file() && opened_metadata.file_type().is_file()
+fn same_file_identity(_path_metadata: &Metadata, _opened_metadata: &Metadata) -> bool {
+    // Without stable, verified file identity fields, stale cleanup must fail closed.
+    false
 }
 
 #[cfg(test)]
@@ -718,6 +719,7 @@ mod tests {
         shutdown.shutdown().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn startup_removes_a_recognizable_unlocked_stale_root() {
         let base = tempdir().unwrap();
@@ -729,6 +731,20 @@ mod tests {
 
         assert!(!stale.exists());
         assert!(store.root_path().unwrap().exists());
+        shutdown.shutdown().unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn startup_preserves_an_unlocked_stale_root_without_exact_file_identity() {
+        let base = tempdir().unwrap();
+        let stale = recognizable_root(base.path(), "stale123");
+        fs::write(stale.join("snapshot"), b"old").unwrap();
+
+        let (_store, shutdown) = store_in(&base);
+
+        assert!(stale.exists());
+        assert_eq!(fs::read(stale.join("snapshot")).unwrap(), b"old");
         shutdown.shutdown().unwrap();
     }
 
@@ -999,5 +1015,53 @@ mod tests {
         let root = recognizable_root(base.path(), "regularlock");
         let lock = File::open(root.join(".lock")).unwrap();
         assert!(lock.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn distinct_regular_files_never_have_the_same_identity() {
+        let base = tempdir().unwrap();
+        let first = base.path().join("first");
+        let second = base.path().join("second");
+        fs::write(&first, b"same bytes").unwrap();
+        fs::write(&second, b"same bytes").unwrap();
+        let first_metadata = fs::metadata(first).unwrap();
+        let second_metadata = fs::metadata(second).unwrap();
+
+        assert!(!super::same_file_identity(
+            &first_metadata,
+            &second_metadata
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_candidate_revalidation_rejects_a_replaced_lock_path() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "swappedlock");
+        let resolved_candidate = fs::canonicalize(&candidate).unwrap();
+        let lock_path = candidate.join(".lock");
+        let original_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        FileExt::lock_exclusive(&original_lock).unwrap();
+
+        let replacement = candidate.join("replacement");
+        fs::write(&replacement, b"different regular file").unwrap();
+        fs::rename(&replacement, &lock_path).unwrap();
+
+        assert!(!super::revalidate_stale_candidate(
+            &canonical_base,
+            &candidate,
+            &resolved_candidate,
+            &lock_path,
+            &original_lock,
+        ));
+        assert!(candidate.exists());
+        assert_eq!(fs::read(&lock_path).unwrap(), b"different regular file");
+
+        FileExt::unlock(&original_lock).unwrap();
     }
 }
