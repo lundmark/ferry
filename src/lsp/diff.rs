@@ -348,11 +348,17 @@ impl OwnedRoot {
     }
 
     fn verify_quarantined_root(&mut self) -> Result<()> {
-        self.verify_quarantine_identity()?;
         let moved_root = match &self.location {
             RootLocation::QuarantinedUnverified(path) => path.clone(),
             _ => return Ok(()),
         };
+        self.verify_quarantined_ownership(&moved_root)?;
+        self.location = RootLocation::QuarantinedVerified(moved_root);
+        Ok(())
+    }
+
+    fn verify_quarantined_ownership(&self, moved_root: &Path) -> Result<()> {
+        self.verify_quarantine_identity()?;
         let quarantine_path = self
             .quarantine
             .as_ref()
@@ -363,9 +369,9 @@ impl OwnedRoot {
             moved_root.parent() == Some(quarantine_path.as_path()),
             "quarantined private snapshot root is misplaced"
         );
-        validate_active_root(&moved_root)?;
+        validate_active_root(moved_root)?;
         ensure!(
-            fs::canonicalize(&moved_root).context("resolving quarantined private snapshot root")?
+            fs::canonicalize(moved_root).context("resolving quarantined private snapshot root")?
                 == moved_root,
             "quarantined private snapshot root does not resolve to itself"
         );
@@ -374,8 +380,8 @@ impl OwnedRoot {
             .root_identity
             .as_ref()
             .context("private snapshot root identity is unavailable")?;
-        let current_root = Handle::from_path(&moved_root)
-            .context("capturing moved private snapshot root identity")?;
+        let current_root = Handle::from_path(moved_root)
+            .context("rechecking moved private snapshot root identity")?;
         ensure!(
             &current_root == expected_root,
             "moved private snapshot root identity does not match its owner"
@@ -386,31 +392,26 @@ impl OwnedRoot {
             .lock_file
             .as_ref()
             .context("private snapshot lock is unavailable")?;
-        validate_lock_path(&moved_root, &moved_lock, lock_file)?;
+        validate_lock_path(moved_root, &moved_lock, lock_file)?;
         let expected_lock = self
             .lock_identity
             .as_ref()
             .context("private snapshot lock identity is unavailable")?;
         let current_lock = Handle::from_path(&moved_lock)
-            .context("capturing moved private snapshot lock identity")?;
+            .context("rechecking moved private snapshot lock identity")?;
         ensure!(
             &current_lock == expected_lock,
             "moved private snapshot lock identity does not match its owner"
         );
-
-        self.location = RootLocation::QuarantinedVerified(moved_root);
-        // The private quarantine is now the retryable ownership boundary.
-        // Release open handles only after both identities have matched.
-        self.root_identity = None;
-        self.lock_identity = None;
-        self.lock_file = None;
-        if let Some(quarantine) = &mut self.quarantine {
-            quarantine.identity = None;
-        }
         Ok(())
     }
 
     fn delete_verified_quarantine(&mut self) -> Result<()> {
+        let moved_root = match &self.location {
+            RootLocation::QuarantinedVerified(path) => path.clone(),
+            _ => return Err(anyhow!("private snapshot quarantine is not verified")),
+        };
+        self.verify_quarantined_ownership(&moved_root)?;
         let quarantine = self
             .quarantine
             .as_ref()
@@ -432,6 +433,9 @@ impl OwnedRoot {
             )
         })?;
         self.location = RootLocation::Complete;
+        self.root_identity = None;
+        self.lock_identity = None;
+        self.lock_file = None;
         self.quarantine = None;
         Ok(())
     }
@@ -1673,6 +1677,43 @@ mod tests {
         assert!(!pending.exists());
         assert!(shutdown.pending_cleanup_path_for_test().unwrap().is_none());
         shutdown.shutdown().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn verified_quarantine_retry_rejects_a_replaced_path_without_deleting_it() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "retryreplace");
+        let mut owned = captured_root(&canonical_base, &candidate);
+        owned.fail_next_delete_for_test();
+
+        let first_error = owned.cleanup().unwrap_err();
+        let quarantine = owned.quarantine_path_for_test().unwrap().to_path_buf();
+        let renamed_original = canonical_base.join("retry-original-quarantine");
+
+        assert!(format!("{first_error:#}").contains("injected cleanup failure"));
+        assert!(quarantine.exists());
+        fs::rename(&quarantine, &renamed_original).unwrap();
+        fs::create_dir(&quarantine).unwrap();
+        fs::create_dir(quarantine.join("unrelated")).unwrap();
+        fs::write(
+            quarantine.join("unrelated").join("replacement-sentinel"),
+            b"must survive",
+        )
+        .unwrap();
+
+        let retry_error = owned.cleanup().unwrap_err();
+
+        assert!(format!("{retry_error:#}").contains("identity"));
+        assert_eq!(
+            fs::read(quarantine.join("unrelated").join("replacement-sentinel")).unwrap(),
+            b"must survive"
+        );
+        assert!(renamed_original.join(super::QUARANTINED_ROOT_NAME).exists());
+        drop(owned);
+        assert!(quarantine.exists());
+        assert!(renamed_original.exists());
     }
 
     #[test]
