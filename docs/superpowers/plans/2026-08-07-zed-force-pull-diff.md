@@ -555,8 +555,10 @@ Add didChange/didClose helpers. Expect `TextDocumentSyncKind::INCREMENTAL`.
 Add memory-loop tests proving matching open permits Pull, differing open and
 didChange refuse without operations, didSave permits a new Pull, and didClose
 makes stale commands fail safely. Also block a guarded operation in preparation,
-shut down the protocol loop, release the worker, and assert that tracker drop
-cancelled the guard so no later write or diff launch occurs.
+send a `shutdown` request without sending `exit` yet, observe immediate guard
+and snapshot cancellation, release the worker, and assert that no later write or
+diff launch occurs. Send `exit` only after proving cleanup happened during the
+shutdown handshake.
 
 - [ ] **Step 2: Verify RED**
 
@@ -580,10 +582,17 @@ Malformed/non-file notifications never clear dirty state. Worker still
 re-resolves project/config before automatic work.
 
 Before moving `Server` into the detached worker, `main_loop` obtains its
-snapshot shutdown handle. Every protocol-loop exit first drops
-`DocumentTracker` (cancelling pending guards), then calls that handle, then
-marks the worker loop stopped. Cover shutdown requests, channel disconnects,
-and error returns through the same cleanup path.
+snapshot shutdown handle. Add an idempotent coordinator method
+`begin_shutdown` that cancels all document guards and pending Force Pull
+slots, closes/removes the shared snapshot root, and marks the worker loop
+stopped.
+
+When a `shutdown` request is received, call `begin_shutdown` **before**
+`Connection::handle_shutdown`; that helper may wait for the later `exit`
+notification, so cleanup cannot be deferred until it returns. Call the same
+idempotent method again on channel disconnect, protocol error, and final loop
+exit. Tests must hold back `exit` long enough to prove a blocked detached
+operation is cancelled as soon as `shutdown` is processed.
 
 - [ ] **Step 4: Guard manual and automatic Pull acceptance**
 
@@ -794,8 +803,13 @@ Add `FORCE_PULL_COMMAND = "ferry.forcePull"`. Final exact action order:
 
 Test: prepare-before-response, exact warning request/actions, affirmative apply
 once, Cancel/null/malformed/unknown no-op, didChange cancellation, saved-local
-mismatch, same-file supersession, independent different files, and shutdown
-dropping pending confirmations.
+mismatch, immediate same-file supersession at second-command acceptance,
+independent different files, and shutdown dropping pending confirmations.
+
+Cover both supersession races: (a) the first prompt exists while the second
+preparation is blocked, then an affirmative response to the first applies
+nothing; and (b) the first preparation is blocked when the second command is
+accepted, then releasing the first produces no prompt.
 
 - [ ] **Step 2: Verify RED**
 
@@ -813,6 +827,7 @@ enum WorkerEvent {
 }
 
 struct PendingForcePull {
+    operation_id: u64,
     absolute_path: PathBuf,
     relative_path: String,
     prepared: PreparedPull,
@@ -821,16 +836,27 @@ struct PendingForcePull {
 ```
 
 Worker runs `prepare_force_pull_one`, never waits for Zed, and never writes
-while preparing.
+while preparing. Its ready event carries the internal operation ID so the
+coordinator can discard a superseded preparation result before showing a
+prompt.
 
 - [ ] **Step 4: Send/correlate native requests**
 
-Coordinator owns a monotonic counter, `HashMap<RequestId, PendingForcePull>`,
-and path-to-ID map. Use string IDs `ferry-force-pull-N`.
-Build warning-level `ShowMessageRequestParams` with exact actions
-`Overwrite local file` and `Cancel`, using
-`ShowMessageRequest::METHOD`. Supersede/cancel older same-file pending data;
-ignore its later response.
+Coordinator owns a monotonic internal operation counter, a server-request
+counter, pending request map, and one current Force Pull slot per absolute path.
+The path slot exists from command acceptance through preparation, prompt, and
+application.
+
+When a Force Pull command is accepted, synchronously cancel/remove the prior
+same-path slot and its pending request **before** queueing the new preparation;
+then register the new operation ID and guard. A `ForcePullReady` event is
+eligible to show a prompt only when its ID still matches the current path slot.
+This makes supersession independent of FTP completion order.
+
+Use string server-request IDs `ferry-force-pull-N`. Build warning-level
+`ShowMessageRequestParams` with exact actions `Overwrite local file` and
+`Cancel`, using `ShowMessageRequest::METHOD`. A response to a removed older
+prompt is unknown and ignored.
 
 - [ ] **Step 5: Handle responses safely**
 
@@ -847,9 +873,11 @@ IDs remain ignored.
 
 Extend blocked-worker tests so Code Actions, command acknowledgements,
 confirmation responses, and shutdown continue while FTP preparation is
-blocked. In particular, shut down with force preparation blocked, release it
-after protocol exit, and assert tracker drop prevents a late confirmation or
-write. Worker retains no LSP sender clone.
+blocked. Prove immediate same-file supersession while the replacement
+preparation is still blocked. Also send `shutdown` with force preparation
+blocked, withhold `exit`, release the worker, and assert `begin_shutdown`
+prevents a late confirmation/write before completing the handshake. Worker
+retains no LSP sender clone.
 
 - [ ] **Step 7: Verify and commit**
 
@@ -967,7 +995,8 @@ the process/action labels but may not invoke a 3S network action.
 - [ ] Zed advertises the five actions in approved order.
 - [ ] Compare launches `zed --diff <local> <snapshot>` and changes no project/state data.
 - [ ] Guard claims happen after all preflight and immediately before rename or Zed spawn.
-- [ ] Protocol shutdown cancels pending operations and explicitly removes the snapshot root even if the detached worker is blocked.
+- [ ] Processing the shutdown request immediately cancels pending operations and removes the snapshot root, before waiting for exit, even with a blocked detached worker.
+- [ ] A newly accepted same-file Force Pull immediately supersedes every older preparation or prompt.
 - [ ] Pull, Compare, and Force Pull reject initial dirtiness and edits during preparation.
 - [ ] Force Pull applies only after exact affirmative response and local identity recheck.
 - [ ] Cancel/dismissal/unknown response/shutdown/race/failure preserve local bytes and state.
