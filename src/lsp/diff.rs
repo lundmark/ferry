@@ -1,7 +1,7 @@
 #![allow(dead_code)] // The protocol loop wires this runtime in the next change.
 
 use std::ffi::OsStr;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -847,6 +847,13 @@ fn validate_prepared_snapshot(root: &Path, snapshot: &PreparedSnapshot) -> Resul
 }
 
 fn cleanup_stale_roots(base: &Path) -> Result<()> {
+    cleanup_stale_roots_with_hook(base, |_, _| {})
+}
+
+fn cleanup_stale_roots_with_hook(
+    base: &Path,
+    mut after_initial_identity: impl FnMut(&Path, &Path),
+) -> Result<()> {
     for entry in fs::read_dir(base).context("reading private snapshot temporary base")? {
         let Ok(entry) = entry else {
             continue;
@@ -859,6 +866,9 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
         if candidate.parent() != Some(base) || candidate == base {
             continue;
         }
+        let Ok(initial_root_identity) = Handle::from_path(&candidate) else {
+            continue;
+        };
         let Ok(candidate_metadata) = fs::symlink_metadata(&candidate) else {
             continue;
         };
@@ -871,8 +881,17 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
         if resolved_candidate != candidate || resolved_candidate.parent() != Some(base) {
             continue;
         }
+        let Ok(current_root_identity) = Handle::from_path(&candidate) else {
+            continue;
+        };
+        if current_root_identity != initial_root_identity {
+            continue;
+        }
 
         let lock_path = candidate.join(LOCK_NAME);
+        let Ok(initial_lock_identity) = Handle::from_path(&lock_path) else {
+            continue;
+        };
         let Ok(lock_metadata) = fs::symlink_metadata(&lock_path) else {
             continue;
         };
@@ -885,10 +904,27 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
         if resolved_lock != lock_path || resolved_lock.parent() != Some(&candidate) {
             continue;
         }
+        let Ok(current_lock_identity) = Handle::from_path(&lock_path) else {
+            continue;
+        };
+        if current_lock_identity != initial_lock_identity {
+            continue;
+        }
+
+        after_initial_identity(&candidate, &lock_path);
 
         let Ok(lock_file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
             continue;
         };
+        let Ok(opened_lock_file) = lock_file.try_clone() else {
+            continue;
+        };
+        let Ok(opened_lock_identity) = Handle::from_file(opened_lock_file) else {
+            continue;
+        };
+        if opened_lock_identity != initial_lock_identity {
+            continue;
+        }
         let Ok(opened_metadata) = lock_file.metadata() else {
             continue;
         };
@@ -901,8 +937,12 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
             Err(_) => continue,
         }
 
-        let Ok(mut root) = OwnedRoot::capture(base.to_path_buf(), candidate.clone(), lock_file)
-        else {
+        let Ok(mut root) = OwnedRoot::capture_with_root_identity(
+            base.to_path_buf(),
+            candidate.clone(),
+            lock_file,
+            initial_root_identity,
+        ) else {
             continue;
         };
         root.cleanup().with_context(|| {
@@ -915,51 +955,6 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
     Ok(())
 }
 
-fn revalidate_stale_candidate(
-    base: &Path,
-    candidate: &Path,
-    expected_resolved_candidate: &Path,
-    lock_path: &Path,
-    lock_file: &File,
-) -> bool {
-    if candidate == base || candidate.parent() != Some(base) {
-        return false;
-    }
-
-    let Ok(candidate_metadata) = fs::symlink_metadata(candidate) else {
-        return false;
-    };
-    if !candidate_metadata.file_type().is_dir() || candidate_metadata.file_type().is_symlink() {
-        return false;
-    }
-    let Ok(resolved_candidate) = fs::canonicalize(candidate) else {
-        return false;
-    };
-    if resolved_candidate != candidate
-        || resolved_candidate != expected_resolved_candidate
-        || resolved_candidate.parent() != Some(base)
-    {
-        return false;
-    }
-
-    let Ok(lock_metadata) = fs::symlink_metadata(lock_path) else {
-        return false;
-    };
-    if !lock_metadata.file_type().is_file() || lock_metadata.file_type().is_symlink() {
-        return false;
-    }
-    let Ok(resolved_lock) = fs::canonicalize(lock_path) else {
-        return false;
-    };
-    if resolved_lock != lock_path || resolved_lock.parent() != Some(candidate) {
-        return false;
-    }
-
-    lock_file
-        .metadata()
-        .is_ok_and(|opened_metadata| same_file_identity(&lock_metadata, &opened_metadata))
-}
-
 fn is_recognizable_root_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
@@ -970,19 +965,6 @@ fn is_recognizable_root_name(name: &OsStr) -> bool {
     !suffix.is_empty()
         && suffix.len() <= 64
         && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-}
-
-#[cfg(unix)]
-fn same_file_identity(path_metadata: &Metadata, opened_metadata: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    path_metadata.dev() == opened_metadata.dev() && path_metadata.ino() == opened_metadata.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(_path_metadata: &Metadata, _opened_metadata: &Metadata) -> bool {
-    // Without stable, verified file identity fields, stale cleanup must fail closed.
-    false
 }
 
 #[cfg(test)]
@@ -1239,7 +1221,7 @@ mod tests {
         shutdown.shutdown().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn startup_removes_a_recognizable_unlocked_stale_root() {
         let base = tempdir().unwrap();
@@ -1254,18 +1236,36 @@ mod tests {
         shutdown.shutdown().unwrap();
     }
 
-    #[cfg(not(unix))]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn startup_preserves_an_unlocked_stale_root_without_exact_file_identity() {
+    fn stale_scanner_rejects_replacement_after_initial_identity_capture() {
         let base = tempdir().unwrap();
-        let stale = recognizable_root(base.path(), "stale123");
-        fs::write(stale.join("snapshot"), b"old").unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "scannerreplace");
+        let renamed_original = canonical_base.join("scanner-original");
+        let mut swapped = false;
 
-        let (_store, shutdown) = store_in(&base);
+        super::cleanup_stale_roots_with_hook(
+            &canonical_base,
+            |observed_candidate, _observed_lock| {
+                if observed_candidate != candidate {
+                    return;
+                }
+                swapped = true;
+                fs::rename(&candidate, &renamed_original).unwrap();
+                fs::create_dir(&candidate).unwrap();
+                fs::write(candidate.join(".lock"), b"replacement lock").unwrap();
+                fs::write(candidate.join("replacement-sentinel"), b"must survive").unwrap();
+            },
+        )
+        .unwrap();
 
-        assert!(stale.exists());
-        assert_eq!(fs::read(stale.join("snapshot")).unwrap(), b"old");
-        shutdown.shutdown().unwrap();
+        assert!(swapped);
+        assert!(renamed_original.exists());
+        assert_eq!(
+            fs::read(candidate.join("replacement-sentinel")).unwrap(),
+            b"must survive"
+        );
     }
 
     #[test]
@@ -1535,54 +1535,6 @@ mod tests {
         let root = recognizable_root(base.path(), "regularlock");
         let lock = File::open(root.join(".lock")).unwrap();
         assert!(lock.metadata().unwrap().is_file());
-    }
-
-    #[test]
-    fn distinct_regular_files_never_have_the_same_identity() {
-        let base = tempdir().unwrap();
-        let first = base.path().join("first");
-        let second = base.path().join("second");
-        fs::write(&first, b"same bytes").unwrap();
-        fs::write(&second, b"same bytes").unwrap();
-        let first_metadata = fs::metadata(first).unwrap();
-        let second_metadata = fs::metadata(second).unwrap();
-
-        assert!(!super::same_file_identity(
-            &first_metadata,
-            &second_metadata
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_candidate_revalidation_rejects_a_replaced_lock_path() {
-        let base = tempdir().unwrap();
-        let canonical_base = fs::canonicalize(base.path()).unwrap();
-        let candidate = recognizable_root(&canonical_base, "swappedlock");
-        let resolved_candidate = fs::canonicalize(&candidate).unwrap();
-        let lock_path = candidate.join(".lock");
-        let original_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .unwrap();
-        FileExt::lock_exclusive(&original_lock).unwrap();
-
-        let replacement = candidate.join("replacement");
-        fs::write(&replacement, b"different regular file").unwrap();
-        fs::rename(&replacement, &lock_path).unwrap();
-
-        assert!(!super::revalidate_stale_candidate(
-            &canonical_base,
-            &candidate,
-            &resolved_candidate,
-            &lock_path,
-            &original_lock,
-        ));
-        assert!(candidate.exists());
-        assert_eq!(fs::read(&lock_path).unwrap(), b"different regular file");
-
-        FileExt::unlock(&original_lock).unwrap();
     }
 
     #[test]
