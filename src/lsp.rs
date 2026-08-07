@@ -11,15 +11,16 @@ use anyhow::{Context, Result};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
     CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, Command,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, ExecuteCommandOptions,
-    ExecuteCommandParams, MessageType, ServerCapabilities, ShowMessageParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, ExecuteCommandOptions, ExecuteCommandParams, MessageType,
+    ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
 };
 
 use crate::commands::ExecutionMode;
 use crate::commands::cc::{self, FileCheckResult};
 use crate::commands::file_transfer::TransferOutcome;
+use document_state::{DocumentTracker, OperationGuard};
 
 pub const PULL_COMMAND: &str = "ferry.pull";
 pub const PUSH_COMMAND: &str = "ferry.push";
@@ -56,47 +57,82 @@ impl FileOperations for FerryOperations {
     }
 }
 
+#[derive(Clone)]
+struct ShutdownBoundary {
+    shutdown: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+}
+
+impl ShutdownBoundary {
+    fn noop() -> Self {
+        Self {
+            shutdown: Arc::new(|| Ok(())),
+        }
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        (self.shutdown)()
+    }
+}
+
 pub struct Server<O: FileOperations> {
     operations: O,
+    shutdown: ShutdownBoundary,
 }
 
 impl<O: FileOperations> Server<O> {
     pub fn new(operations: O) -> Self {
-        Self { operations }
+        Self {
+            operations,
+            shutdown: ShutdownBoundary::noop(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_shutdown<F>(operations: O, shutdown: F) -> Self
+    where
+        F: Fn() -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            operations,
+            shutdown: ShutdownBoundary {
+                shutdown: Arc::new(shutdown),
+            },
+        }
+    }
+
+    fn shutdown_handle(&self) -> ShutdownBoundary {
+        self.shutdown.clone()
     }
 
     #[cfg(test)]
     fn handle_notification(&mut self, connection: &Connection, notification: Notification) {
-        for message in self.process_notification(notification) {
-            let _ = connection.sender.send(message);
-        }
-    }
-
-    fn process_notification(&mut self, notification: Notification) -> Vec<Message> {
-        match notification.method.as_str() {
+        let message = match notification.method.as_str() {
             "textDocument/didOpen" => {
-                if let Ok(params) =
-                    serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
-                {
-                    return self
-                        .handle_file_event(params.text_document.uri.as_str(), Event::Open)
-                        .into_iter()
-                        .collect();
-                }
+                serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
+                    .ok()
+                    .and_then(|params| {
+                        let path = uri_to_path(params.text_document.uri.as_str())?;
+                        let mut tracker = DocumentTracker::default();
+                        tracker
+                            .open(path.clone(), &params.text_document.text)
+                            .ok()?;
+                        let guard = tracker.begin_clean_operation(&path).ok();
+                        self.handle_file_event(&path, Event::Open, guard)
+                    })
             }
             "textDocument/didSave" => {
-                if let Ok(params) =
-                    serde_json::from_value::<DidSaveTextDocumentParams>(notification.params)
-                {
-                    return self
-                        .handle_file_event(params.text_document.uri.as_str(), Event::Save)
-                        .into_iter()
-                        .collect();
-                }
+                serde_json::from_value::<DidSaveTextDocumentParams>(notification.params)
+                    .ok()
+                    .and_then(|params| {
+                        let path = uri_to_path(params.text_document.uri.as_str())?;
+                        self.handle_file_event(&path, Event::Save, None)
+                    })
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(message) = message {
+            let _ = connection.sender.send(message);
         }
-        Vec::new()
     }
 
     #[cfg(test)]
@@ -107,7 +143,7 @@ impl<O: FileOperations> Server<O> {
                 PreparedRequest::Ready { id, command } => {
                     vec![
                         Message::Response(Response::new_ok(id, ())),
-                        self.process_command(command),
+                        self.process_command(command, None),
                     ]
                 }
                 PreparedRequest::Immediate(messages) => messages,
@@ -120,7 +156,11 @@ impl<O: FileOperations> Server<O> {
         }
     }
 
-    fn process_command(&mut self, command: PreparedCommand) -> Message {
+    fn process_command(
+        &mut self,
+        command: PreparedCommand,
+        guard: Option<OperationGuard>,
+    ) -> Message {
         let resolved = match crate::project::resolve_file(&command.absolute_path, true) {
             Ok(Some(resolved)) => resolved,
             Ok(None) => {
@@ -137,22 +177,21 @@ impl<O: FileOperations> Server<O> {
                 ));
             }
         };
+        if matches!(command.action, ActionCommand::Pull)
+            && guard.is_some_and(|guard| !guard.try_claim())
+        {
+            return save_first_warning(&resolved.relative_path);
+        }
         match command.action {
             ActionCommand::Pull => transfer_feedback(
                 &resolved.relative_path,
-                self.operations.pull(
-                    &resolved.config_path,
-                    &resolved.relative_path,
-                    /* force = */ false,
-                ),
+                self.operations
+                    .pull(&resolved.config_path, &resolved.relative_path, false),
             ),
             ActionCommand::Push => transfer_feedback(
                 &resolved.relative_path,
-                self.operations.push(
-                    &resolved.config_path,
-                    &resolved.relative_path,
-                    /* force = */ false,
-                ),
+                self.operations
+                    .push(&resolved.config_path, &resolved.relative_path, false),
             ),
             ActionCommand::Compile => compile_feedback(
                 &resolved.relative_path,
@@ -162,9 +201,13 @@ impl<O: FileOperations> Server<O> {
         }
     }
 
-    fn handle_file_event(&mut self, uri: &str, event: Event) -> Option<Message> {
-        let path = uri_to_path(uri)?;
-        let resolved = match crate::project::resolve_file(&path, true) {
+    fn handle_file_event(
+        &mut self,
+        path: &Path,
+        event: Event,
+        guard: Option<OperationGuard>,
+    ) -> Option<Message> {
+        let resolved = match crate::project::resolve_file(path, true) {
             Ok(Some(resolved)) => resolved,
             Ok(None) => return None,
             Err(error) => {
@@ -184,16 +227,20 @@ impl<O: FileOperations> Server<O> {
         }
 
         let result = match event {
-            Event::Open => self.operations.pull(
-                &resolved.config_path,
-                &resolved.relative_path,
-                /* force = */ false,
-            ),
-            Event::Save => self.operations.push(
-                &resolved.config_path,
-                &resolved.relative_path,
-                /* force = */ false,
-            ),
+            Event::Open => {
+                let Some(guard) = guard else {
+                    return Some(save_first_warning(&resolved.relative_path));
+                };
+                if !guard.try_claim() {
+                    return Some(save_first_warning(&resolved.relative_path));
+                }
+                self.operations
+                    .pull(&resolved.config_path, &resolved.relative_path, false)
+            }
+            Event::Save => {
+                self.operations
+                    .push(&resolved.config_path, &resolved.relative_path, false)
+            }
         };
         if let Err(error) = result {
             return Some(warning_message(format!(
@@ -335,7 +382,7 @@ pub fn capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
-                change: Some(TextDocumentSyncKind::NONE),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
                 will_save: None,
                 will_save_wait_until: None,
                 save: Some(TextDocumentSyncSaveOptions::Supported(true)),
@@ -354,8 +401,66 @@ pub fn capabilities() -> ServerCapabilities {
 }
 
 enum Work {
-    Notification(Notification),
-    Command(PreparedCommand),
+    Open {
+        path: PathBuf,
+        guard: Option<OperationGuard>,
+    },
+    Save {
+        path: PathBuf,
+    },
+    Command {
+        command: PreparedCommand,
+        guard: Option<OperationGuard>,
+    },
+}
+
+struct Coordinator {
+    documents: DocumentTracker,
+    running: Arc<AtomicBool>,
+    shutdown: ShutdownBoundary,
+    shutdown_complete: bool,
+    cleanup_error: Option<anyhow::Error>,
+}
+
+impl Coordinator {
+    fn new(running: Arc<AtomicBool>, shutdown: ShutdownBoundary) -> Self {
+        Self {
+            documents: DocumentTracker::default(),
+            running,
+            shutdown,
+            shutdown_complete: false,
+            cleanup_error: None,
+        }
+    }
+
+    fn begin_shutdown(&mut self) {
+        self.documents.cancel_all();
+        self.running.store(false, Ordering::Release);
+        if self.shutdown_complete {
+            return;
+        }
+        match self.shutdown.shutdown() {
+            Ok(()) => {
+                self.shutdown_complete = true;
+                self.cleanup_error = None;
+            }
+            Err(error) => self.cleanup_error = Some(error),
+        }
+    }
+
+    fn finish(mut self, result: Result<()>) -> Result<()> {
+        self.begin_shutdown();
+        if self.shutdown_complete {
+            return result;
+        }
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => Err(self
+                .cleanup_error
+                .take()
+                .unwrap_or_else(|| anyhow::anyhow!("Ferry shutdown cleanup did not complete"))),
+        }
+    }
 }
 
 pub fn main_loop<O: FileOperations + Send + 'static>(
@@ -366,10 +471,11 @@ pub fn main_loop<O: FileOperations + Send + 'static>(
     let (outbound_sender, outbound_receiver) = mpsc::channel::<Message>();
     let running = Arc::new(AtomicBool::new(true));
     let worker_running = Arc::clone(&running);
+    let shutdown = server.shutdown_handle();
 
-    // Deliberately detached: a transport can block indefinitely. The worker
-    // owns no clone of the LSP sender, so it cannot keep the stdio writer alive
-    // after the protocol loop exits.
+    // Deliberately detached: a transport can block indefinitely. The worker owns no
+    // clone of the LSP sender, so it cannot keep the stdio writer alive after the
+    // protocol loop exits. Shutdown instead makes queued work inert immediately.
     let _worker = thread::spawn(move || {
         while worker_running.load(Ordering::Acquire) {
             let Ok(work) = work_receiver.recv() else {
@@ -378,20 +484,29 @@ pub fn main_loop<O: FileOperations + Send + 'static>(
             if !worker_running.load(Ordering::Acquire) {
                 return;
             }
-            let messages = match work {
-                Work::Notification(notification) => server.process_notification(notification),
-                Work::Command(command) => vec![server.process_command(command)],
+            let message = match work {
+                Work::Open { path, guard } => server.handle_file_event(&path, Event::Open, guard),
+                Work::Save { path } => server.handle_file_event(&path, Event::Save, None),
+                Work::Command { command, guard } => Some(server.process_command(command, guard)),
             };
-            for message in messages {
-                if outbound_sender.send(message).is_err() {
-                    return;
-                }
+            if !worker_running.load(Ordering::Acquire) {
+                return;
+            }
+            if let Some(message) = message
+                && outbound_sender.send(message).is_err()
+            {
+                return;
             }
         }
     });
 
-    let result = protocol_loop(&connection, &work_sender, &outbound_receiver);
-    running.store(false, Ordering::Release);
+    let result = protocol_loop(
+        &connection,
+        &work_sender,
+        &outbound_receiver,
+        Arc::clone(&running),
+        shutdown,
+    );
     drop(work_sender);
     result
 }
@@ -400,6 +515,19 @@ fn protocol_loop(
     connection: &Connection,
     work_sender: &mpsc::Sender<Work>,
     outbound_receiver: &mpsc::Receiver<Message>,
+    running: Arc<AtomicBool>,
+    shutdown: ShutdownBoundary,
+) -> Result<()> {
+    let mut coordinator = Coordinator::new(running, shutdown);
+    let result = protocol_loop_inner(connection, work_sender, outbound_receiver, &mut coordinator);
+    coordinator.finish(result)
+}
+
+fn protocol_loop_inner(
+    connection: &Connection,
+    work_sender: &mpsc::Sender<Work>,
+    outbound_receiver: &mpsc::Receiver<Message>,
+    coordinator: &mut Coordinator,
 ) -> Result<()> {
     loop {
         while let Ok(message) = outbound_receiver.try_recv() {
@@ -410,12 +538,12 @@ fn protocol_loop(
 
         match connection.receiver.try_recv() {
             Ok(Message::Request(request)) => {
-                if handle_request(connection, work_sender, request)? {
+                if handle_request(connection, work_sender, coordinator, request)? {
                     return Ok(());
                 }
             }
             Ok(Message::Notification(notification)) => {
-                if work_sender.send(Work::Notification(notification)).is_err() {
+                if handle_notification(work_sender, &mut coordinator.documents, notification) {
                     return Ok(());
                 }
             }
@@ -426,12 +554,72 @@ fn protocol_loop(
     }
 }
 
+fn handle_notification(
+    work_sender: &mpsc::Sender<Work>,
+    documents: &mut DocumentTracker,
+    notification: Notification,
+) -> bool {
+    match notification.method.as_str() {
+        "textDocument/didOpen" => {
+            let Ok(params) =
+                serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
+            else {
+                return false;
+            };
+            let Some(path) = uri_to_path(params.text_document.uri.as_str()) else {
+                return false;
+            };
+            if documents
+                .open(path.clone(), &params.text_document.text)
+                .is_err()
+            {
+                return false;
+            }
+            let guard = documents.begin_clean_operation(&path).ok();
+            work_sender.send(Work::Open { path, guard }).is_err()
+        }
+        "textDocument/didChange" => {
+            if let Ok(params) =
+                serde_json::from_value::<DidChangeTextDocumentParams>(notification.params)
+                && let Some(path) = uri_to_path(params.text_document.uri.as_str())
+            {
+                documents.change(&path);
+            }
+            false
+        }
+        "textDocument/didSave" => {
+            let Ok(params) =
+                serde_json::from_value::<DidSaveTextDocumentParams>(notification.params)
+            else {
+                return false;
+            };
+            let Some(path) = uri_to_path(params.text_document.uri.as_str()) else {
+                return false;
+            };
+            documents.save(&path);
+            work_sender.send(Work::Save { path }).is_err()
+        }
+        "textDocument/didClose" => {
+            if let Ok(params) =
+                serde_json::from_value::<DidCloseTextDocumentParams>(notification.params)
+                && let Some(path) = uri_to_path(params.text_document.uri.as_str())
+            {
+                documents.close(&path);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn handle_request(
     connection: &Connection,
     work_sender: &mpsc::Sender<Work>,
+    coordinator: &mut Coordinator,
     request: Request,
 ) -> Result<bool> {
     if request.method == "shutdown" {
+        coordinator.begin_shutdown();
         return Ok(connection.handle_shutdown(&request)?);
     }
 
@@ -444,7 +632,28 @@ fn handle_request(
     if request.method == EXECUTE_COMMAND_METHOD {
         match prepare_execute_command(request) {
             PreparedRequest::Ready { id, command } => {
-                let response = if work_sender.send(Work::Command(command)).is_ok() {
+                let guard = if matches!(command.action, ActionCommand::Pull) {
+                    match coordinator
+                        .documents
+                        .begin_clean_operation(&command.absolute_path)
+                    {
+                        Ok(guard) => Some(guard),
+                        Err(_) => {
+                            for message in operation_response(
+                                id,
+                                save_first_warning(&command.initial_relative_path),
+                            ) {
+                                if connection.sender.send(message).is_err() {
+                                    return Ok(true);
+                                }
+                            }
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    None
+                };
+                let response = if work_sender.send(Work::Command { command, guard }).is_ok() {
                     Response::new_ok(id, ())
                 } else {
                     Response::new_err(
@@ -508,6 +717,10 @@ fn warning_message(message: String) -> Message {
         },
     );
     Message::Notification(notification)
+}
+
+fn save_first_warning(relative_path: &str) -> Message {
+    warning_message(format!("ferry: {relative_path}: save the file and retry"))
 }
 
 fn info_message(message: String) -> Message {
@@ -581,6 +794,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -588,8 +802,9 @@ mod tests {
     use anyhow::{Result, anyhow};
     use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
     use lsp_types::{
-        DidOpenTextDocumentParams, DidSaveTextDocumentParams, MessageType, ShowMessageParams,
-        TextDocumentIdentifier, TextDocumentItem, Uri,
+        DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+        DidSaveTextDocumentParams, MessageType, ShowMessageParams, TextDocumentContentChangeEvent,
+        TextDocumentIdentifier, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
     };
     use tempfile::TempDir;
 
@@ -778,6 +993,10 @@ mod tests {
     }
 
     fn did_open(uri: Uri) -> Notification {
+        did_open_with_text(uri, "int main(void) {}\n")
+    }
+
+    fn did_open_with_text(uri: Uri, text: &str) -> Notification {
         Notification::new(
             "textDocument/didOpen".to_string(),
             DidOpenTextDocumentParams {
@@ -785,8 +1004,22 @@ mod tests {
                     uri,
                     language_id: "c".to_string(),
                     version: 1,
-                    text: String::new(),
+                    text: text.to_string(),
                 },
+            },
+        )
+    }
+
+    fn did_change(uri: Uri) -> Notification {
+        Notification::new(
+            "textDocument/didChange".to_string(),
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri, version: 2 },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "changed in editor".to_string(),
+                }],
             },
         )
     }
@@ -797,6 +1030,15 @@ mod tests {
             DidSaveTextDocumentParams {
                 text_document: TextDocumentIdentifier::new(uri),
                 text: None,
+            },
+        )
+    }
+
+    fn did_close(uri: Uri) -> Notification {
+        Notification::new(
+            "textDocument/didClose".to_string(),
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(uri),
             },
         )
     }
@@ -1052,7 +1294,7 @@ mod tests {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::NONE),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         will_save: None,
                         will_save_wait_until: None,
                         save: Some(TextDocumentSyncSaveOptions::Supported(true)),
@@ -1102,7 +1344,7 @@ mod tests {
         }
     }
 
-    fn send_shutdown(client: &Connection, id: i32) {
+    fn send_shutdown_request(client: &Connection, id: i32) {
         client
             .sender
             .send(Message::Request(Request::new(
@@ -1111,6 +1353,9 @@ mod tests {
                 (),
             )))
             .unwrap();
+    }
+
+    fn send_exit(client: &Connection) {
         client
             .sender
             .send(Message::Notification(Notification::new(
@@ -1118,6 +1363,11 @@ mod tests {
                 (),
             )))
             .unwrap();
+    }
+
+    fn send_shutdown(client: &Connection, id: i32) {
+        send_shutdown_request(client, id);
+        send_exit(client);
     }
 
     fn response_with_id(message: Message, id: i32) -> Response {
@@ -1511,6 +1761,370 @@ mod tests {
         messages
     }
 
+    fn assert_acknowledged_with_warning(messages: Vec<Message>, id: i32) {
+        let mut responses = 0;
+        let mut warnings = Vec::new();
+        for message in messages {
+            match message {
+                Message::Response(response) if response.id == RequestId::from(id) => {
+                    responses += 1;
+                    assert!(response.error.is_none());
+                    assert_eq!(response.result, Some(serde_json::Value::Null));
+                }
+                Message::Notification(notification)
+                    if notification.method == "window/showMessage" =>
+                {
+                    warnings.push(
+                        serde_json::from_value::<ShowMessageParams>(notification.params).unwrap(),
+                    );
+                }
+                other => panic!("unexpected protocol message: {other:?}"),
+            }
+        }
+        assert_eq!(responses, 1, "request must be acknowledged exactly once");
+        assert_eq!(warnings.len(), 1, "request must emit exactly one warning");
+        assert_eq!(warnings[0].typ, MessageType::WARNING);
+        assert_eq!(
+            warnings[0].message,
+            "ferry: src/nested/hello world.c: save the file and retry"
+        );
+    }
+
+    fn start_recording_loop(
+        calls: Arc<Mutex<Vec<Call>>>,
+    ) -> (Connection, thread::JoinHandle<Result<()>>) {
+        let operations = RecordingSendOperations { calls };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        (client_connection, loop_thread)
+    }
+
+    fn send_pull(client: &Connection, id: i32, uri: &Uri) -> Vec<Message> {
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                id,
+                PULL_COMMAND,
+                vec![serde_json::to_value(uri).unwrap()],
+            )))
+            .unwrap();
+        receive_request_messages(client, id, 2)
+    }
+
+    fn finish_loop(client: &Connection, loop_thread: thread::JoinHandle<Result<()>>, id: i32) {
+        send_shutdown(client, id);
+        let shutdown = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response");
+        assert!(response_with_id(shutdown, id).error.is_none());
+        loop_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn dirty_document_matching_did_open_content_permits_pull() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+
+        let messages = send_pull(&client, 201, &fixture.uri());
+
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Notification(notification) if notification.method == "window/showMessage"
+        )));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        finish_loop(&client, loop_thread, 202);
+    }
+
+    #[test]
+    fn dirty_document_differing_did_open_content_refuses_pull_without_operations() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "unsaved editor contents\n",
+            )))
+            .unwrap();
+
+        let messages = send_pull(&client, 211, &fixture.uri());
+
+        assert_acknowledged_with_warning(messages, 211);
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 212);
+    }
+
+    #[test]
+    fn dirty_document_did_change_refuses_pull_without_operations() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_change(fixture.uri())))
+            .unwrap();
+
+        let messages = send_pull(&client, 221, &fixture.uri());
+
+        assert_acknowledged_with_warning(messages, 221);
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 222);
+    }
+
+    #[test]
+    fn dirty_document_did_save_marks_clean_and_permits_a_new_pull() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_change(fixture.uri())))
+            .unwrap();
+        assert_acknowledged_with_warning(send_pull(&client, 231, &fixture.uri()), 231);
+        client
+            .sender
+            .send(Message::Notification(did_save(fixture.uri())))
+            .unwrap();
+
+        let messages = send_pull(&client, 232, &fixture.uri());
+
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Notification(notification) if notification.method == "window/showMessage"
+        )));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        finish_loop(&client, loop_thread, 233);
+    }
+
+    #[test]
+    fn automatic_restored_dirty_buffer_warns_and_skips_enabled_pull() {
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "restored unsaved contents\n",
+            )))
+            .unwrap();
+
+        let warning = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dirty pull-on-open warning");
+
+        let warning = match warning {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
+            }
+            other => panic!("expected dirty pull-on-open warning, got {other:?}"),
+        };
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert_eq!(
+            warning.message,
+            "ferry: src/nested/hello world.c: save the file and retry"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 243);
+    }
+
+    #[test]
+    fn automatic_restored_dirty_buffer_is_silent_when_pull_on_open_is_disabled() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "restored unsaved contents\n",
+            )))
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+
+        assert!(client.receiver.try_recv().is_err());
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 244);
+    }
+
+    #[test]
+    fn dirty_document_malformed_and_non_file_notifications_do_not_clear_dirty_state() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_change(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification::new(
+                "textDocument/didSave".to_string(),
+                serde_json::json!({ "textDocument": {} }),
+            )))
+            .unwrap();
+        for method in [
+            "textDocument/didOpen",
+            "textDocument/didChange",
+            "textDocument/didClose",
+        ] {
+            client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    method.to_string(),
+                    serde_json::json!({ "textDocument": {} }),
+                )))
+                .unwrap();
+        }
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                Uri::from_str("untitled:buffer").unwrap(),
+                "not a file",
+            )))
+            .unwrap();
+        let non_file_uri = Uri::from_str("untitled:buffer").unwrap();
+        for notification in [
+            did_change(non_file_uri.clone()),
+            did_save(non_file_uri.clone()),
+            did_close(non_file_uri),
+        ] {
+            client
+                .sender
+                .send(Message::Notification(notification))
+                .unwrap();
+        }
+
+        let messages = send_pull(&client, 245, &fixture.uri());
+
+        assert_acknowledged_with_warning(messages, 245);
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 246);
+    }
+
+    #[test]
+    fn dirty_document_did_close_removes_tracking_so_stale_pull_fails_safely() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_close(fixture.uri())))
+            .unwrap();
+
+        let messages = send_pull(&client, 241, &fixture.uri());
+
+        assert_acknowledged_with_warning(messages, 241);
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 242);
+    }
+
+    #[test]
+    fn main_loop_shutdown_cancels_immediately_and_retries_only_incomplete_cleanup() {
+        let fixture = Fixture::new("");
+        let running = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_shutdown = Arc::clone(&attempts);
+        let shutdown = ShutdownBoundary {
+            shutdown: Arc::new(move || {
+                if attempts_for_shutdown.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    Err(anyhow!("injected cleanup failure"))
+                } else {
+                    Ok(())
+                }
+            }),
+        };
+        let mut coordinator = Coordinator::new(Arc::clone(&running), shutdown);
+        coordinator
+            .documents
+            .open(fixture.file_path.clone(), "int main(void) {}\n")
+            .unwrap();
+        let guard = coordinator
+            .documents
+            .begin_clean_operation(&fixture.file_path)
+            .unwrap();
+
+        coordinator.begin_shutdown();
+
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!guard.try_claim());
+        assert!(!coordinator.shutdown_complete);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+
+        coordinator.begin_shutdown();
+        assert!(coordinator.shutdown_complete);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+
+        coordinator.begin_shutdown();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn main_loop_cleanup_error_does_not_delay_shutdown_response_and_retries_after_exit() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_shutdown = Arc::clone(&attempts);
+        let server = Server::with_shutdown(SendOperations, move || {
+            if attempts_for_shutdown.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                Err(anyhow!("injected cleanup failure"))
+            } else {
+                Ok(())
+            }
+        });
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread = thread::spawn(move || main_loop(server_connection, server));
+
+        send_shutdown_request(&client_connection, 254);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cleanup error must not delay shutdown response");
+
+        assert!(response_with_id(shutdown, 254).error.is_none());
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+
+        send_exit(&client_connection);
+        loop_thread.join().unwrap().unwrap();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+    }
+
     #[test]
     fn main_loop_processes_actions_and_commands_with_correlated_feedback() {
         let fixture = Fixture::new("");
@@ -1523,6 +2137,10 @@ mod tests {
         let (server_connection, client_connection) = Connection::memory();
         let loop_thread =
             thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(uri.clone())))
+            .unwrap();
 
         client_connection
             .sender
@@ -1728,6 +2346,137 @@ mod tests {
     }
 
     #[test]
+    fn dirty_document_shutdown_cancels_queued_pull_and_closes_snapshot_boundary_before_exit() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let operations = ShutdownBlockingOperations {
+            calls: Arc::clone(&calls),
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+        };
+        let shutdown_count = Arc::new(AtomicUsize::new(0));
+        let shutdown_count_for_loop = Arc::clone(&shutdown_count);
+        let (snapshot_closed_tx, snapshot_closed_rx) = mpsc::sync_channel(1);
+        let server = Server::with_shutdown(operations, move || {
+            shutdown_count_for_loop.fetch_add(1, AtomicOrdering::SeqCst);
+            snapshot_closed_tx.send(()).unwrap();
+            Ok(())
+        });
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread = thread::spawn(move || main_loop(server_connection, server));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                251,
+                PUSH_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_request_messages(&client_connection, 251, 1);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("preparation blocker should start");
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                252,
+                PULL_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_request_messages(&client_connection, 252, 1);
+
+        send_shutdown_request(&client_connection, 253);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown response must arrive before exit");
+
+        assert!(response_with_id(shutdown, 253).error.is_none());
+        snapshot_closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot boundary must close during shutdown handshake");
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked preparation should be released");
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[Call::Push {
+                config_path: fixture.config_path.clone(),
+                rel: "src/nested/hello world.c".to_string(),
+                force: false,
+            }],
+            "cancelled queued pull must never launch"
+        );
+        assert!(
+            client_connection.receiver.try_recv().is_err(),
+            "released worker must not write after shutdown begins"
+        );
+        assert_eq!(shutdown_count.load(AtomicOrdering::SeqCst), 1);
+
+        send_exit(&client_connection);
+        loop_thread.join().unwrap().unwrap();
+        assert_eq!(shutdown_count.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    struct ShutdownBlockingOperations {
+        calls: Arc<Mutex<Vec<Call>>>,
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+    }
+
+    impl FileOperations for ShutdownBlockingOperations {
+        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::Pull {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+                force,
+            });
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::Push {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+                force,
+            });
+            self.started.send(()).unwrap();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.finished.send(()).unwrap();
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    #[test]
     fn main_loop_shutdown_does_not_wait_for_blocked_file_operation() {
         let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -1853,6 +2602,10 @@ mod tests {
             loop_done_tx.send(()).unwrap();
             result
         });
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
         client_connection
             .sender
             .send(Message::Request(execute_command_request(
