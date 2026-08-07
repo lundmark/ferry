@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Pin to whatever version the current Zed release ships. Extensions are
-# built with `wasm32-wasip1` (previously `wasm32-wasi`). See:
+# built with `wasm32-wasip2` (previously `wasm32-wasi`). See:
 # https://zed.dev/docs/extensions/developing-extensions
 zed_extension_api = "0.6"
