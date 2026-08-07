@@ -2,7 +2,11 @@
 mod support;
 
 use ferry::commands::file_transfer::{TransferOutcome, TransferStatus};
-use ferry::commands::{ExecutionMode, pull::pull_one, push::push_one};
+use ferry::commands::{
+    ExecutionMode,
+    pull::{apply_prepared_pull, fetch_remote_one, prepare_force_pull_one, pull_one},
+    push::push_one,
+};
 use ferry::error::Exit;
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
@@ -534,4 +538,165 @@ fn single_file_untracked_conflict_preserves_both_sides_and_state() {
     assert_eq!(std::fs::read(local.path().join(rel)).unwrap(), local_bytes);
     assert_eq!(ftp.download(&remote_path(rel)).unwrap(), remote_bytes);
     assert!(!local.path().join(".ferry/state.json").exists());
+}
+
+#[test]
+#[ignore]
+fn fetch_remote_one_returns_bytes_without_mutating_local_or_state() {
+    let fixture = start_ftp();
+    let local = tempfile::tempdir().unwrap();
+    let config = write_config(local.path(), &fixture);
+    let rel = "prepared/fetch-only.txt";
+    let local_bytes = b"local bytes must remain exact\n\0";
+    let remote_bytes = b"controlled remote payload\n\0\xff";
+    let local_path = local.path().join(rel);
+    let state_path = local.path().join(".ferry/state.json");
+    std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    std::fs::write(&local_path, local_bytes).unwrap();
+    seed_state(local.path(), rel, b"previously synchronized bytes\n");
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.mkdir(&remote_path("prepared")).unwrap();
+    ftp.upload_bytes(&remote_path(rel), remote_bytes).unwrap();
+    let remote_mtime = ftp.mtime(&remote_path(rel)).unwrap();
+    let local_before = std::fs::read(&local_path).unwrap();
+    let state_before = std::fs::read(&state_path).unwrap();
+
+    let remote = fetch_remote_one(&config, rel).unwrap();
+
+    assert_eq!(remote.bytes, remote_bytes);
+    assert_eq!(remote.sha256, hash_bytes(remote_bytes));
+    assert_eq!(remote.size, remote_bytes.len() as u64);
+    assert_eq!(remote.mtime, remote_mtime);
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_before);
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+}
+
+#[test]
+#[ignore]
+fn prepared_force_pull_installs_the_fetched_remote_and_updates_state() {
+    let fixture = start_ftp();
+    let local = tempfile::tempdir().unwrap();
+    let config = write_config(local.path(), &fixture);
+    let rel = "prepared/force-install.txt";
+    let equal_rel = "prepared/force-install-equal.txt";
+    let local_bytes = b"local bytes before forced install\n\0";
+    let remote_bytes = b"fetched remote bytes for forced install\n\0\xff";
+    let equal_bytes = b"same bytes still require a forced install\n\0";
+    let local_path = local.path().join(rel);
+    let equal_local_path = local.path().join(equal_rel);
+    let state_path = local.path().join(".ferry/state.json");
+    std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    std::fs::write(&local_path, local_bytes).unwrap();
+    std::fs::write(&equal_local_path, equal_bytes).unwrap();
+    seed_state(local.path(), rel, local_bytes);
+    seed_state(local.path(), equal_rel, equal_bytes);
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.mkdir(&remote_path("prepared")).unwrap();
+    ftp.upload_bytes(&remote_path(rel), remote_bytes).unwrap();
+    ftp.upload_bytes(&remote_path(equal_rel), equal_bytes)
+        .unwrap();
+    let remote_mtime = ftp.mtime(&remote_path(rel)).unwrap();
+    let equal_remote_mtime = ftp.mtime(&remote_path(equal_rel)).unwrap();
+    let local_before = std::fs::read(&local_path).unwrap();
+    let equal_local_before = std::fs::read(&equal_local_path).unwrap();
+    let state_before = std::fs::read(&state_path).unwrap();
+
+    let prepared = prepare_force_pull_one(&config, rel).unwrap();
+    let equal_prepared = prepare_force_pull_one(&config, equal_rel).unwrap();
+
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_before);
+    assert_eq!(
+        std::fs::read(&equal_local_path).unwrap(),
+        equal_local_before
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+
+    let outcome = apply_prepared_pull(prepared, ExecutionMode::Apply).unwrap();
+    let equal_outcome = apply_prepared_pull(equal_prepared, ExecutionMode::Apply).unwrap();
+
+    assert_eq!(
+        outcome,
+        TransferOutcome::new(rel, TransferStatus::Transferred)
+    );
+    assert_eq!(
+        equal_outcome,
+        TransferOutcome::new(equal_rel, TransferStatus::Transferred)
+    );
+    assert_eq!(std::fs::read(&local_path).unwrap(), remote_bytes);
+    assert_eq!(std::fs::read(&equal_local_path).unwrap(), equal_bytes);
+    let state = StateFile::load_or_default(&state_path).unwrap();
+    let record = state.files.get(rel).unwrap();
+    assert_eq!(record.sha256, hash_bytes(remote_bytes));
+    assert_eq!(record.size, remote_bytes.len() as u64);
+    assert_eq!(record.remote_mtime, remote_mtime);
+    let equal_record = state.files.get(equal_rel).unwrap();
+    assert_eq!(equal_record.sha256, hash_bytes(equal_bytes));
+    assert_eq!(equal_record.size, equal_bytes.len() as u64);
+    assert_eq!(equal_record.remote_mtime, equal_remote_mtime);
+}
+
+#[test]
+#[ignore]
+fn prepared_force_pull_rejects_a_local_change_after_preparation() {
+    let fixture = start_ftp();
+    let local = tempfile::tempdir().unwrap();
+    let config = write_config(local.path(), &fixture);
+    let rel = "prepared/stale-local.txt";
+    let local_path = local.path().join(rel);
+    let state_path = local.path().join(".ferry/state.json");
+    let edited_bytes = b"edited after preparation\n\0";
+    std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    std::fs::write(&local_path, b"local before preparation\n").unwrap();
+    seed_state(local.path(), rel, b"previously synchronized bytes\n");
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    ftp.mkdir(&remote_path("prepared")).unwrap();
+    ftp.upload_bytes(&remote_path(rel), b"remote fetched during preparation\n")
+        .unwrap();
+    let prepared = prepare_force_pull_one(&config, rel).unwrap();
+    let state_before_apply = std::fs::read(&state_path).unwrap();
+    std::fs::write(&local_path, edited_bytes).unwrap();
+
+    let error = apply_prepared_pull(prepared, ExecutionMode::Apply).unwrap_err();
+
+    assert!(
+        error
+            .downcast_ref::<Exit>()
+            .is_some_and(|exit| matches!(exit, Exit::Conflict(_))),
+        "got: {error:#}"
+    );
+    assert_eq!(std::fs::read(&local_path).unwrap(), edited_bytes);
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before_apply);
+}
+
+#[test]
+#[ignore]
+fn prepared_force_pull_requires_a_remote_file() {
+    let fixture = start_ftp();
+    let local = tempfile::tempdir().unwrap();
+    let config = write_config(local.path(), &fixture);
+    let rel = "prepared/missing-remote.txt";
+    let absent_rel = "prepared/also-missing-remotely.txt";
+    let local_path = local.path().join(rel);
+    let absent_local_path = local.path().join(absent_rel);
+    let state_path = local.path().join(".ferry/state.json");
+    let local_bytes = b"existing local bytes must remain\n\0";
+    std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    std::fs::write(&local_path, local_bytes).unwrap();
+    seed_state(local.path(), rel, b"previously synchronized bytes\n");
+    let state_before = std::fs::read(&state_path).unwrap();
+
+    let error = prepare_force_pull_one(&config, rel).unwrap_err();
+
+    assert!(format!("{error:#}").contains(rel));
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_bytes);
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+
+    let absent_error = prepare_force_pull_one(&config, absent_rel).unwrap_err();
+
+    assert!(format!("{absent_error:#}").contains(absent_rel));
+    assert!(!absent_local_path.exists());
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
 }
