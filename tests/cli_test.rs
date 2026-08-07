@@ -29,6 +29,67 @@ fn rm_requires_at_least_one_path() {
 }
 
 #[test]
+fn bare_rm_does_not_migrate_legacy_project_files() {
+    let project = tempfile::tempdir().unwrap();
+    let legacy_config = project.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    let legacy_state = project
+        .path()
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    std::fs::write(
+        &legacy_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    ferry::state::StateFile::default()
+        .save(&legacy_state)
+        .unwrap();
+    let config_before = std::fs::read(&legacy_config).unwrap();
+    let state_before = std::fs::read(&legacy_state).unwrap();
+
+    let out = bin()
+        .arg("rm")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "bare rm should exit non-zero");
+    assert!(stderr.contains("at least one path"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&legacy_config).unwrap(), config_before);
+    assert_eq!(std::fs::read(&legacy_state).unwrap(), state_before);
+    assert!(!project.path().join(ferry::names::CONFIG_FILE).exists());
+    assert!(!project.path().join(ferry::names::STATE_DIR).exists());
+}
+
+#[test]
+fn malformed_hook_json_does_not_echo_input() {
+    let marker = "SENSITIVE-HOOK-MARKER-9dff6c";
+    let mut child = bin()
+        .arg("hook")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write!(child.stdin.as_mut().unwrap(), "{{invalid:{marker}}}").unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    assert!(!stderr.contains(marker), "hook echoed input: {stderr}");
+    assert!(stderr.contains("parsing hook envelope"), "stderr={stderr}");
+}
+
+#[test]
 fn rm_rejects_unsafe_paths() {
     // A `..` path must be refused before we touch the server. Provide a valid
     // config so we get past config-load and reach path validation.
@@ -222,4 +283,268 @@ remote_root = "/"
     assert_eq!(std::fs::read(&target).unwrap(), target_before);
     assert!(!current_state_dir.join("state.json").exists());
     assert_eq!(std::fs::read_dir(&current_state_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn finds_config_upward() {
+    let project = tempfile::tempdir().unwrap();
+    let nested = project.path().join("nested/deeper");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        project.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+
+    let out = bin().arg("status").current_dir(&nested).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ftp connect 127.0.0.1:1"),
+        "ancestor config was not used; stderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("reading .ferry.toml"),
+        "status looked only in the nested directory; stderr={stderr}",
+    );
+}
+
+#[test]
+fn explicit_legacy_config_refreshes_after_apply_migration() {
+    let project = tempfile::tempdir().unwrap();
+    let unrelated_cwd = tempfile::tempdir().unwrap();
+    std::fs::write(
+        unrelated_cwd.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 2
+user = "unrelated"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let legacy_config = project.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    std::fs::write(
+        &legacy_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+
+    let output = bin()
+        .args(["status", "--config"])
+        .arg(&legacy_config)
+        .current_dir(unrelated_cwd.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ftp connect 127.0.0.1:1"),
+        "explicit migrated config was not refreshed; stderr={stderr}",
+    );
+    assert!(
+        project.path().join(ferry::names::CONFIG_FILE).exists(),
+        "legacy config was not migrated",
+    );
+    assert!(!legacy_config.exists(), "legacy config was not removed");
+}
+
+#[test]
+fn explicit_legacy_config_wins_when_current_config_coexists() {
+    let project = tempfile::tempdir().unwrap();
+    let legacy_config = project.path().join(ferry::names::LEGACY_CONFIG_FILE);
+    let current_config = project.path().join(ferry::names::CONFIG_FILE);
+    std::fs::write(
+        &legacy_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "legacy"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &current_config,
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 2
+user = "current"
+password = "p"
+
+[paths]
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+
+    let output = bin()
+        .args(["status", "--config"])
+        .arg(&legacy_config)
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ftp connect 127.0.0.1:1"),
+        "explicit legacy config lost authority; stderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("ftp connect 127.0.0.1:2"),
+        "current config replaced explicit legacy config; stderr={stderr}",
+    );
+    assert!(legacy_config.exists(), "legacy config should remain");
+    assert!(current_config.exists(), "current config should remain");
+}
+
+fn recent_state(target: &str) -> ferry::state::StateFile {
+    let now = chrono::Utc::now();
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        target.into(),
+        ferry::state::FileRecord {
+            sha256: "known".into(),
+            size: 12,
+            remote_mtime: now,
+            last_synced: now,
+        },
+    );
+    state
+}
+
+fn hook_with_target(project: &std::path::Path, target: &std::path::Path) -> std::process::Output {
+    let mut child = bin()
+        .args(["hook", "--cooldown", "3600"])
+        .current_dir(project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.as_mut().unwrap(),
+        &serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": target},
+        }),
+    )
+    .unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn hook_migrates_descendant_local_root_state() {
+    let project = tempfile::tempdir().unwrap();
+    let local_root = project.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let target = local_root.join("target.txt");
+    std::fs::write(&target, b"local bytes\n").unwrap();
+    std::fs::write(
+        project.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+local_root = "mirror"
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let legacy = local_root
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    recent_state("target.txt").save(&legacy).unwrap();
+    std::fs::create_dir(local_root.join(ferry::names::STATE_DIR)).unwrap();
+
+    let output = hook_with_target(project.path(), &target);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    assert!(
+        stderr.contains("within 3600s cooldown, skipping pull"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("pull failed"), "stderr={stderr}");
+    assert!(
+        local_root
+            .join(ferry::names::STATE_DIR)
+            .join("state.json")
+            .exists()
+    );
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn hook_reads_legacy_state_when_migration_fails() {
+    let project = tempfile::tempdir().unwrap();
+    let local_root = project.path().join("mirror");
+    std::fs::create_dir(&local_root).unwrap();
+    let target = local_root.join("target.txt");
+    std::fs::write(&target, b"local bytes\n").unwrap();
+    std::fs::write(
+        project.path().join(ferry::names::CONFIG_FILE),
+        r#"
+[connection]
+host = "127.0.0.1"
+port = 1
+user = "u"
+password = "p"
+
+[paths]
+local_root = "mirror"
+remote_root = "/"
+"#,
+    )
+    .unwrap();
+    let legacy = local_root
+        .join(ferry::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    recent_state("target.txt").save(&legacy).unwrap();
+    std::fs::write(
+        local_root.join(ferry::names::STATE_DIR),
+        b"blocks migration",
+    )
+    .unwrap();
+    let legacy_before = std::fs::read(&legacy).unwrap();
+
+    let output = hook_with_target(project.path(), &target);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr={stderr}");
+    assert!(stderr.contains("warning"), "stderr={stderr}");
+    assert!(
+        stderr.contains("within 3600s cooldown, skipping pull"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("pull failed"), "stderr={stderr}");
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
 }

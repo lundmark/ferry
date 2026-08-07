@@ -18,7 +18,10 @@ pub fn remote_join(root: &str, rel: &str) -> String {
 /// could escape the sync roots. Shared by `push` and `rm` so both enforce the
 /// same containment rule.
 pub fn safe_rel(p: &str) -> Result<String> {
+    #[cfg(windows)]
     let s = p.replace('\\', "/");
+    #[cfg(not(windows))]
+    let s = p.to_owned();
     let rel = s.trim_start_matches("./").to_string();
     if rel.is_empty() || Path::new(&rel).is_absolute() || rel.split('/').any(|c| c == "..") {
         anyhow::bail!(
@@ -26,6 +29,16 @@ pub fn safe_rel(p: &str) -> Result<String> {
         );
     }
     Ok(rel.trim_end_matches('/').to_string())
+}
+
+/// Normalize a path argument relative to `local_root`. Absolute paths are
+/// accepted only when their canonical location is contained by that root.
+pub fn safe_arg(local_root: &Path, input: &str) -> Result<String> {
+    let path = Path::new(input);
+    if path.is_absolute() {
+        return crate::project::relative_to_local_root(local_root, path);
+    }
+    safe_rel(input)
 }
 
 /// Walk the local mirror, populating `out` with relative paths (forward-slash
@@ -37,11 +50,10 @@ pub fn walk_local(
     matcher: &Matcher,
     out: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .with_context(|| format!("reading local dir {}", dir.display()))?;
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("reading local dir {}", dir.display()))?;
     for entry in entries {
-        let entry = entry
-            .with_context(|| format!("walking local dir {}", dir.display()))?;
+        let entry = entry.with_context(|| format!("walking local dir {}", dir.display()))?;
         let path = entry.path();
         let is_dir = path.is_dir();
         if matcher.is_ignored(&path, is_dir) {
@@ -132,9 +144,7 @@ pub fn collect_remote_arg<R: Remote + ?Sized>(
 /// root (i.e. `remote_root = "/"`) contains everything.
 fn is_under(root: &str, path: &str) -> bool {
     let root = root.trim_end_matches('/');
-    root.is_empty()
-        || path == root
-        || path.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+    root.is_empty() || path == root || path.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
 }
 
 /// Resolve a server-supplied listing name into the name of a direct child of
@@ -195,7 +205,10 @@ fn walk_remote_inner<R: Remote + ?Sized>(
         // absolute-echo form is detectable — a bare basename is
         // indistinguishable from a genuine child of the same name, so it is
         // left to the SIZE probe rather than guessed at.
-        if top_level && !sub.is_empty() && entry.name.trim_end_matches('/') == dir.trim_end_matches('/') {
+        if top_level
+            && !sub.is_empty()
+            && entry.name.trim_end_matches('/') == dir.trim_end_matches('/')
+        {
             out.insert(sub.to_string());
             continue;
         }
@@ -293,8 +306,7 @@ mod walk_remote_tests {
         fn list_dir(&mut self, dir: &str) -> Result<Vec<Entry>> {
             self.listed.push(dir.to_string());
             if let Some(children) = self.dirs.get(dir) {
-                let mut out: Vec<Entry> =
-                    children.iter().map(|(n, d)| entry(n, *d)).collect();
+                let mut out: Vec<Entry> = children.iter().map(|(n, d)| entry(n, *d)).collect();
                 if let Some(extra) = self.inject.get(dir) {
                     out.extend(extra.iter().map(|(n, d)| entry(n, *d)));
                 }
@@ -459,7 +471,8 @@ mod walk_remote_tests {
         );
         let out = walk(&mut f, "").unwrap();
         assert!(
-            !out.iter().any(|p| p.contains("passwd") || p.contains("outside")),
+            !out.iter()
+                .any(|p| p.contains("passwd") || p.contains("outside")),
             "escaped the root: {out:?}"
         );
         // The legitimate entries are still walked.
@@ -581,6 +594,27 @@ mod tests {
     #[test]
     fn safe_rel_rejects_absolute() {
         assert!(safe_rel("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn absolute_arg_inside_root_becomes_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("sub/file.c");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            safe_arg(tmp.path(), file.to_str().unwrap()).unwrap(),
+            "sub/file.c"
+        );
+    }
+
+    #[test]
+    fn absolute_arg_outside_root_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("file.c");
+        std::fs::write(&file, "").unwrap();
+        assert!(safe_arg(root.path(), file.to_str().unwrap()).is_err());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! Requires Docker. Run with: cargo test --test rm_integration -- --ignored
+use ferry::ftp::Ftp;
 use std::process::Command;
 use testcontainers::{
+    Container, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::SyncRunner,
-    Container, GenericImage, ImageExt,
 };
-use ferry::ftp::Ftp;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
@@ -87,11 +87,20 @@ fn rm_deletes_file_remote_local_and_state() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    assert!(ftp.size("/notes.txt").is_err(), "remote file should be gone");
-    assert!(!local_root.join("notes.txt").exists(), "local file should be gone");
+    assert!(
+        ftp.size("/notes.txt").is_err(),
+        "remote file should be gone"
+    );
+    assert!(
+        !local_root.join("notes.txt").exists(),
+        "local file should be gone"
+    );
     let new_state =
         ferry::state::StateFile::load_or_default(&state_dir.join("state.json")).unwrap();
-    assert!(!new_state.files.contains_key("notes.txt"), "state entry should be dropped");
+    assert!(
+        !new_state.files.contains_key("notes.txt"),
+        "state entry should be dropped"
+    );
 }
 
 #[test]
@@ -99,7 +108,8 @@ fn rm_deletes_file_remote_local_and_state() {
 fn rm_remote_only_file_succeeds() {
     let (host, port, _c) = start_ftp();
     let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
-    ftp.upload_bytes("/orphan.txt", b"only on server\n").unwrap();
+    ftp.upload_bytes("/orphan.txt", b"only on server\n")
+        .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
@@ -111,7 +121,10 @@ fn rm_remote_only_file_succeeds() {
         "rm of remote-only file should succeed: stderr={}",
         String::from_utf8_lossy(&out.stderr),
     );
-    assert!(ftp.size("/orphan.txt").is_err(), "remote-only file should be gone");
+    assert!(
+        ftp.size("/orphan.txt").is_err(),
+        "remote-only file should be gone"
+    );
 }
 
 #[test]
@@ -140,11 +153,20 @@ fn rm_recursive_clears_subtree_and_removes_dirs() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    assert!(ftp.size("/site/a.txt").is_err(), "remote a.txt should be gone");
-    assert!(ftp.size("/site/sub/b.txt").is_err(), "remote b.txt should be gone");
+    assert!(
+        ftp.size("/site/a.txt").is_err(),
+        "remote a.txt should be gone"
+    );
+    assert!(
+        ftp.size("/site/sub/b.txt").is_err(),
+        "remote b.txt should be gone"
+    );
     // The emptied directories should be removed too.
     assert!(ftp.list("/site").is_err(), "remote /site should be removed");
-    assert!(!local_root.join("site").exists(), "local site/ should be removed");
+    assert!(
+        !local_root.join("site").exists(),
+        "local site/ should be removed"
+    );
 }
 
 #[test]
@@ -159,12 +181,18 @@ fn rm_on_directory_without_recursive_errors() {
 
     let cfg_path = write_config(local_root, &host, port);
     let out = run_rm(&cfg_path, &["stuff"]);
-    assert!(!out.status.success(), "rm of a directory without --recursive should fail");
+    assert!(
+        !out.status.success(),
+        "rm of a directory without --recursive should fail"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("refusing directory"),
         "expected 'refusing directory'; stderr={stderr}",
     );
     // The local directory must be left intact.
-    assert!(local_root.join("stuff/x.txt").exists(), "local dir should be untouched");
+    assert!(
+        local_root.join("stuff/x.txt").exists(),
+        "local dir should be untouched"
+    );
 }

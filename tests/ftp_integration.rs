@@ -1,10 +1,10 @@
 //! Requires Docker. Run with: cargo test --test ftp_integration -- --ignored
+use ferry::ftp::Ftp;
 use testcontainers::{
+    Container, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::SyncRunner,
-    Container, GenericImage, ImageExt,
 };
-use ferry::ftp::Ftp;
 
 fn start_ftp() -> (String, u16, Container<GenericImage>) {
     let img = GenericImage::new("delfer/alpine-ftp-server", "latest")

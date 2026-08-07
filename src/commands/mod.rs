@@ -18,33 +18,27 @@ impl ExecutionMode {
     }
 }
 
-/// Select the state file used by a command. Apply mode always targets the
-/// current path; dry-run mode may read legacy state when no current state file
-/// exists, without migrating it.
-pub fn state_path_for(local_root: &std::path::Path, mode: ExecutionMode) -> std::path::PathBuf {
+/// Select the state file used by a command. Prefer the current state file, but
+/// preserve a legacy state file as the target until migration can complete.
+pub fn state_path_for(local_root: &std::path::Path, _mode: ExecutionMode) -> std::path::PathBuf {
     let current = local_root.join(crate::names::STATE_DIR).join("state.json");
-    if mode.is_dry_run() && !current.exists() {
-        let legacy = local_root
-            .join(crate::names::LEGACY_STATE_DIR)
-            .join("state.json");
-        if legacy.exists() {
-            return legacy;
-        }
+    if current.exists() {
+        return current;
     }
-    current
+
+    let legacy = local_root
+        .join(crate::names::LEGACY_STATE_DIR)
+        .join("state.json");
+    if legacy.exists() { legacy } else { current }
 }
 
 #[cfg(test)]
 mod execution_mode_tests {
-    use super::{state_path_for, ExecutionMode};
+    use super::{ExecutionMode, state_path_for};
 
     #[test]
-    fn dry_run_state_path_reads_legacy_only_as_a_fallback() {
+    fn state_path_reads_legacy_for_both_modes_as_a_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        let current = dir
-            .path()
-            .join(crate::names::STATE_DIR)
-            .join("state.json");
         let legacy = dir
             .path()
             .join(crate::names::LEGACY_STATE_DIR)
@@ -53,16 +47,13 @@ mod execution_mode_tests {
         std::fs::write(&legacy, "legacy").unwrap();
 
         assert_eq!(state_path_for(dir.path(), ExecutionMode::DryRun), legacy);
-        assert_eq!(state_path_for(dir.path(), ExecutionMode::Apply), current);
+        assert_eq!(state_path_for(dir.path(), ExecutionMode::Apply), legacy);
     }
 
     #[test]
     fn dry_run_state_path_prefers_current_over_legacy() {
         let dir = tempfile::tempdir().unwrap();
-        let current = dir
-            .path()
-            .join(crate::names::STATE_DIR)
-            .join("state.json");
+        let current = dir.path().join(crate::names::STATE_DIR).join("state.json");
         let legacy = dir
             .path()
             .join(crate::names::LEGACY_STATE_DIR)
@@ -82,9 +73,25 @@ mod execution_mode_tests {
         assert!(ExecutionMode::Apply.should_apply());
         assert!(!ExecutionMode::DryRun.should_apply());
     }
+
+    #[test]
+    fn apply_state_path_reads_legacy_when_current_state_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_dir = dir.path().join(crate::names::STATE_DIR);
+        let legacy = dir
+            .path()
+            .join(crate::names::LEGACY_STATE_DIR)
+            .join("state.json");
+        std::fs::create_dir(&current_dir).unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        assert_eq!(state_path_for(dir.path(), ExecutionMode::Apply), legacy);
+    }
 }
 
 pub mod cc;
+pub mod file_transfer;
 pub mod hook;
 pub mod init;
 pub mod ls;

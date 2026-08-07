@@ -7,8 +7,8 @@
 //! may not escape the sync roots, and deleting a directory demands
 //! `--recursive`.
 
-use crate::commands::{state_path_for, ExecutionMode};
-use crate::commands::walk::{remote_join, safe_rel, walk_local, walk_remote};
+use crate::commands::walk::{remote_join, safe_arg, walk_local, walk_remote};
+use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::ignored::Matcher;
@@ -33,9 +33,12 @@ pub fn run(
 
     // Validate/normalize every path up front, before opening a connection, so a
     // bad argument fails fast with no side effects.
-    let rels: Vec<String> = paths.iter().map(|p| safe_rel(p)).collect::<Result<_>>()?;
-
     let local_root = cfg.paths.local_root.clone();
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|path| safe_arg(&local_root, path))
+        .collect::<Result<_>>()?;
+
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
@@ -282,7 +285,10 @@ mod tests {
     fn collects_root_and_nested_dirs_but_not_ancestors() {
         // Deleting under "src/old": we clean up src/old and src/old/sub, never
         // the ancestor "src".
-        assert_eq!(dirs("src/old/sub/a.html", "src/old"), vec!["src/old", "src/old/sub"]);
+        assert_eq!(
+            dirs("src/old/sub/a.html", "src/old"),
+            vec!["src/old", "src/old/sub"]
+        );
     }
 
     #[test]

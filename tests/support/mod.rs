@@ -63,6 +63,8 @@ pub fn remote_path(rel: &str) -> String {
 }
 
 pub fn write_config(local_root: &std::path::Path, fixture: &FtpFixture) -> std::path::PathBuf {
+    // Keep the container alive for every config that refers to its mapped port.
+    let _container_guard = &fixture.container;
     let path = local_root.join(".ferry.toml");
     std::fs::write(
         &path,

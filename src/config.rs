@@ -7,6 +7,8 @@ pub struct Config {
     pub paths: Paths,
     #[serde(default)]
     pub sync: Sync,
+    #[serde(default)]
+    pub editor: Editor,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -37,10 +39,35 @@ pub struct Sync {
     pub include: Option<Vec<String>>,
 }
 
-fn default_port() -> u16 { 21 }
-fn default_udp_port() -> u16 { 3203 }
-fn default_true() -> bool { true }
-fn default_local_root() -> PathBuf { PathBuf::from(".") }
+#[derive(Debug, Deserialize, PartialEq)]
+pub struct Editor {
+    #[serde(default = "default_true")]
+    pub pull_on_open: bool,
+    #[serde(default)]
+    pub push_on_save: bool,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            pull_on_open: true,
+            push_on_save: false,
+        }
+    }
+}
+
+fn default_port() -> u16 {
+    21
+}
+fn default_udp_port() -> u16 {
+    3203
+}
+fn default_true() -> bool {
+    true
+}
+fn default_local_root() -> PathBuf {
+    PathBuf::from(".")
+}
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -48,21 +75,18 @@ impl Config {
         // process exits 3 (config problem) rather than 1 (generic). The path
         // and underlying I/O / parse message are preserved inside the
         // `Exit::Config(...)` payload so the user still sees what went wrong.
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            crate::error::Exit::Config(format!("reading {}: {e}", path.display()))
-        })?;
-        let mut cfg: Config = toml::from_str(&text).map_err(|e| {
-            crate::error::Exit::Config(format!("parsing {}: {e}", path.display()))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| crate::error::Exit::Config(format!("reading {}: {e}", path.display())))?;
+        let mut cfg: Config = toml::from_str(&text)
+            .map_err(|e| crate::error::Exit::Config(format!("parsing {}: {e}", path.display())))?;
         // Resolve local_root relative to the config file's directory. Without
         // this, invoking ferry from a different CWD (as the Claude Code
         // hook does) makes `local_root = "."` point at the wrong tree.
-        if cfg.paths.local_root.is_relative() {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    cfg.paths.local_root = parent.join(&cfg.paths.local_root);
-                }
-            }
+        if cfg.paths.local_root.is_relative()
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            cfg.paths.local_root = parent.join(&cfg.paths.local_root);
         }
         Ok(cfg)
     }
@@ -92,6 +116,50 @@ mod tests {
         assert!(cfg.connection.passive);
         assert_eq!(cfg.paths.remote_root, "/var/www/site");
         assert_eq!(cfg.sync.ignore.len(), 2);
+    }
+
+    #[test]
+    fn editor_defaults_preserve_pull_and_disable_push() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [connection]
+            host = "h"
+            user = "u"
+            password = "p"
+            [paths]
+            remote_root = "/"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.editor.pull_on_open);
+        assert!(!cfg.editor.push_on_save);
+    }
+
+    #[test]
+    fn parses_explicit_editor_settings() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [connection]
+            host = "h"
+            user = "u"
+            password = "p"
+            [paths]
+            remote_root = "/"
+            [editor]
+            pull_on_open = false
+            push_on_save = true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.editor,
+            Editor {
+                pull_on_open: false,
+                push_on_save: true
+            }
+        );
     }
 
     #[test]

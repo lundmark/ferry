@@ -110,12 +110,11 @@ pub fn run(config_path: &Path, no_validate: bool, mode: ExecutionMode) -> Result
         )?;
         return Ok(());
     }
-    if let Some(parent) = config_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("creating config parent dir {}", parent.display())
-            })?;
-        }
+    if let Some(parent) = config_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config parent dir {}", parent.display()))?;
     }
     std::fs::write(config_path, &cfg_text)
         .with_context(|| format!("writing {}", config_path.display()))?;
@@ -158,8 +157,8 @@ fn validate_and_resolve<R: BufRead, W: Write>(
     // .ferry.toml so the validation pass agrees with every subsequent
     // command on which files are in scope.
     let patterns: Vec<String> = DEFAULT_IGNORE.iter().map(|s| (*s).to_string()).collect();
-    let matcher = Matcher::new(&patterns, local_root)
-        .context("building ignore matcher for validation")?;
+    let matcher =
+        Matcher::new(&patterns, local_root).context("building ignore matcher for validation")?;
 
     // Passive mode matches the `Connection::passive` default in config.rs;
     // using anything else here would make the validation pass behave
@@ -256,7 +255,10 @@ fn validate_and_resolve<R: BufRead, W: Write>(
     // shell can never silently mutate either side.
     for rel in &differs {
         writeln!(stdout, "\ndiffers: {rel}")?;
-        write!(stdout, "[k]eep unsynced  [p]ush local  [P]ull remote  [s]kip: ")?;
+        write!(
+            stdout,
+            "[k]eep unsynced  [p]ush local  [P]ull remote  [s]kip: "
+        )?;
         stdout.flush()?;
         let choice = read_single_char(stdin).unwrap_or('k');
 
@@ -277,7 +279,11 @@ fn validate_and_resolve<R: BufRead, W: Write>(
                     mode,
                 )?;
                 would_seed_state = true;
-                let verb = if mode.is_dry_run() { "would push" } else { "pushed" };
+                let verb = if mode.is_dry_run() {
+                    "would push"
+                } else {
+                    "pushed"
+                };
                 writeln!(stdout, "{verb} {rel}")?;
             }
             'P' => {
@@ -298,7 +304,11 @@ fn validate_and_resolve<R: BufRead, W: Write>(
                     mode,
                 )?;
                 would_seed_state = true;
-                let verb = if mode.is_dry_run() { "would pull" } else { "pulled" };
+                let verb = if mode.is_dry_run() {
+                    "would pull"
+                } else {
+                    "pulled"
+                };
                 writeln!(stdout, "{verb} {rel}")?;
             }
             's' => {
@@ -321,7 +331,8 @@ fn validate_and_resolve<R: BufRead, W: Write>(
     let state_path: PathBuf = local_root.join(crate::names::STATE_DIR).join("state.json");
     if mode.should_apply() {
         if !state.files.is_empty() {
-            state.save(&state_path)
+            state
+                .save(&state_path)
                 .with_context(|| format!("writing state file {}", state_path.display()))?;
         }
     } else if would_seed_state {
@@ -367,10 +378,10 @@ fn prompt<R: BufRead, W: Write>(
         // EOF before any input — treat as empty (default will apply).
     }
     let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
-    if trimmed.is_empty() {
-        if let Some(d) = default {
-            return Ok(d.to_string());
-        }
+    if trimmed.is_empty()
+        && let Some(d) = default
+    {
+        return Ok(d.to_string());
     }
     Ok(trimmed)
 }
@@ -468,12 +479,10 @@ fn update_gitignore(path: &Path) -> Result<()> {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
-            return Err(anyhow::Error::new(e)
-                .context(format!("reading {}", path.display())));
+            return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
         }
     };
-    let have: std::collections::HashSet<&str> =
-        existing.lines().map(|l| l.trim()).collect();
+    let have: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
 
     let mut to_add: Vec<&str> = Vec::new();
     for entry in entries {
@@ -495,8 +504,7 @@ fn update_gitignore(path: &Path) -> Result<()> {
         new_text.push_str(entry);
         new_text.push('\n');
     }
-    std::fs::write(path, new_text)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, new_text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -516,7 +524,14 @@ mod tests {
         // The whole point of this command is to write a file the rest of
         // the binary can read back. Make sure the loader actually accepts
         // what we render.
-        let text = render_config("ftp.example.com", 21, "deploy", "s3cr3t", "/var/www/site", ".");
+        let text = render_config(
+            "ftp.example.com",
+            21,
+            "deploy",
+            "s3cr3t",
+            "/var/www/site",
+            ".",
+        );
         let parsed: crate::config::Config =
             toml::from_str(&text).expect("render_config produced unparseable TOML");
         assert_eq!(parsed.connection.host, "ftp.example.com");

@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ferry", version, about = "FTP sync helper for editors and coding agents")]
+#[command(
+    name = "ferry",
+    version,
+    about = "FTP sync helper for editors and coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -17,7 +21,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Interactive setup; validates existing local files vs remote.
-    Init { #[arg(long)] no_validate: bool },
+    Init {
+        #[arg(long)]
+        no_validate: bool,
+    },
     /// List a remote directory (connectivity smoke test). PATH is relative
     /// to `paths.remote_root` from the config; empty lists the root itself.
     Ls { path: Option<String> },
@@ -32,15 +39,30 @@ enum Cmd {
     /// Show per-file sync state vs remote.
     Status,
     /// Download remote -> local.
-    Pull { paths: Vec<String>, #[arg(long)] force: bool },
+    Pull {
+        paths: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Upload local -> remote.
-    Push { paths: Vec<String>, #[arg(long)] force: bool },
+    Push {
+        paths: Vec<String>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Pull then push; refuses on conflict unless --force.
-    Sync { #[arg(long)] force: bool },
+    Sync {
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete files on the remote server and the local mirror (and drop their
     /// state records). Requires explicit paths; pass --recursive to delete a
     /// directory subtree.
-    Rm { paths: Vec<String>, #[arg(long)] recursive: bool },
+    Rm {
+        paths: Vec<String>,
+        #[arg(long)]
+        recursive: bool,
+    },
     /// Check-compile files on the MUD via the UDP compile service. Prints
     /// per-file OK/FAIL and diagnostics; exits non-zero if any failed.
     #[command(alias = "check")]
@@ -61,21 +83,45 @@ fn main() {
 fn run() -> i32 {
     let cli = Cli::parse();
     let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
+    if matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty()) {
+        return finish(ferry::commands::rm::run(
+            std::path::Path::new(""),
+            &[],
+            false,
+            mode,
+        ));
+    }
     let explicit_config = cli.config.is_some();
-    let cfg = cli.config.unwrap_or_else(|| {
-        if mode.is_dry_run() {
-            ferry::names::config_path_for_read(std::path::Path::new("."))
-        } else {
-            std::path::PathBuf::from(ferry::names::CONFIG_FILE)
-        }
-    });
-    // Auto-migrate legacy `.zed-ftp` config/state to the current `.ferry` names
-    // when using the default config location. Best-effort: a migration failure
-    // is a warning, not a hard stop — the command below will surface any real
-    // "config not found" error itself.
-    if !explicit_config && mode.should_apply() {
-        if let Err(e) = ferry::names::migrate_legacy(std::path::Path::new(".")) {
+    let mut cfg = cli.config.unwrap_or_else(|| default_config_path(&cli.cmd));
+    let explicit_legacy_config = explicit_config
+        && cfg
+            .file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(ferry::names::LEGACY_CONFIG_FILE));
+    let explicit_legacy_entry_exists = explicit_legacy_config && path_entry_exists(&cfg);
+    let is_hook = matches!(&cli.cmd, Cmd::Hook { .. });
+    let should_load_config = !matches!(&cli.cmd, Cmd::Init { .. })
+        && !matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty());
+    if !is_hook && mode.should_apply() {
+        let config_dir = cfg.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if let Err(e) = ferry::names::migrate_legacy(config_dir) {
             eprintln!("warning: {e:#}");
+        }
+        if !explicit_config || (explicit_legacy_entry_exists && path_entry_is_missing(&cfg)) {
+            cfg = ferry::names::config_path_for_read(config_dir);
+        }
+
+        if should_load_config {
+            match ferry::config::Config::load(&cfg) {
+                Ok(config) => {
+                    if let Err(e) = ferry::names::migrate_legacy(&config.paths.local_root) {
+                        eprintln!("warning: {e:#}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    return classify_exit(&e);
+                }
+            }
         }
     }
     let result: anyhow::Result<()> = match cli.cmd {
@@ -89,6 +135,10 @@ fn run() -> i32 {
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
     };
+    finish(result)
+}
+
+fn finish(result: anyhow::Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -99,6 +149,31 @@ fn run() -> i32 {
             classify_exit(&e)
         }
     }
+}
+
+fn path_entry_exists(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn path_entry_is_missing(path: &std::path::Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn default_config_path(cmd: &Cmd) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    default_config_path_at(cmd, &cwd)
+}
+
+fn default_config_path_at(cmd: &Cmd, cwd: &std::path::Path) -> std::path::PathBuf {
+    if matches!(cmd, Cmd::Init { .. }) {
+        return std::path::PathBuf::from(ferry::names::CONFIG_FILE);
+    }
+    ferry::project::find_config_upward(cwd)
+        .map(|location| location.config_path)
+        .unwrap_or_else(|| ferry::names::config_path_for_read(cwd))
 }
 
 /// Map an anyhow error onto a process exit code. We check both the root
@@ -124,5 +199,24 @@ fn code_for(exit: &ferry::Exit) -> i32 {
     match exit {
         Exit::Conflict(_) => 2,
         Exit::Config(_) | Exit::Auth(_) => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_default_config_stays_in_cwd() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(project.path().join(ferry::names::CONFIG_FILE), "ancestor").unwrap();
+
+        let init = Cmd::Init { no_validate: true };
+        assert_eq!(
+            default_config_path_at(&init, &nested),
+            std::path::PathBuf::from(ferry::names::CONFIG_FILE),
+        );
     }
 }

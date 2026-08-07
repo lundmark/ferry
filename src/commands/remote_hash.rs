@@ -51,40 +51,40 @@ pub fn compute(
 ) -> Result<RemoteHash> {
     // Fast path: only attempt if (a) we haven't already determined the server
     // doesn't speak MDTM, and (b) we have a cached record to compare against.
-    if state.server_supports_mdtm.unwrap_or(true) {
-        if let Some(known) = state.files.get(rel) {
-            match ftp.mtime(remote_path) {
-                Ok(mtime) => {
-                    // MDTM works. Now check size too.
-                    match ftp.size(remote_path) {
-                        Ok(size) => {
-                            // Remember the server speaks MDTM, in case we
-                            // were previously unsure (None).
-                            if state.server_supports_mdtm.is_none() {
-                                state.server_supports_mdtm = Some(true);
-                            }
-                            if mtime == known.remote_mtime && size == known.size {
-                                return Ok(RemoteHash {
-                                    sha256: known.sha256.clone(),
-                                    size,
-                                    mtime,
-                                    from_cache: true,
-                                    bytes: None,
-                                });
-                            }
-                            // Mismatch: fall through to full download.
+    if state.server_supports_mdtm.unwrap_or(true)
+        && let Some(known) = state.files.get(rel)
+    {
+        match ftp.mtime(remote_path) {
+            Ok(mtime) => {
+                // MDTM works. Now check size too.
+                match ftp.size(remote_path) {
+                    Ok(size) => {
+                        // Remember the server speaks MDTM, in case we
+                        // were previously unsure (None).
+                        if state.server_supports_mdtm.is_none() {
+                            state.server_supports_mdtm = Some(true);
                         }
-                        Err(_) => {
-                            // SIZE failed but MDTM worked — odd, but treat
-                            // it as "can't use the fast path this round".
+                        if mtime == known.remote_mtime && size == known.size {
+                            return Ok(RemoteHash {
+                                sha256: known.sha256.clone(),
+                                size,
+                                mtime,
+                                from_cache: true,
+                                bytes: None,
+                            });
                         }
+                        // Mismatch: fall through to full download.
+                    }
+                    Err(_) => {
+                        // SIZE failed but MDTM worked — odd, but treat
+                        // it as "can't use the fast path this round".
                     }
                 }
-                Err(_) => {
-                    // MDTM error: assume the server doesn't support it and
-                    // cache that decision so we skip the probe next run.
-                    state.server_supports_mdtm = Some(false);
-                }
+            }
+            Err(_) => {
+                // MDTM error: assume the server doesn't support it and
+                // cache that decision so we skip the probe next run.
+                state.server_supports_mdtm = Some(false);
             }
         }
     }
