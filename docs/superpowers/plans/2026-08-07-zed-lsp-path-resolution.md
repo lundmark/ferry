@@ -6,7 +6,7 @@
 
 **Architecture:** Keep the extension thin. Resolve the executable with Zed's `Worktree::which`, then pass the lookup result through a pure command-construction helper so success and missing-binary behavior have host-side unit coverage.
 
-**Tech Stack:** Rust 2024, `zed_extension_api` 0.6.0, Cargo, Zed development extensions
+**Tech Stack:** Rust 2024 (root crate), Rust 2021 (Zed extension), `zed_extension_api` 0.6.0, Cargo, Zed development extensions
 
 ---
 
