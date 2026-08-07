@@ -19,9 +19,10 @@ rpassword = "7"
 lsp-server = "0.8"
 lsp-types = "0.97"
 percent-encoding = "2"
+tempfile = "3"
+fs2 = "0.4"
 
 [dev-dependencies]
-tempfile = "3"
 testcontainers = { version = "0.20", features = ["blocking"] }
 
 [[bin]]

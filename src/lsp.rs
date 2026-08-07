@@ -1,3 +1,4 @@
+mod diff;
 mod document_state;
 
 use std::path::{Path, PathBuf};
