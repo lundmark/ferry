@@ -2,22 +2,26 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use fs2::FileExt;
-use tempfile::{Builder, NamedTempFile, TempDir};
+use same_file::Handle;
+use tempfile::{Builder, NamedTempFile};
 
 use super::document_state::OperationGuard;
 
 const ROOT_PREFIX: &str = "ferry-lsp-diff-v1-";
+const QUARANTINE_PREFIX: &str = "ferry-lsp-quarantine-v1-";
+const QUARANTINED_ROOT_NAME: &str = "root";
 const SNAPSHOT_PREFIX: &str = "remote-";
 const LOCK_NAME: &str = ".lock";
+const CHILD_REAPER_THREAD_NAME: &str = "ferry-zed-diff-reaper";
 const MAX_EXTENSION_BYTES: usize = 32;
 
 pub(crate) trait DiffLauncher: Send {
@@ -26,11 +30,48 @@ pub(crate) trait DiffLauncher: Send {
 
 pub(crate) struct ZedDiffLauncher;
 
+struct ChildReaper {
+    sender: Sender<Child>,
+    waiter: JoinHandle<io::Result<ExitStatus>>,
+}
+
+impl ChildReaper {
+    fn start() -> Result<Self> {
+        let (sender, receiver) = channel::<Child>();
+        let waiter = thread::Builder::new()
+            .name(CHILD_REAPER_THREAD_NAME.to_owned())
+            .spawn(move || {
+                let mut child = receiver.recv().map_err(|_| {
+                    io::Error::new(
+                        ErrorKind::BrokenPipe,
+                        "Zed child reaper closed before receiving a child",
+                    )
+                })?;
+                child.wait()
+            })
+            .context("starting Zed child reaper")?;
+        Ok(Self { sender, waiter })
+    }
+
+    fn accept(self, child: Child) -> JoinHandle<io::Result<ExitStatus>> {
+        // The fresh worker cannot disconnect before this rendezvous: its only
+        // operation before receipt is the blocking receive above.
+        self.sender
+            .send(child)
+            .expect("fresh Zed child reaper must accept its child");
+        self.waiter
+    }
+}
+
 impl DiffLauncher for ZedDiffLauncher {
     fn launch(&mut self, local: &Path, remote: &Path) -> Result<()> {
-        zed_diff_command(local, remote)
+        // Start the waiter before the child so thread-creation failure never
+        // leaves an already-spawned process without a reaping owner.
+        let reaper = ChildReaper::start()?;
+        let child = zed_diff_command(local, remote)
             .spawn()
             .context("launching Zed native diff")?;
+        drop(reaper.accept(child));
         Ok(())
     }
 }
@@ -58,8 +99,32 @@ struct SnapshotInner {
 struct SnapshotState {
     closed: bool,
     retained: Vec<PreparedSnapshot>,
+    root: Option<OwnedRoot>,
+}
+
+struct OwnedRoot {
+    base: PathBuf,
+    location: RootLocation,
+    root_identity: Option<Handle>,
     lock_file: Option<File>,
-    root: Option<TempDir>,
+    lock_identity: Option<Handle>,
+    quarantine: Option<Quarantine>,
+    #[cfg(test)]
+    fail_after_move: bool,
+    #[cfg(test)]
+    fail_next_delete: bool,
+}
+
+enum RootLocation {
+    Active(PathBuf),
+    QuarantinedUnverified(PathBuf),
+    QuarantinedVerified(PathBuf),
+    Complete,
+}
+
+struct Quarantine {
+    path: PathBuf,
+    identity: Option<Handle>,
 }
 
 pub(crate) struct PreparedSnapshot {
@@ -69,6 +134,334 @@ pub(crate) struct PreparedSnapshot {
 impl PreparedSnapshot {
     pub(crate) fn path(&self) -> &Path {
         self.file.path()
+    }
+}
+
+impl Drop for PreparedSnapshot {
+    fn drop(&mut self) {
+        #[cfg(not(unix))]
+        clear_file_read_only(self.file.as_file());
+    }
+}
+
+impl OwnedRoot {
+    fn capture(base: PathBuf, source: PathBuf, lock_file: File) -> Result<Self> {
+        let root_identity =
+            Handle::from_path(&source).context("capturing private snapshot root identity")?;
+        Self::capture_with_root_identity(base, source, lock_file, root_identity)
+    }
+
+    fn capture_with_root_identity(
+        base: PathBuf,
+        source: PathBuf,
+        lock_file: File,
+        root_identity: Handle,
+    ) -> Result<Self> {
+        ensure!(
+            source != base && source.parent() == Some(base.as_path()),
+            "private snapshot root is outside its canonical base"
+        );
+        validate_active_root(&source)?;
+        ensure!(
+            fs::canonicalize(&source).context("resolving owned private snapshot root")? == source,
+            "owned private snapshot root does not resolve to itself"
+        );
+
+        let current_root =
+            Handle::from_path(&source).context("rechecking private snapshot root identity")?;
+        ensure!(
+            current_root == root_identity,
+            "private snapshot root identity changed during capture"
+        );
+
+        let lock_path = source.join(LOCK_NAME);
+        validate_lock_path(&source, &lock_path, &lock_file)?;
+        let lock_identity = Handle::from_file(
+            lock_file
+                .try_clone()
+                .context("cloning private snapshot lock for identity")?,
+        )
+        .context("capturing private snapshot lock identity")?;
+        let current_lock =
+            Handle::from_path(&lock_path).context("rechecking private snapshot lock identity")?;
+        ensure!(
+            current_lock == lock_identity,
+            "private snapshot lock identity changed during capture"
+        );
+
+        Ok(Self {
+            base,
+            location: RootLocation::Active(source),
+            root_identity: Some(root_identity),
+            lock_file: Some(lock_file),
+            lock_identity: Some(lock_identity),
+            quarantine: None,
+            #[cfg(test)]
+            fail_after_move: false,
+            #[cfg(test)]
+            fail_next_delete: false,
+        })
+    }
+
+    fn active_path(&self) -> Option<&Path> {
+        match &self.location {
+            RootLocation::Active(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn cleanup_path(&self) -> Option<&Path> {
+        match &self.location {
+            RootLocation::Active(path)
+            | RootLocation::QuarantinedUnverified(path)
+            | RootLocation::QuarantinedVerified(path) => Some(path),
+            RootLocation::Complete => None,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if matches!(self.location, RootLocation::Active(_)) {
+            self.move_to_quarantine()?;
+        }
+        #[cfg(test)]
+        if self.fail_after_move {
+            self.fail_after_move = false;
+            return Err(anyhow!("injected failure after quarantine move"));
+        }
+        if matches!(self.location, RootLocation::QuarantinedUnverified(_)) {
+            self.verify_quarantined_root()?;
+        }
+        if matches!(self.location, RootLocation::QuarantinedVerified(_)) {
+            self.delete_verified_quarantine()?;
+        }
+        Ok(())
+    }
+
+    fn move_to_quarantine(&mut self) -> Result<()> {
+        let source = match &self.location {
+            RootLocation::Active(path) => path.clone(),
+            _ => return Ok(()),
+        };
+        self.ensure_quarantine()?;
+        self.verify_quarantine_identity()?;
+
+        let quarantine = self
+            .quarantine
+            .as_ref()
+            .context("private snapshot quarantine is unavailable")?;
+        let moved_root = quarantine.path.join(QUARANTINED_ROOT_NAME);
+        match fs::symlink_metadata(&moved_root) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(anyhow!(
+                    "private snapshot quarantine destination already exists"
+                ));
+            }
+            Err(error) => {
+                return Err(error).context("inspecting private snapshot quarantine destination");
+            }
+        }
+
+        fs::rename(&source, &moved_root).with_context(|| {
+            format!(
+                "moving private snapshot root {} into quarantine {}",
+                source.display(),
+                quarantine.path.display()
+            )
+        })?;
+        // Rename is atomic. Record the moved path before any other fallible work.
+        self.location = RootLocation::QuarantinedUnverified(moved_root);
+        Ok(())
+    }
+
+    fn ensure_quarantine(&mut self) -> Result<()> {
+        if self.quarantine.is_none() {
+            let mut builder = Builder::new();
+            builder.prefix(QUARANTINE_PREFIX).disable_cleanup(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(fs::Permissions::from_mode(0o700));
+            }
+
+            let quarantine = builder
+                .tempdir_in(&self.base)
+                .context("creating private snapshot quarantine")?;
+            let identity = Handle::from_path(quarantine.path())
+                .context("capturing private snapshot quarantine identity");
+            let path = quarantine.keep();
+            // Persist the path immediately: no TempDir drop may remove an
+            // unverified quarantine after this point.
+            self.quarantine = Some(Quarantine {
+                path,
+                identity: None,
+            });
+            self.quarantine
+                .as_mut()
+                .expect("quarantine was just stored")
+                .identity = Some(identity?);
+        }
+
+        let quarantine = self
+            .quarantine
+            .as_ref()
+            .context("private snapshot quarantine is unavailable")?;
+        let identity = quarantine
+            .identity
+            .as_ref()
+            .context("private snapshot quarantine identity is unavailable")?;
+        set_private_directory_mode(identity.as_file())?;
+        self.verify_quarantine_identity()
+    }
+
+    fn verify_quarantine_identity(&self) -> Result<()> {
+        let quarantine = self
+            .quarantine
+            .as_ref()
+            .context("private snapshot quarantine is unavailable")?;
+        ensure!(
+            quarantine.path.parent() == Some(self.base.as_path()),
+            "private snapshot quarantine is outside its canonical base"
+        );
+        let metadata = fs::symlink_metadata(&quarantine.path)
+            .context("inspecting private snapshot quarantine")?;
+        ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "private snapshot quarantine is unsafe"
+        );
+        ensure!(
+            fs::canonicalize(&quarantine.path).context("resolving private snapshot quarantine")?
+                == quarantine.path,
+            "private snapshot quarantine does not resolve to itself"
+        );
+        let expected = quarantine
+            .identity
+            .as_ref()
+            .context("private snapshot quarantine identity is unavailable")?;
+        let current = Handle::from_path(&quarantine.path)
+            .context("rechecking private snapshot quarantine identity")?;
+        ensure!(
+            &current == expected,
+            "private snapshot quarantine identity changed"
+        );
+        Ok(())
+    }
+
+    fn verify_quarantined_root(&mut self) -> Result<()> {
+        self.verify_quarantine_identity()?;
+        let moved_root = match &self.location {
+            RootLocation::QuarantinedUnverified(path) => path.clone(),
+            _ => return Ok(()),
+        };
+        let quarantine_path = self
+            .quarantine
+            .as_ref()
+            .context("private snapshot quarantine is unavailable")?
+            .path
+            .clone();
+        ensure!(
+            moved_root.parent() == Some(quarantine_path.as_path()),
+            "quarantined private snapshot root is misplaced"
+        );
+        validate_active_root(&moved_root)?;
+        ensure!(
+            fs::canonicalize(&moved_root).context("resolving quarantined private snapshot root")?
+                == moved_root,
+            "quarantined private snapshot root does not resolve to itself"
+        );
+
+        let expected_root = self
+            .root_identity
+            .as_ref()
+            .context("private snapshot root identity is unavailable")?;
+        let current_root = Handle::from_path(&moved_root)
+            .context("capturing moved private snapshot root identity")?;
+        ensure!(
+            &current_root == expected_root,
+            "moved private snapshot root identity does not match its owner"
+        );
+
+        let moved_lock = moved_root.join(LOCK_NAME);
+        let lock_file = self
+            .lock_file
+            .as_ref()
+            .context("private snapshot lock is unavailable")?;
+        validate_lock_path(&moved_root, &moved_lock, lock_file)?;
+        let expected_lock = self
+            .lock_identity
+            .as_ref()
+            .context("private snapshot lock identity is unavailable")?;
+        let current_lock = Handle::from_path(&moved_lock)
+            .context("capturing moved private snapshot lock identity")?;
+        ensure!(
+            &current_lock == expected_lock,
+            "moved private snapshot lock identity does not match its owner"
+        );
+
+        self.location = RootLocation::QuarantinedVerified(moved_root);
+        // The private quarantine is now the retryable ownership boundary.
+        // Release open handles only after both identities have matched.
+        self.root_identity = None;
+        self.lock_identity = None;
+        self.lock_file = None;
+        if let Some(quarantine) = &mut self.quarantine {
+            quarantine.identity = None;
+        }
+        Ok(())
+    }
+
+    fn delete_verified_quarantine(&mut self) -> Result<()> {
+        let quarantine = self
+            .quarantine
+            .as_ref()
+            .context("verified private snapshot quarantine is unavailable")?
+            .path
+            .clone();
+
+        #[cfg(test)]
+        if self.fail_next_delete {
+            self.fail_next_delete = false;
+            return Err(anyhow!("injected cleanup failure"));
+        }
+
+        prepare_tree_for_removal(&quarantine)?;
+        fs::remove_dir_all(&quarantine).with_context(|| {
+            format!(
+                "removing verified private snapshot quarantine {}",
+                quarantine.display()
+            )
+        })?;
+        self.location = RootLocation::Complete;
+        self.quarantine = None;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn cleanup_path_for_test(&self) -> &Path {
+        self.cleanup_path()
+            .expect("test expected pending private snapshot cleanup")
+    }
+
+    #[cfg(test)]
+    fn quarantine_path_for_test(&self) -> Option<&Path> {
+        self.quarantine
+            .as_ref()
+            .map(|quarantine| quarantine.path.as_path())
+    }
+
+    #[cfg(test)]
+    fn is_cleanup_complete_for_test(&self) -> bool {
+        matches!(self.location, RootLocation::Complete)
+    }
+
+    #[cfg(test)]
+    fn fail_after_move_for_test(&mut self) {
+        self.fail_after_move = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_delete_for_test(&mut self) {
+        self.fail_next_delete = true;
     }
 }
 
@@ -105,25 +498,42 @@ impl SharedSnapshotStore {
 
         cleanup_stale_roots(&base)?;
 
-        let root = Builder::new()
-            .prefix(ROOT_PREFIX)
+        let mut root_builder = Builder::new();
+        root_builder.prefix(ROOT_PREFIX).disable_cleanup(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            root_builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let root = root_builder
             .tempdir_in(&base)
             .context("creating private snapshot root")?;
-        let lock_path = root.path().join(LOCK_NAME);
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
+        let root_identity = Handle::from_path(root.path())
+            .context("capturing new private snapshot root identity")?;
+        let root_path = root.keep();
+        set_private_directory_mode(root_identity.as_file())?;
+
+        let lock_path = root_path.join(LOCK_NAME);
+        let mut lock_options = OpenOptions::new();
+        lock_options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let lock_file = lock_options
             .open(&lock_path)
             .context("creating private snapshot root lock")?;
+        set_private_file_mode(&lock_file)?;
         FileExt::lock_exclusive(&lock_file).context("locking private snapshot root")?;
+        let root =
+            OwnedRoot::capture_with_root_identity(base, root_path, lock_file, root_identity)?;
 
         Ok(Self {
             inner: Arc::new(SnapshotInner {
                 state: Mutex::new(SnapshotState {
                     closed: false,
                     retained: Vec::new(),
-                    lock_file: Some(lock_file),
                     root: Some(root),
                 }),
             }),
@@ -147,7 +557,8 @@ impl SharedSnapshotStore {
             state
                 .root
                 .as_ref()
-                .map(|root| root.path().to_path_buf())
+                .and_then(OwnedRoot::active_path)
+                .map(Path::to_path_buf)
                 .context("private snapshot root is unavailable")?
         };
 
@@ -176,8 +587,8 @@ impl SharedSnapshotStore {
             let active_root = state
                 .root
                 .as_ref()
-                .context("private snapshot root is unavailable")?
-                .path();
+                .and_then(OwnedRoot::active_path)
+                .context("private snapshot root is unavailable")?;
             ensure!(
                 active_root == root,
                 "private snapshot root changed during creation"
@@ -204,8 +615,8 @@ impl SharedSnapshotStore {
         let root = state
             .root
             .as_ref()
+            .and_then(OwnedRoot::active_path)
             .context("private snapshot root is unavailable")?
-            .path()
             .to_path_buf();
 
         ensure!(local.is_absolute(), "local diff path must be absolute");
@@ -229,30 +640,40 @@ impl SharedSnapshotStore {
         state
             .root
             .as_ref()
-            .map(|root| root.path().to_path_buf())
+            .and_then(OwnedRoot::active_path)
+            .map(Path::to_path_buf)
             .context("private snapshot root is unavailable")
+    }
+
+    #[cfg(test)]
+    fn fail_next_cleanup_for_test(&self) -> Result<()> {
+        let mut state = self.inner.lock()?;
+        let root = state
+            .root
+            .as_mut()
+            .context("private snapshot root is unavailable")?;
+        root.fail_next_delete_for_test();
+        Ok(())
     }
 }
 
 impl SnapshotShutdown {
     pub(crate) fn shutdown(&self) -> Result<()> {
-        let root = {
-            let mut state = self.inner.lock()?;
-            if state.closed {
-                return Ok(());
-            }
-
+        let mut state = self.inner.lock()?;
+        if !state.closed {
             state.closed = true;
             state.retained.clear();
-            let lock_file = state.lock_file.take();
-            drop(lock_file);
-            state.root.take()
-        };
+        }
 
-        if let Some(root) = root {
-            let path = root.path().to_path_buf();
-            root.close()
-                .with_context(|| format!("removing private snapshot root {}", path.display()))?;
+        let cleanup_complete = match state.root.as_mut() {
+            Some(root) => {
+                root.cleanup()?;
+                matches!(root.location, RootLocation::Complete)
+            }
+            None => true,
+        };
+        if cleanup_complete {
+            state.root = None;
         }
         Ok(())
     }
@@ -260,6 +681,17 @@ impl SnapshotShutdown {
     #[cfg(test)]
     fn is_closed(&self) -> Result<bool> {
         Ok(self.inner.lock()?.closed)
+    }
+
+    #[cfg(test)]
+    fn pending_cleanup_path_for_test(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .inner
+            .lock()?
+            .root
+            .as_ref()
+            .and_then(OwnedRoot::cleanup_path)
+            .map(Path::to_path_buf))
     }
 }
 
@@ -275,23 +707,94 @@ fn safe_snapshot_suffix(source_name: &Path) -> Option<String> {
 }
 
 fn make_snapshot_read_only(file: &File) -> Result<()> {
+    let mut permissions = file
+        .metadata()
+        .context("inspecting private remote snapshot permissions")?
+        .permissions();
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = file
-            .metadata()
-            .context("inspecting private remote snapshot permissions")?
-            .permissions();
         let mode = permissions.mode();
         permissions.set_mode(mode & !0o222);
-        file.set_permissions(permissions)
-            .context("making private remote snapshot read-only")?;
     }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
 
+    file.set_permissions(permissions)
+        .context("making private remote snapshot read-only")
+}
+
+#[cfg(not(unix))]
+fn clear_file_read_only(file: &File) {
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        let _ = file.set_permissions(permissions);
+    }
+}
+
+fn set_private_directory_mode(directory: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .context("setting private snapshot directory mode")?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
+}
+
+fn set_private_file_mode(file: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .context("setting private snapshot lock mode")?;
+    }
     #[cfg(not(unix))]
     let _ = file;
+    Ok(())
+}
 
+fn prepare_tree_for_removal(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        clear_tree_read_only(path)?;
+    }
+    #[cfg(unix)]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn clear_tree_read_only(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting cleanup path {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("reading cleanup directory {}", path.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("reading cleanup entry below {}", path.display()))?;
+            clear_tree_read_only(&entry.path())?;
+        }
+    }
+
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("clearing read-only cleanup path {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -300,6 +803,31 @@ fn validate_active_root(root: &Path) -> Result<()> {
     ensure!(
         metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
         "active private snapshot root is unsafe"
+    );
+    Ok(())
+}
+
+fn validate_lock_path(root: &Path, lock_path: &Path, lock_file: &File) -> Result<()> {
+    ensure!(
+        lock_path.parent() == Some(root),
+        "private snapshot lock is outside its root"
+    );
+    let metadata =
+        fs::symlink_metadata(lock_path).context("inspecting private snapshot lock path")?;
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "private snapshot lock path is unsafe"
+    );
+    ensure!(
+        fs::canonicalize(lock_path).context("resolving private snapshot lock path")? == lock_path,
+        "private snapshot lock path does not resolve to itself"
+    );
+    ensure!(
+        lock_file
+            .metadata()
+            .context("inspecting opened private snapshot lock")?
+            .is_file(),
+        "opened private snapshot lock is not a regular file"
     );
     Ok(())
 }
@@ -364,9 +892,7 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
         let Ok(opened_metadata) = lock_file.metadata() else {
             continue;
         };
-        if !opened_metadata.file_type().is_file()
-            || !same_file_identity(&lock_metadata, &opened_metadata)
-        {
+        if !opened_metadata.file_type().is_file() {
             continue;
         }
         match FileExt::try_lock_exclusive(&lock_file) {
@@ -375,19 +901,13 @@ fn cleanup_stale_roots(base: &Path) -> Result<()> {
             Err(_) => continue,
         }
 
-        if !revalidate_stale_candidate(
-            base,
-            &candidate,
-            &resolved_candidate,
-            &lock_path,
-            &lock_file,
-        ) {
+        let Ok(mut root) = OwnedRoot::capture(base.to_path_buf(), candidate.clone(), lock_file)
+        else {
             continue;
-        }
-
-        fs::remove_dir_all(&candidate).with_context(|| {
+        };
+        root.cleanup().with_context(|| {
             format!(
-                "removing stale private snapshot root {}",
+                "cleaning stale private snapshot root {}",
                 candidate.display()
             )
         })?;
@@ -1063,5 +1583,246 @@ mod tests {
         assert_eq!(fs::read(&lock_path).unwrap(), b"different regular file");
 
         FileExt::unlock(&original_lock).unwrap();
+    }
+
+    #[test]
+    fn shutdown_rejects_a_replaced_root_path_without_deleting_either_directory() {
+        let base = tempdir().unwrap();
+        let (store, shutdown) = store_in(&base);
+        let root = store.root_path().unwrap();
+        let renamed_original = base.path().join("renamed-owned-root");
+        fs::rename(&root, &renamed_original).unwrap();
+
+        fs::create_dir(&root).unwrap();
+        let replacement_sentinel = root.join("replacement-sentinel");
+        fs::write(&replacement_sentinel, b"must survive").unwrap();
+
+        let error = shutdown.shutdown().unwrap_err();
+        let moved_replacement = shutdown.pending_cleanup_path_for_test().unwrap().unwrap();
+        let quarantine = moved_replacement.parent().unwrap().to_path_buf();
+
+        assert!(format!("{error:#}").contains("identity"));
+        assert!(renamed_original.exists());
+        assert!(!replacement_sentinel.exists());
+        assert!(moved_replacement.join("replacement-sentinel").exists());
+        assert!(shutdown.is_closed().unwrap());
+        drop(store);
+        drop(shutdown);
+        assert!(renamed_original.exists());
+        assert!(quarantine.exists());
+        assert!(moved_replacement.join("replacement-sentinel").exists());
+    }
+
+    fn captured_root(base: &Path, candidate: &Path) -> super::OwnedRoot {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(candidate.join(".lock"))
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        super::OwnedRoot::capture(base.to_path_buf(), candidate.to_path_buf(), lock).unwrap()
+    }
+
+    #[test]
+    fn stale_cleanup_rejects_a_replaced_path_without_deleting_the_replacement() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "stalereplaced");
+        let mut owned = captured_root(&canonical_base, &candidate);
+        let renamed_original = canonical_base.join("renamed-stale-original");
+        fs::rename(&candidate, &renamed_original).unwrap();
+
+        let replacement = recognizable_root(&canonical_base, "stalereplaced");
+        fs::write(replacement.join("replacement-sentinel"), b"must survive").unwrap();
+
+        let error = owned.cleanup().unwrap_err();
+
+        assert!(format!("{error:#}").contains("identity"));
+        assert!(renamed_original.exists());
+        assert!(
+            owned
+                .cleanup_path_for_test()
+                .join("replacement-sentinel")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn successful_owned_root_cleanup_removes_the_verified_original() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "verifiedcleanup");
+        let mut owned = captured_root(&canonical_base, &candidate);
+
+        owned.cleanup().unwrap();
+
+        assert!(!candidate.exists());
+        assert!(owned.is_cleanup_complete_for_test());
+        assert!(
+            fs::read_dir(&canonical_base)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(super::QUARANTINE_PREFIX))
+        );
+    }
+
+    #[test]
+    fn an_unverified_quarantine_is_not_deleted_when_its_owner_is_dropped() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "persistmismatch");
+        let mut owned = captured_root(&canonical_base, &candidate);
+        let renamed_original = canonical_base.join("persisted-original");
+        fs::rename(&candidate, &renamed_original).unwrap();
+
+        let replacement = recognizable_root(&canonical_base, "persistmismatch");
+        fs::write(replacement.join("preserved-sentinel"), b"preserve").unwrap();
+        owned.cleanup().unwrap_err();
+        let quarantine = owned.quarantine_path_for_test().unwrap().to_path_buf();
+        let moved_replacement = owned.cleanup_path_for_test().to_path_buf();
+
+        drop(owned);
+
+        assert!(quarantine.exists());
+        assert_eq!(
+            fs::read(moved_replacement.join("preserved-sentinel")).unwrap(),
+            b"preserve"
+        );
+        assert!(renamed_original.exists());
+    }
+
+    #[test]
+    fn shutdown_cleanup_failure_is_retryable_after_the_store_is_closed() {
+        let base = tempdir().unwrap();
+        let (store, shutdown) = store_in(&base);
+        let root = store.root_path().unwrap();
+        store.fail_next_cleanup_for_test().unwrap();
+
+        let first_error = shutdown.shutdown().unwrap_err();
+        let pending = shutdown.pending_cleanup_path_for_test().unwrap().unwrap();
+
+        assert!(format!("{first_error:#}").contains("injected cleanup failure"));
+        assert!(shutdown.is_closed().unwrap());
+        assert!(pending.exists());
+        assert!(!root.exists());
+        assert!(
+            store
+                .prepare_snapshot(Path::new("closed.rs"), b"closed")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("closed")
+        );
+
+        shutdown.shutdown().unwrap();
+        assert!(!pending.exists());
+        assert!(shutdown.pending_cleanup_path_for_test().unwrap().is_none());
+        shutdown.shutdown().unwrap();
+    }
+
+    #[test]
+    fn quarantine_move_holds_lock_and_is_not_recognized_by_another_scan() {
+        let base = tempdir().unwrap();
+        let canonical_base = fs::canonicalize(base.path()).unwrap();
+        let candidate = recognizable_root(&canonical_base, "overlap");
+        let mut owned = captured_root(&canonical_base, &candidate);
+        owned.fail_after_move_for_test();
+
+        owned.cleanup().unwrap_err();
+        let quarantine = owned.quarantine_path_for_test().unwrap().to_path_buf();
+        let moved_root = owned.cleanup_path_for_test().to_path_buf();
+
+        assert!(quarantine.exists());
+        assert!(moved_root.exists());
+        assert!(!candidate.exists());
+        assert!(
+            !quarantine
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(ROOT_PREFIX)
+        );
+        let moved_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(moved_root.join(".lock"))
+            .unwrap();
+        assert!(matches!(
+            FileExt::try_lock_exclusive(&moved_lock),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        super::cleanup_stale_roots(&canonical_base).unwrap();
+
+        assert!(quarantine.exists());
+        assert!(moved_root.exists());
+        owned.cleanup().unwrap();
+        assert!(!quarantine.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_root_and_lock_have_exact_owner_only_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempdir().unwrap();
+        let (store, shutdown) = store_in(&base);
+        let root = store.root_path().unwrap();
+
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(root.join(".lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        shutdown.shutdown().unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_snapshot_cleanup_clears_read_only_before_unlinking() {
+        let base = tempdir().unwrap();
+        let (store, shutdown) = store_in(&base);
+        let snapshot = store
+            .prepare_snapshot(Path::new("readonly.rs"), b"readonly")
+            .unwrap();
+        let path = snapshot.path().to_path_buf();
+
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        drop(snapshot);
+        assert!(!path.exists());
+
+        shutdown.shutdown().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn child_reaper_waits_for_a_short_lived_child() {
+        let reaper = super::ChildReaper::start().unwrap();
+        #[cfg(unix)]
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+
+        let waiter = reaper.accept(child);
+        let status = waiter.join().unwrap().unwrap();
+
+        assert!(status.success());
     }
 }

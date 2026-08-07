@@ -545,6 +545,7 @@ dependencies = [
  "lsp-types",
  "percent-encoding",
  "rpassword",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

@@ -21,6 +21,7 @@ lsp-types = "0.97"
 percent-encoding = "2"
 tempfile = "3"
 fs2 = "0.4"
+same-file = "1"
 
 [dev-dependencies]
 testcontainers = { version = "0.20", features = ["blocking"] }
