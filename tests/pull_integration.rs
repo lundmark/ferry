@@ -1,56 +1,24 @@
 //! Requires Docker. Run with: cargo test --test pull_integration -- --ignored
+mod support;
+
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
 use std::process::Command;
-use testcontainers::{
-    Container, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-};
-
-fn start_ftp() -> (String, u16, Container<GenericImage>) {
-    let img = GenericImage::new("delfer/alpine-ftp-server", "latest")
-        .with_exposed_port(21.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("vsftpd"))
-        .with_env_var("USERS", "test|testpw|/home/test");
-    let container = img.start().unwrap();
-    let port = container.get_host_port_ipv4(21.tcp()).unwrap();
-    ("127.0.0.1".into(), port, container)
-}
-
-fn write_config(local_root: &std::path::Path, host: &str, port: u16) -> std::path::PathBuf {
-    let cfg_path = local_root.join(".ferry.toml");
-    let cfg = format!(
-        r#"
-[connection]
-host = "{host}"
-port = {port}
-user = "test"
-password = "testpw"
-passive = true
-
-[paths]
-local_root = "{root}"
-remote_root = "/"
-"#,
-        host = host,
-        port = port,
-        root = local_root.display(),
-    );
-    std::fs::write(&cfg_path, cfg).unwrap();
-    cfg_path
-}
+use support::{remote_path, start_ftp, write_config};
 
 #[test]
 #[ignore]
 fn pull_downloads_new_and_remote_changed_files() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
     let keep_remote: &[u8] = b"only on remote initially\n";
     let update_remote: &[u8] = b"updated remote version\n";
-    ftp.upload_bytes("/keep.txt", keep_remote).unwrap();
-    ftp.upload_bytes("/update.txt", update_remote).unwrap();
+    ftp.upload_bytes(&remote_path("keep.txt"), keep_remote)
+        .unwrap();
+    ftp.upload_bytes(&remote_path("update.txt"), update_remote)
+        .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
@@ -76,7 +44,7 @@ fn pull_downloads_new_and_remote_changed_files() {
     );
     state.save(&state_dir.join("state.json")).unwrap();
 
-    let cfg_path = write_config(local_root, &host, port);
+    let cfg_path = write_config(local_root, &fixture);
 
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
         .arg("--config")
@@ -119,11 +87,13 @@ fn pull_downloads_new_and_remote_changed_files() {
 #[test]
 #[ignore]
 fn pull_refuses_local_changed_without_force_and_obeys_force() {
-    let (host, port, _c) = start_ftp();
+    let fixture = start_ftp();
 
-    let mut ftp = Ftp::connect(&host, port, "test", "testpw", true).unwrap();
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
     let remote_bytes: &[u8] = b"remote version of file\n";
-    ftp.upload_bytes("/edited.txt", remote_bytes).unwrap();
+    ftp.upload_bytes(&remote_path("edited.txt"), remote_bytes)
+        .unwrap();
 
     let workdir = tempfile::tempdir().unwrap();
     let local_root = workdir.path();
@@ -149,7 +119,7 @@ fn pull_refuses_local_changed_without_force_and_obeys_force() {
     );
     state.save(&state_dir.join("state.json")).unwrap();
 
-    let cfg_path = write_config(local_root, &host, port);
+    let cfg_path = write_config(local_root, &fixture);
 
     // Without --force: pull should fail and local file should be untouched.
     let out = Command::new(env!("CARGO_BIN_EXE_ferry"))
