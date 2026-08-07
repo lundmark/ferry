@@ -808,8 +808,20 @@ mod tests {
     }
 
     #[test]
-    fn automatic_open_with_default_config_pulls_once_without_force() {
+    fn automatic_open_with_default_config_calls_nothing() {
         let fixture = Fixture::new("");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (server_connection, _client_connection) = Connection::memory();
+        let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
+
+        server.handle_notification(&server_connection, did_open(fixture.uri()));
+
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn automatic_open_enabled_pulls_once_without_force() {
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let calls = Rc::new(RefCell::new(Vec::new()));
         let (server_connection, _client_connection) = Connection::memory();
         let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
@@ -827,20 +839,8 @@ mod tests {
     }
 
     #[test]
-    fn automatic_open_disabled_calls_nothing() {
-        let fixture = Fixture::new("[editor]\npull_on_open = false\n");
-        let calls = Rc::new(RefCell::new(Vec::new()));
-        let (server_connection, _client_connection) = Connection::memory();
-        let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
-
-        server.handle_notification(&server_connection, did_open(fixture.uri()));
-
-        assert!(calls.borrow().is_empty());
-    }
-
-    #[test]
     fn automatic_editor_settings_are_reloaded_for_each_event() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let calls = Rc::new(RefCell::new(Vec::new()));
         let (server_connection, _client_connection) = Connection::memory();
         let mut server = Server::new(FakeOperations::successful(Rc::clone(&calls)));
@@ -911,7 +911,7 @@ mod tests {
     }
 
     fn automatic_failure_emits_warning(failure: Failure) {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let calls = Rc::new(RefCell::new(Vec::new()));
         let (server_connection, client_connection) = Connection::memory();
         let mut server = Server::new(FakeOperations::failing(calls, failure));
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn automatic_operation_auth_error_never_discloses_details() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let calls = Rc::new(RefCell::new(Vec::new()));
         let (server_connection, client_connection) = Connection::memory();
         let mut server = Server::new(FakeOperations::failing(calls, Failure::SensitiveAuth));
@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn automatic_second_config_load_error_never_discloses_source_text() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let (server_connection, client_connection) = Connection::memory();
         let mut server = Server::new(CorruptingConfigOperations);
 
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn automatic_success_outcomes_are_silent() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         for status in [
             TransferStatus::Transferred,
             TransferStatus::Unchanged,
@@ -1726,7 +1726,7 @@ mod tests {
 
     #[test]
     fn main_loop_shutdown_does_not_wait_for_blocked_file_operation() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1782,7 +1782,7 @@ mod tests {
 
     #[test]
     fn code_action_remains_responsive_while_transfer_worker_is_blocked() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1900,7 +1900,7 @@ mod tests {
 
     #[test]
     fn queued_command_re_resolves_after_project_roots_change() {
-        let fixture = Fixture::new("");
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
