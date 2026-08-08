@@ -855,8 +855,8 @@ enum WorkerEvent<P> {
 struct ForcePullSlot {
     operation_id: u64,
     guard: OperationGuard,
+    relative_path: String,
     request_id: Option<RequestId>,
-    dirty: bool,
 }
 
 impl ForcePullSlot {
@@ -943,8 +943,8 @@ impl<P> Coordinator<P> {
             ForcePullSlot {
                 operation_id,
                 guard: guard.clone(),
+                relative_path: command.initial_relative_path.clone(),
                 request_id: None,
-                dirty: false,
             },
         );
         Ok(ForcePullPreparation {
@@ -953,6 +953,24 @@ impl<P> Coordinator<P> {
             initial_relative_path: command.initial_relative_path,
             guard,
         })
+    }
+
+    fn enqueue_force_pull_preparation(
+        &mut self,
+        work_sender: &mpsc::Sender<Work<P>>,
+        preparation: ForcePullPreparation,
+    ) -> Result<(), String> {
+        let operation_id = preparation.operation_id;
+        let absolute_path = preparation.absolute_path.clone();
+        let relative_path = preparation.initial_relative_path.clone();
+        if work_sender
+            .send(Work::ForcePullPrepare(preparation))
+            .is_err()
+        {
+            self.remove_current_force_slot(&absolute_path, operation_id);
+            return Err(relative_path);
+        }
+        Ok(())
     }
 
     fn current_force_slot(&self, path: &Path, operation_id: u64) -> Option<&ForcePullSlot> {
@@ -972,11 +990,15 @@ impl<P> Coordinator<P> {
         }
     }
 
-    fn mark_force_dirty(&mut self, path: &Path) {
-        if let Some(slot) = self.force_slots.get_mut(path) {
-            slot.dirty = true;
+    fn cancel_force_for_path(&mut self, path: &Path) -> Option<String> {
+        if let Some(slot) = self.force_slots.remove(path) {
             slot.cancel();
+            if let Some(request_id) = slot.request_id {
+                self.pending_confirmations.remove(&request_id);
+            }
+            return Some(slot.relative_path);
         }
+        None
     }
 
     fn allocate_force_request_id(&mut self) -> RequestId {
@@ -1118,7 +1140,7 @@ fn protocol_loop_inner<P: Send + 'static>(
                 }
             }
             Ok(Message::Notification(notification)) => {
-                if handle_notification(work_sender, coordinator, notification) {
+                if handle_notification(connection, work_sender, coordinator, notification) {
                     return Ok(());
                 }
             }
@@ -1143,16 +1165,11 @@ fn handle_worker_event<P: Send + 'static>(
         WorkerEvent::ForcePullReady(pending) => {
             let operation_id = pending.operation_id;
             let absolute_path = pending.absolute_path.clone();
-            let Some(slot) = coordinator.current_force_slot(&absolute_path, operation_id) else {
+            if coordinator
+                .current_force_slot(&absolute_path, operation_id)
+                .is_none()
+            {
                 return false;
-            };
-            if slot.dirty {
-                let sent = connection
-                    .sender
-                    .send(save_first_warning(&pending.relative_path))
-                    .is_err();
-                coordinator.remove_current_force_slot(&absolute_path, operation_id);
-                return sent;
             }
             let request_id = coordinator.allocate_force_request_id();
             let relative_path = pending.relative_path.clone();
@@ -1197,17 +1214,16 @@ fn handle_worker_event<P: Send + 'static>(
             relative_path,
             error,
         } => {
-            let Some(slot) = coordinator.current_force_slot(&absolute_path, operation_id) else {
+            if coordinator
+                .current_force_slot(&absolute_path, operation_id)
+                .is_none()
+            {
                 return false;
-            };
-            let feedback = if slot.dirty {
-                save_first_warning(&relative_path)
-            } else {
-                warning_message(format!(
-                    "ferry: {relative_path}: {}; run a Ferry task for details",
-                    safe_error_summary(&error)
-                ))
-            };
+            }
+            let feedback = warning_message(format!(
+                "ferry: {relative_path}: {}; run a Ferry task for details",
+                safe_error_summary(&error)
+            ));
             coordinator.remove_current_force_slot(&absolute_path, operation_id);
             connection.sender.send(feedback).is_err()
         }
@@ -1245,10 +1261,16 @@ fn handle_response<P: Send + 'static>(
     let pending = confirmation.pending;
     let operation_id = pending.operation_id;
     let absolute_path = pending.absolute_path.clone();
-    let Some(slot) = coordinator.current_force_slot(&absolute_path, operation_id) else {
+    if coordinator
+        .current_force_slot(&absolute_path, operation_id)
+        .is_none()
+    {
         return false;
-    };
-    let dirty = slot.dirty;
+    }
+    if !pending.guard.is_pending() {
+        coordinator.remove_current_force_slot(&absolute_path, operation_id);
+        return false;
+    }
     if let Some(slot) = coordinator.force_slots.get_mut(&absolute_path) {
         slot.request_id = None;
     }
@@ -1261,11 +1283,6 @@ fn handle_response<P: Send + 'static>(
     if !affirmative {
         coordinator.remove_current_force_slot(&absolute_path, operation_id);
         return false;
-    }
-    if dirty {
-        let feedback = save_first_warning(&pending.relative_path);
-        coordinator.remove_current_force_slot(&absolute_path, operation_id);
-        return connection.sender.send(feedback).is_err();
     }
     let still_resolved = crate::project::resolve_file(&absolute_path, true)
         .ok()
@@ -1291,6 +1308,7 @@ fn handle_response<P: Send + 'static>(
 }
 
 fn handle_notification<P>(
+    connection: &Connection,
     work_sender: &mpsc::Sender<Work<P>>,
     coordinator: &mut Coordinator<P>,
     notification: Notification,
@@ -1313,6 +1331,7 @@ fn handle_notification<P>(
                 return false;
             }
             let guard = coordinator.documents.begin_clean_operation(&path).ok();
+            let _ = coordinator.cancel_force_for_path(&path);
             work_sender.send(Work::Open { path, guard }).is_err()
         }
         "textDocument/didChange" => {
@@ -1321,7 +1340,12 @@ fn handle_notification<P>(
                 && let Some(path) = uri_to_path(params.text_document.uri.as_str())
             {
                 coordinator.documents.change(&path);
-                coordinator.mark_force_dirty(&path);
+                if let Some(relative_path) = coordinator.cancel_force_for_path(&path) {
+                    return connection
+                        .sender
+                        .send(save_first_warning(&relative_path))
+                        .is_err();
+                }
             }
             false
         }
@@ -1335,7 +1359,7 @@ fn handle_notification<P>(
                 return false;
             };
             coordinator.documents.save(&path);
-            coordinator.mark_force_dirty(&path);
+            let _ = coordinator.cancel_force_for_path(&path);
             work_sender.send(Work::Save { path }).is_err()
         }
         "textDocument/didClose" => {
@@ -1344,7 +1368,7 @@ fn handle_notification<P>(
                 && let Some(path) = uri_to_path(params.text_document.uri.as_str())
             {
                 coordinator.documents.close(&path);
-                coordinator.mark_force_dirty(&path);
+                let _ = coordinator.cancel_force_for_path(&path);
             }
             false
         }
@@ -1384,9 +1408,6 @@ fn handle_request<P>(
                             return Ok(false);
                         }
                     };
-                    let operation_id = preparation.operation_id;
-                    let absolute_path = preparation.absolute_path.clone();
-                    let relative_path = preparation.initial_relative_path.clone();
                     if connection
                         .sender
                         .send(Message::Response(Response::new_ok(id, ())))
@@ -1394,11 +1415,9 @@ fn handle_request<P>(
                     {
                         return Ok(true);
                     }
-                    if work_sender
-                        .send(Work::ForcePullPrepare(preparation))
-                        .is_err()
+                    if let Err(relative_path) =
+                        coordinator.enqueue_force_pull_preparation(work_sender, preparation)
                     {
-                        coordinator.remove_current_force_slot(&absolute_path, operation_id);
                         return Ok(connection
                             .sender
                             .send(warning_message(format!(
@@ -2460,6 +2479,40 @@ mod tests {
         receive_force_prompt(client, id)
     }
 
+    fn direct_force_coordinator(fixture: &Fixture) -> Coordinator<String> {
+        let mut coordinator =
+            Coordinator::new(Arc::new(AtomicBool::new(true)), ShutdownBoundary::noop());
+        coordinator
+            .documents
+            .open(fixture.file_path.clone(), "int main(void) {}\n")
+            .unwrap();
+        coordinator
+    }
+
+    fn begin_direct_force(
+        coordinator: &mut Coordinator<String>,
+        fixture: &Fixture,
+    ) -> (PendingForcePull<String>, OperationGuard) {
+        let preparation = coordinator
+            .begin_force_pull(PreparedCommand {
+                action: ActionCommand::ForcePull,
+                absolute_path: fixture.file_path.clone(),
+                initial_relative_path: "src/nested/hello world.c".to_string(),
+            })
+            .unwrap();
+        let guard = preparation.guard.clone();
+        (
+            PendingForcePull {
+                operation_id: preparation.operation_id,
+                absolute_path: preparation.absolute_path,
+                relative_path: preparation.initial_relative_path,
+                prepared: "prepared".to_string(),
+                guard: preparation.guard,
+            },
+            guard,
+        )
+    }
+
     #[test]
     fn force_pull_affirmative_response_applies_exactly_once_and_old_id_is_ignored() {
         let fixture = Fixture::new("");
@@ -2592,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn force_pull_edit_while_prompting_rejects_affirmative_with_save_retry() {
+    fn force_pull_edit_while_prompting_invalidates_request_and_ignores_old_affirmative() {
         let fixture = Fixture::new("");
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
@@ -2612,48 +2665,410 @@ mod tests {
             .sender
             .send(Message::Request(code_action_request(78, &fixture.uri())))
             .unwrap();
+        assert_save_retry_warning_with_response(receive_request_messages(&client, 78, 2), 78);
+        respond_to_force_prompt(
+            &client,
+            &prompt,
+            serde_json::json!({ "title": "Overwrite local file" }),
+        );
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                79,
+                COMPILE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let barrier = receive_request_messages(&client, 79, 2);
+        assert!(barrier.iter().all(|message| !matches!(
+            message,
+            Message::Notification(notification)
+                if serde_json::from_value::<ShowMessageParams>(notification.params.clone())
+                    .is_ok_and(|params| params.typ == MessageType::WARNING)
+        )));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                Call::ForcePullPrepare {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                },
+                Call::Compile {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                },
+            ],
+            "old prompt response must be unknown and never queue apply"
+        );
+        finish_loop(&client, loop_thread, 80);
+    }
+
+    #[test]
+    fn force_pull_repeated_matching_did_open_invalidates_pending_confirmation() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+        let prompt = send_force_pull(&client, 81, &fixture.uri());
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                fixture.uri(),
+                "int main(void) {}\n",
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(code_action_request(82, &fixture.uri())))
+            .unwrap();
         assert!(
-            response_with_id(
-                client
-                    .receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("didChange protocol barrier"),
-                78,
-            )
-            .error
-            .is_none()
+            response_with_id(client.receiver.recv().unwrap(), 82)
+                .error
+                .is_none()
         );
         respond_to_force_prompt(
             &client,
             &prompt,
             serde_json::json!({ "title": "Overwrite local file" }),
         );
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                83,
+                COMPILE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let barrier = receive_request_messages(&client, 83, 2);
+        assert!(barrier.iter().all(|message| !matches!(
+            message,
+            Message::Notification(notification)
+                if serde_json::from_value::<ShowMessageParams>(notification.params.clone())
+                    .is_ok_and(|params| params.typ == MessageType::WARNING)
+        )));
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !matches!(call, Call::PullApply { .. })),
+            "repeated didOpen must remove the slot/request before old response"
+        );
+        finish_loop(&client, loop_thread, 84);
+    }
 
-        let warning = match client
-            .receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("save/retry warning")
-        {
+    #[test]
+    fn force_pull_save_and_close_invalidate_confirmation_and_ignore_late_affirmative() {
+        for (label, close, base_id) in [("didSave", false, 401), ("didClose", true, 405)] {
+            let fixture = Fixture::new("");
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+            client
+                .sender
+                .send(Message::Notification(did_open(fixture.uri())))
+                .unwrap();
+            let prompt = send_force_pull(&client, base_id, &fixture.uri());
+            let lifecycle = if close {
+                did_close(fixture.uri())
+            } else {
+                did_save(fixture.uri())
+            };
+            client
+                .sender
+                .send(Message::Notification(lifecycle))
+                .unwrap();
+            client
+                .sender
+                .send(Message::Request(code_action_request(
+                    base_id + 1,
+                    &fixture.uri(),
+                )))
+                .unwrap();
+            assert!(
+                response_with_id(client.receiver.recv().unwrap(), base_id + 1)
+                    .error
+                    .is_none(),
+                "{label} protocol barrier"
+            );
+
+            respond_to_force_prompt(
+                &client,
+                &prompt,
+                serde_json::json!({ "title": "Overwrite local file" }),
+            );
+            client
+                .sender
+                .send(Message::Request(execute_command_request(
+                    base_id + 2,
+                    COMPILE_COMMAND,
+                    vec![serde_json::to_value(fixture.uri()).unwrap()],
+                )))
+                .unwrap();
+            let barrier = receive_request_messages(&client, base_id + 2, 2);
+            assert!(
+                barrier.iter().all(|message| !matches!(
+                    message,
+                    Message::Notification(notification)
+                        if serde_json::from_value::<ShowMessageParams>(notification.params.clone())
+                            .is_ok_and(|params| params.typ == MessageType::WARNING)
+                )),
+                "{label} must not emit late Force feedback"
+            );
+            assert!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|call| !matches!(call, Call::PullApply { .. })),
+                "{label} must make the old response unknown"
+            );
+            finish_loop(&client, loop_thread, base_id + 3);
+        }
+    }
+
+    #[test]
+    fn force_pull_json_rpc_error_response_cancels_and_cleans_confirmation() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        let prompt = send_force_pull(&client, 85, &fixture.uri());
+        client
+            .sender
+            .send(Message::Response(Response {
+                id: prompt.id,
+                result: None,
+                error: Some(lsp_server::ResponseError {
+                    code: ErrorCode::InternalError as i32,
+                    message: "client rejected request".to_string(),
+                    data: None,
+                }),
+            }))
+            .unwrap();
+        let next = send_force_pull(&client, 86, &fixture.uri());
+        assert_exact_force_prompt(&next, "src/nested/hello world.c", 2);
+        respond_to_force_prompt(&client, &next, serde_json::json!({ "title": "Cancel" }));
+        finish_loop(&client, loop_thread, 87);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| !matches!(call, Call::PullApply { .. }))
+        );
+    }
+
+    #[test]
+    fn force_pull_untracked_file_is_acknowledged_once_and_never_prepared() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                88,
+                FORCE_PULL_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+
+        assert_acknowledged_with_warning(receive_request_messages(&client, 88, 2), 88);
+        assert!(calls.lock().unwrap().is_empty());
+        finish_loop(&client, loop_thread, 89);
+    }
+
+    #[test]
+    fn force_pull_prompt_send_failure_cleans_confirmation_and_guard() {
+        let fixture = Fixture::new("");
+        let mut coordinator = direct_force_coordinator(&fixture);
+        let (pending, guard) = begin_direct_force(&mut coordinator, &fixture);
+        let (failed_connection, failed_client) = Connection::memory();
+        drop(failed_client);
+
+        assert!(handle_worker_event(
+            &failed_connection,
+            &mut coordinator,
+            WorkerEvent::ForcePullReady(pending),
+        ));
+        assert!(coordinator.force_slots.is_empty());
+        assert!(coordinator.pending_confirmations.is_empty());
+        assert!(!guard.is_pending());
+
+        let (response_connection, _response_client) = Connection::memory();
+        let (work_sender, work_receiver) = mpsc::channel();
+        assert!(!handle_response(
+            &response_connection,
+            &work_sender,
+            &mut coordinator,
+            Response::new_ok(
+                RequestId::from("ferry-force-pull-1".to_string()),
+                serde_json::json!({ "title": "Overwrite local file" }),
+            ),
+        ));
+        assert!(work_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_pull_preparation_enqueue_failure_cleans_guard_and_warns_safely() {
+        let fixture = Fixture::new("");
+        let mut coordinator = direct_force_coordinator(&fixture);
+        let preparation = coordinator
+            .begin_force_pull(PreparedCommand {
+                action: ActionCommand::ForcePull,
+                absolute_path: fixture.file_path.clone(),
+                initial_relative_path: "src/nested/hello world.c".to_string(),
+            })
+            .unwrap();
+        let guard = preparation.guard.clone();
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+
+        assert_eq!(
+            coordinator.enqueue_force_pull_preparation(&failed_sender, preparation),
+            Err("src/nested/hello world.c".to_string())
+        );
+        assert!(coordinator.force_slots.is_empty());
+        assert!(coordinator.pending_confirmations.is_empty());
+        assert!(!guard.is_pending());
+
+        let mut coordinator = direct_force_coordinator(&fixture);
+        let (server_connection, client) = Connection::memory();
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+        assert!(
+            !handle_request(
+                &server_connection,
+                &failed_sender,
+                &mut coordinator,
+                execute_command_request(
+                    400,
+                    FORCE_PULL_COMMAND,
+                    vec![serde_json::to_value(fixture.uri()).unwrap()],
+                ),
+            )
+            .unwrap()
+        );
+
+        let messages = receive_request_messages(&client, 400, 2);
+        let warnings = messages
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Notification(notification) => {
+                    serde_json::from_value::<ShowMessageParams>(notification.params).ok()
+                }
+                Message::Response(response) => {
+                    assert_eq!(response.result, Some(serde_json::Value::Null));
+                    None
+                }
+                other => panic!("unexpected enqueue-failure message: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].typ, MessageType::WARNING);
+        assert_eq!(
+            warnings[0].message,
+            "ferry: src/nested/hello world.c: operation worker unavailable"
+        );
+        assert!(coordinator.force_slots.is_empty());
+        assert!(coordinator.pending_confirmations.is_empty());
+    }
+
+    #[test]
+    fn force_pull_apply_enqueue_failure_cleans_guard_and_warns_safely() {
+        let fixture = Fixture::new("");
+        let mut coordinator = direct_force_coordinator(&fixture);
+        let (pending, guard) = begin_direct_force(&mut coordinator, &fixture);
+        let (server_connection, client) = Connection::memory();
+        assert!(!handle_worker_event(
+            &server_connection,
+            &mut coordinator,
+            WorkerEvent::ForcePullReady(pending),
+        ));
+        let prompt = receive_server_request(&client, "direct Force Pull prompt");
+        let prompt_id = prompt.id.clone();
+        let (failed_sender, failed_receiver) = mpsc::channel();
+        drop(failed_receiver);
+
+        assert!(!handle_response(
+            &server_connection,
+            &failed_sender,
+            &mut coordinator,
+            Response::new_ok(
+                prompt_id.clone(),
+                serde_json::json!({ "title": "Overwrite local file" }),
+            ),
+        ));
+        let warning = match client.receiver.recv().unwrap() {
             Message::Notification(notification) => {
                 serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
             }
-            other => panic!("expected save/retry warning, got {other:?}"),
+            other => panic!("expected apply-enqueue warning, got {other:?}"),
         };
         assert_eq!(warning.typ, MessageType::WARNING);
         assert_eq!(
             warning.message,
-            "ferry: src/nested/hello world.c: save the file and retry"
+            "ferry: src/nested/hello world.c: operation worker unavailable"
         );
-        assert_eq!(
-            calls.lock().unwrap().len(),
-            1,
-            "edited file must never apply"
-        );
-        finish_loop(&client, loop_thread, 79);
+        assert!(coordinator.force_slots.is_empty());
+        assert!(coordinator.pending_confirmations.is_empty());
+        assert!(!guard.is_pending());
+
+        let (work_sender, work_receiver) = mpsc::channel();
+        assert!(!handle_response(
+            &server_connection,
+            &work_sender,
+            &mut coordinator,
+            Response::new_ok(
+                prompt_id,
+                serde_json::json!({ "title": "Overwrite local file" }),
+            ),
+        ));
+        assert!(work_receiver.try_recv().is_err());
+        assert!(client.receiver.try_recv().is_err());
     }
 
     #[test]
-    fn force_pull_dirty_or_untracked_file_is_acknowledged_and_never_prepared() {
+    fn force_pull_cancelled_live_confirmation_is_rejected_before_apply_enqueue() {
+        let fixture = Fixture::new("");
+        let mut coordinator = direct_force_coordinator(&fixture);
+        let (pending, guard) = begin_direct_force(&mut coordinator, &fixture);
+        let (server_connection, client) = Connection::memory();
+        assert!(!handle_worker_event(
+            &server_connection,
+            &mut coordinator,
+            WorkerEvent::ForcePullReady(pending),
+        ));
+        let prompt = receive_server_request(&client, "live-guard Force Pull prompt");
+        guard.cancel();
+        let (work_sender, work_receiver) = mpsc::channel();
+
+        assert!(!handle_response(
+            &server_connection,
+            &work_sender,
+            &mut coordinator,
+            Response::new_ok(
+                prompt.id,
+                serde_json::json!({ "title": "Overwrite local file" }),
+            ),
+        ));
+        assert!(work_receiver.try_recv().is_err());
+        assert!(coordinator.force_slots.is_empty());
+        assert!(coordinator.pending_confirmations.is_empty());
+        assert!(!guard.is_pending());
+        assert!(client.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_pull_dirty_file_is_acknowledged_and_never_prepared() {
         let fixture = Fixture::new("");
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
@@ -3033,14 +3448,19 @@ mod tests {
             .sender
             .send(Message::Request(code_action_request(97, &fixture.uri())))
             .unwrap();
-        assert!(
-            response_with_id(client.receiver.recv().unwrap(), 97)
-                .error
-                .is_none()
-        );
+        assert_save_retry_warning_with_response(receive_request_messages(&client, 97, 2), 97);
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                98,
+                COMPILE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_acknowledgement(&client, 98);
         release_barrier(&prepare_gate);
 
-        let warning = match client
+        let feedback = match client
             .receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
@@ -3048,11 +3468,12 @@ mod tests {
             Message::Notification(notification) => {
                 serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
             }
-            other => panic!("expected preparing-edit warning, got {other:?}"),
+            other => panic!("expected compile barrier feedback, got {other:?}"),
         };
-        assert_eq!(
-            warning.message,
-            "ferry: src/nested/hello world.c: save the file and retry"
+        assert_eq!(feedback.typ, MessageType::INFO);
+        assert!(
+            client.receiver.try_recv().is_err(),
+            "cancelled preparation must not emit late duplicate feedback"
         );
         assert!(
             trace
@@ -3061,7 +3482,7 @@ mod tests {
                 .iter()
                 .all(|event| !matches!(event, ForceTrace::ApplyStarted(..)))
         );
-        finish_loop(&client, loop_thread, 98);
+        finish_loop(&client, loop_thread, 99);
     }
 
     #[test]
@@ -4064,6 +4485,34 @@ mod tests {
         }
         assert_eq!(responses, 1, "request must be acknowledged exactly once");
         assert_eq!(warnings.len(), 1, "request must emit exactly one warning");
+        assert_eq!(warnings[0].typ, MessageType::WARNING);
+        assert_eq!(
+            warnings[0].message,
+            "ferry: src/nested/hello world.c: save the file and retry"
+        );
+    }
+
+    fn assert_save_retry_warning_with_response(messages: Vec<Message>, id: i32) {
+        let mut responses = 0;
+        let mut warnings = Vec::new();
+        for message in messages {
+            match message {
+                Message::Response(response) if response.id == RequestId::from(id) => {
+                    responses += 1;
+                    assert!(response.error.is_none());
+                }
+                Message::Notification(notification)
+                    if notification.method == "window/showMessage" =>
+                {
+                    warnings.push(
+                        serde_json::from_value::<ShowMessageParams>(notification.params).unwrap(),
+                    );
+                }
+                other => panic!("unexpected lifecycle message: {other:?}"),
+            }
+        }
+        assert_eq!(responses, 1, "barrier must respond exactly once");
+        assert_eq!(warnings.len(), 1, "dirtying must warn exactly once");
         assert_eq!(warnings[0].typ, MessageType::WARNING);
         assert_eq!(
             warnings[0].message,

@@ -21,6 +21,10 @@ pub(crate) struct OperationGuard {
 }
 
 impl OperationGuard {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.state.load(Ordering::Acquire) == PENDING
+    }
+
     pub(crate) fn try_claim(&self) -> bool {
         self.state
             .compare_exchange(PENDING, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
@@ -252,6 +256,25 @@ mod tests {
         guard.cancel();
 
         assert!(!guard.try_claim());
+    }
+
+    #[test]
+    fn operation_guard_reports_pending_cancelled_and_claimed_states() {
+        let directory = tempdir().unwrap();
+        let path = write_file(directory.path(), "pending-state.txt", b"clean");
+        let mut tracker = DocumentTracker::default();
+        tracker.open(path.clone(), "clean").unwrap();
+        let cancelled = tracker.begin_clean_operation(&path).unwrap();
+        let claimed = tracker.begin_clean_operation(&path).unwrap();
+
+        assert!(cancelled.is_pending());
+        assert!(claimed.is_pending());
+
+        cancelled.cancel();
+        assert!(!cancelled.is_pending());
+
+        assert!(claimed.try_claim());
+        assert!(!claimed.is_pending());
     }
 
     #[test]
