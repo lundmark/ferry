@@ -2,11 +2,12 @@ use super::{record_download, stage_local_write};
 use crate::commands::file_transfer::{
     RemotePresence, TransferOutcome, TransferStatus, probe_remote_file,
 };
-use crate::commands::remote_hash::{self, RemoteHash};
+use crate::commands::remote_hash::{self, RemoteFileRetrieval, RemoteHash};
 use crate::commands::walk::{remote_join, safe_rel};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
+#[cfg(test)]
 use crate::hash::hash_bytes;
 use crate::state::{FileState, StateFile, classify};
 use anyhow::{Context, Result};
@@ -258,51 +259,11 @@ pub fn pull_one(
     apply_prepared_pull(prepare_pull_one(config_path, rel, force)?, mode)
 }
 
-trait RemoteFileRetrieval {
-    fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>>;
-    fn size(&mut self, remote_path: &str) -> Result<u64>;
-    fn download(&mut self, remote_path: &str) -> Result<Vec<u8>>;
-}
-
-impl RemoteFileRetrieval for Ftp {
-    fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
-        Ftp::mtime(self, remote_path)
-    }
-
-    fn size(&mut self, remote_path: &str) -> Result<u64> {
-        Ftp::size(self, remote_path)
-    }
-
-    fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
-        Ftp::download(self, remote_path)
-    }
-}
-
 fn retrieve_remote_file<R: RemoteFileRetrieval>(
     remote: &mut R,
     remote_path: &str,
 ) -> Result<RemoteFile> {
-    let mtime_before = remote
-        .mtime(remote_path)
-        .with_context(|| format!("fetching mtime for {remote_path} before download"))?;
-    let size_before = remote.size(remote_path).ok();
-
-    let bytes = remote
-        .download(remote_path)
-        .with_context(|| format!("downloading {remote_path}"))?;
-
-    let mtime_after = remote
-        .mtime(remote_path)
-        .with_context(|| format!("fetching mtime for {remote_path} after download"))?;
-    let size_after = remote.size(remote_path).ok();
-
-    let size_changed =
-        matches!((size_before, size_after), (Some(before), Some(after)) if before != after);
-    if mtime_before != mtime_after || size_changed {
-        anyhow::bail!("remote changed while downloading {remote_path}");
-    }
-
-    Ok(remote_file_from_payload(bytes, mtime_before))
+    remote_file_from_hash(remote_hash::retrieve_stable(remote, remote_path)?)
 }
 
 fn connect(cfg: &Config) -> Result<Ftp> {
@@ -315,21 +276,31 @@ fn connect(cfg: &Config) -> Result<Ftp> {
     )
 }
 
-fn remote_file_for_install(
-    ftp: &mut Ftp,
+fn remote_file_for_install<R: RemoteFileRetrieval>(
+    remote: &mut R,
     remote_path: &str,
     remote_hash: RemoteHash,
 ) -> Result<RemoteFile> {
-    let mtime = remote_hash.mtime;
-    let bytes = match remote_hash.bytes {
-        Some(bytes) => bytes,
-        None => ftp
-            .download(remote_path)
-            .with_context(|| format!("downloading {remote_path}"))?,
-    };
-    Ok(remote_file_from_payload(bytes, mtime))
+    remote_file_from_hash(remote_hash::complete_for_install(
+        remote,
+        remote_path,
+        remote_hash,
+    )?)
 }
 
+fn remote_file_from_hash(remote_hash: RemoteHash) -> Result<RemoteFile> {
+    let bytes = remote_hash
+        .bytes
+        .ok_or_else(|| anyhow::anyhow!("completed remote hash has no payload"))?;
+    Ok(RemoteFile {
+        bytes,
+        sha256: remote_hash.sha256,
+        size: remote_hash.size,
+        mtime: remote_hash.mtime,
+    })
+}
+
+#[cfg(test)]
 fn remote_file_from_payload(bytes: Vec<u8>, mtime: DateTime<Utc>) -> RemoteFile {
     let size = bytes.len() as u64;
     let sha256 = hash_bytes(&bytes);
@@ -351,7 +322,7 @@ mod tests {
     use super::*;
     use crate::commands::ExecutionMode;
     use crate::hash::hash_bytes;
-    use crate::state::StateFile;
+    use crate::state::{FileRecord, StateFile};
     use chrono::{TimeZone, Utc};
     use std::{collections::VecDeque, path::Path};
 
@@ -705,6 +676,7 @@ remote_root = "/remote"
             mtime,
             from_cache: true,
             bytes: None,
+            pre_download: None,
         };
         let payload = b"actual downloaded payload";
 
@@ -838,5 +810,81 @@ remote_root = "/remote"
         assert_eq!(remote.sha256, hash_bytes(payload));
         assert_eq!(remote.size, payload.len() as u64);
         assert_eq!(remote.mtime, mtime);
+    }
+
+    fn cached_remote_state(rel: &str, cached_bytes: &[u8], mtime: DateTime<Utc>) -> StateFile {
+        let mut state = StateFile::default();
+        state.files.insert(
+            rel.to_string(),
+            FileRecord {
+                sha256: hash_bytes(cached_bytes),
+                size: cached_bytes.len() as u64,
+                remote_mtime: mtime,
+                last_synced: mtime,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn cache_hit_install_continues_the_probe_bracket_with_one_download() {
+        let mtime = Utc.with_ymd_and_hms(2026, 8, 7, 15, 0, 0).unwrap();
+        let cached_bytes = b"old cached payload";
+        let downloaded = b"new remote payload";
+        assert_eq!(cached_bytes.len(), downloaded.len());
+        let mut remote = ScriptedRetrieval::new(
+            [mtime, mtime],
+            [Some(downloaded.len() as u64), Some(downloaded.len() as u64)],
+            downloaded,
+        );
+        let mut state = cached_remote_state("page.txt", cached_bytes, mtime);
+        let cached_hash = remote_hash::compute_with(
+            &mut remote,
+            &mut state,
+            "page.txt",
+            "/remote/page.txt",
+            true,
+        )
+        .unwrap();
+
+        let file = remote_file_for_install(&mut remote, "/remote/page.txt", cached_hash).unwrap();
+
+        remote.assert_bracketed_one_download();
+        assert_eq!(file.bytes, downloaded);
+        assert_eq!(file.sha256, hash_bytes(downloaded));
+        assert_eq!(file.size, downloaded.len() as u64);
+        assert_eq!(file.mtime, mtime);
+    }
+
+    #[test]
+    fn cache_hit_install_rejects_changed_metadata_after_one_download() {
+        let before = Utc.with_ymd_and_hms(2026, 8, 7, 15, 0, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 8, 7, 15, 0, 1).unwrap();
+        let cached_bytes = b"old cached payload";
+        let downloaded = b"new remote payload";
+        assert_eq!(cached_bytes.len(), downloaded.len());
+        let mut remote = ScriptedRetrieval::new(
+            [before, after],
+            [Some(downloaded.len() as u64), Some(downloaded.len() as u64)],
+            downloaded,
+        );
+        let mut state = cached_remote_state("page.txt", cached_bytes, before);
+        let cached_hash = remote_hash::compute_with(
+            &mut remote,
+            &mut state,
+            "page.txt",
+            "/remote/page.txt",
+            true,
+        )
+        .unwrap();
+
+        let error =
+            remote_file_for_install(&mut remote, "/remote/page.txt", cached_hash).unwrap_err();
+
+        remote.assert_bracketed_one_download();
+        assert!(
+            format!("{error:#}").contains("remote changed while downloading /remote/page.txt"),
+            "got: {error:#}"
+        );
     }
 }
