@@ -26,6 +26,12 @@ impl OperationGuard {
             .compare_exchange(PENDING, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+
+    pub(crate) fn cancel(&self) {
+        let _ =
+            self.state
+                .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -233,6 +239,33 @@ mod tests {
         assert!(clone.try_claim());
         assert!(!guard.try_claim());
         assert!(!clone.try_claim());
+    }
+
+    #[test]
+    fn operation_guard_cancel_before_final_claim_denies_authorization() {
+        let directory = tempdir().unwrap();
+        let path = write_file(directory.path(), "cancel-before-claim.txt", b"clean");
+        let mut tracker = DocumentTracker::default();
+        tracker.open(path.clone(), "clean").unwrap();
+        let guard = tracker.begin_clean_operation(&path).unwrap();
+
+        guard.cancel();
+
+        assert!(!guard.try_claim());
+    }
+
+    #[test]
+    fn operation_guard_final_claim_wins_before_late_cancellation() {
+        let directory = tempdir().unwrap();
+        let path = write_file(directory.path(), "claim-before-cancel.txt", b"clean");
+        let mut tracker = DocumentTracker::default();
+        tracker.open(path.clone(), "clean").unwrap();
+        let guard = tracker.begin_clean_operation(&path).unwrap();
+
+        assert!(guard.try_claim());
+        guard.cancel();
+
+        assert!(!guard.try_claim());
     }
 
     #[test]
