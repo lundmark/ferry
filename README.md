@@ -155,25 +155,51 @@ Configure the editor behavior in the project's `.ferry.toml`:
 
 ```toml
 [editor]
-pull_on_open = true
+pull_on_open = false
 push_on_save = false
 ```
 
-Both values shown are the defaults: Pull on open is enabled, while Push on
-save is opt-in. For nested projects, the nearest `.ferry.toml` above the file
-wins. The configuration is read again on every open, save, and manual action,
-so changes apply on the next event without restarting Zed.
+Both settings default to `false`. Each project can opt into Pull on open,
+Push on save, or both independently. For nested projects, the nearest
+`.ferry.toml` above the file wins. The configuration is read again on every
+open, save, and manual action, so changes apply on the next event without
+restarting Zed.
 
-Automatic Pull and the optional automatic Push are always non-force and
-conflict-safe. A conflict or other failure produces a warning; automatic
-success is silent. Zed initially opens the on-disk file, so it can briefly
+When enabled, automatic Pull and Push are always non-force and conflict-safe.
+A conflict or other failure produces a warning; automatic success is silent.
+Zed initially opens the on-disk file, so it can briefly
 show stale content before its external-file watcher observes a successful
 Pull. No open or save event performs a whole-tree sync.
 
-For an explicit operation, open the lightbulb menu or press `Ctrl-.` and pick
-exactly one of `Ferry: Pull`, `Ferry: Push`, or `Ferry: Compile-check`. Manual
-actions report results with Info or Warning notifications. The Task Picker
-tasks described above are terminal-backed alternatives when you want command
+Automatic settings do not hide manual actions. For an explicit operation,
+open the lightbulb menu or press `Ctrl-.`; for a file in a Ferry project the
+actions appear in this order:
+
+1. `Ferry: Pull`
+2. `Ferry: Compare with Remote`
+3. `Ferry: Force Pull (overwrite local)`
+4. `Ferry: Push`
+5. `Ferry: Compile-check`
+
+Pull, Compare, and Force Pull are save-first operations: they use the saved
+local file. If the Zed buffer has unsaved changes, Ferry refuses the action and
+asks you to save and retry. Compare fetches the remote file into a private
+snapshot, then opens Zed's native diff with the saved local file on the left
+(old) and the fetched remote file on the right (new). It does not change the
+local file, Ferry state, or sync settings. For native diff, the `zed` CLI must
+be on the `PATH` visible to `ferry-lsp`.
+
+Force Pull retrieves the remote file first, then displays Zed's native warning
+confirmation. Only the exact `Overwrite local file` action applies it. Cancel,
+dismissal, an edit, shutdown, or a change to the local file's identity leaves
+the current file and Ferry state intact. A confirmed overwrite updates the
+local file and state through a guarded atomic install. This confirmation
+applies only to the Zed action; the existing `ferry pull --force` CLI remains
+noninteractive and unchanged.
+
+Manual actions report results with Info or Warning notifications and remain
+scoped to the current file's nearest Ferry project. The Task Picker tasks
+described above are terminal-backed alternatives when you want command
 output, project Status/Sync, or the destructive Delete command.
 
 The extension attaches only to Zed's C language by default. `.h` files are
