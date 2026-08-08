@@ -1323,6 +1323,7 @@ fn handle_notification<P>(
             let Some(path) = uri_to_path(params.text_document.uri.as_str()) else {
                 return false;
             };
+            let _ = coordinator.cancel_force_for_path(&path);
             if coordinator
                 .documents
                 .open(path.clone(), &params.text_document.text)
@@ -1331,7 +1332,6 @@ fn handle_notification<P>(
                 return false;
             }
             let guard = coordinator.documents.begin_clean_operation(&path).ok();
-            let _ = coordinator.cancel_force_for_path(&path);
             work_sender.send(Work::Open { path, guard }).is_err()
         }
         "textDocument/didChange" => {
@@ -2761,6 +2761,64 @@ mod tests {
             "repeated didOpen must remove the slot/request before old response"
         );
         finish_loop(&client, loop_thread, 84);
+    }
+
+    #[test]
+    fn force_pull_failed_valid_reopen_invalidates_live_confirmation_before_tracking() {
+        let fixture = Fixture::new("");
+        let mut coordinator = direct_force_coordinator(&fixture);
+        let (pending, guard) = begin_direct_force(&mut coordinator, &fixture);
+        let (server_connection, client) = Connection::memory();
+        assert!(!handle_worker_event(
+            &server_connection,
+            &mut coordinator,
+            WorkerEvent::ForcePullReady(pending),
+        ));
+        let prompt = receive_server_request(&client, "failed-reopen Force Pull prompt");
+        let (work_sender, work_receiver) = mpsc::channel();
+
+        assert!(!handle_notification(
+            &server_connection,
+            &work_sender,
+            &mut coordinator,
+            Notification::new(
+                "textDocument/didOpen".to_string(),
+                serde_json::json!({ "textDocument": {} }),
+            ),
+        ));
+        assert!(!handle_notification(
+            &server_connection,
+            &work_sender,
+            &mut coordinator,
+            did_open_with_text(Uri::from_str("untitled:buffer").unwrap(), "unsaved"),
+        ));
+        assert_eq!(coordinator.force_slots.len(), 1);
+        assert_eq!(coordinator.pending_confirmations.len(), 1);
+        assert!(guard.is_pending());
+
+        fs::remove_file(&fixture.file_path).unwrap();
+        assert!(!handle_notification(
+            &server_connection,
+            &work_sender,
+            &mut coordinator,
+            did_open_with_text(fixture.uri(), "int main(void) {}\n"),
+        ));
+        assert!(!handle_response(
+            &server_connection,
+            &work_sender,
+            &mut coordinator,
+            Response::new_ok(
+                prompt.id,
+                serde_json::json!({ "title": "Overwrite local file" }),
+            ),
+        ));
+
+        assert!(work_receiver.try_recv().is_err());
+        assert!(coordinator.force_slots.is_empty());
+        assert!(coordinator.pending_confirmations.is_empty());
+        assert!(!guard.is_pending());
+        assert!(!fixture.file_path.exists());
+        assert!(client.receiver.try_recv().is_err());
     }
 
     #[test]
