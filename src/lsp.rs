@@ -4,7 +4,7 @@ mod document_state;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -22,7 +22,7 @@ use lsp_types::{
 use crate::commands::ExecutionMode;
 use crate::commands::cc::{self, FileCheckResult};
 use crate::commands::file_transfer::TransferOutcome;
-use crate::commands::pull::{LocalIdentity, fetch_remote_one};
+use crate::commands::pull::{LocalIdentity, PreparedPull as CorePreparedPull, fetch_remote_one};
 use document_state::{DocumentTracker, OperationGuard};
 
 pub const PULL_COMMAND: &str = "ferry.pull";
@@ -36,7 +36,20 @@ const CODE_ACTION_METHOD: &str = "textDocument/codeAction";
 const EXECUTE_COMMAND_METHOD: &str = "workspace/executeCommand";
 
 pub trait FileOperations {
-    fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome>;
+    type PreparedPull;
+
+    fn prepare_pull(
+        &mut self,
+        config_path: &Path,
+        rel: &str,
+        force: bool,
+    ) -> Result<Self::PreparedPull>;
+
+    fn apply_pull(
+        &mut self,
+        prepared: Self::PreparedPull,
+        request: PullRequest,
+    ) -> Result<TransferOutcome>;
 
     fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome>;
 
@@ -48,6 +61,63 @@ pub trait FileOperations {
 
     fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
         Arc::new(|| Ok(()))
+    }
+}
+
+const PULL_AUTH_PENDING: u8 = 0;
+const PULL_AUTHORIZED: u8 = 1;
+const PULL_AUTH_DENIED: u8 = 2;
+
+pub struct PullRequest {
+    guard: OperationGuard,
+    decision: Arc<AtomicU8>,
+}
+
+impl PullRequest {
+    /// Claim authorization immediately before committing the prepared Pull.
+    ///
+    /// This request is one-shot. Repeated calls return `false`, as does a
+    /// document edit or shutdown that cancelled the pending operation.
+    pub fn try_claim(&self) -> bool {
+        if self
+            .decision
+            .compare_exchange(
+                PULL_AUTH_PENDING,
+                PULL_AUTH_DENIED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if self.guard.try_claim() {
+            self.decision.store(PULL_AUTHORIZED, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct PullAuthorization {
+    decision: Arc<AtomicU8>,
+}
+
+impl PullAuthorization {
+    fn request(guard: OperationGuard) -> (PullRequest, Self) {
+        let decision = Arc::new(AtomicU8::new(PULL_AUTH_PENDING));
+        (
+            PullRequest {
+                guard,
+                decision: Arc::clone(&decision),
+            },
+            Self { decision },
+        )
+    }
+
+    fn decision(&self) -> u8 {
+        self.decision.load(Ordering::Acquire)
     }
 }
 
@@ -100,8 +170,25 @@ impl FerryOperations {
 }
 
 impl FileOperations for FerryOperations {
-    fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
-        crate::commands::pull::pull_one(config_path, rel, force, ExecutionMode::Apply)
+    type PreparedPull = CorePreparedPull;
+
+    fn prepare_pull(
+        &mut self,
+        config_path: &Path,
+        rel: &str,
+        force: bool,
+    ) -> Result<Self::PreparedPull> {
+        crate::commands::pull::prepare_pull_one(config_path, rel, force)
+    }
+
+    fn apply_pull(
+        &mut self,
+        prepared: Self::PreparedPull,
+        request: PullRequest,
+    ) -> Result<TransferOutcome> {
+        crate::commands::pull::apply_prepared_pull_if(prepared, ExecutionMode::Apply, || {
+            request.try_claim()
+        })
     }
 
     fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
@@ -231,7 +318,7 @@ impl<O: FileOperations> Server<O> {
                             .open(path.clone(), &params.text_document.text)
                             .ok()?;
                         let guard = tracker.begin_clean_operation(&path).ok();
-                        self.handle_file_event(&path, Event::Open, guard)
+                        self.handle_file_event(&path, Event::Open, guard, None)
                     })
             }
             "textDocument/didSave" => {
@@ -239,7 +326,7 @@ impl<O: FileOperations> Server<O> {
                     .ok()
                     .and_then(|params| {
                         let path = uri_to_path(params.text_document.uri.as_str())?;
-                        self.handle_file_event(&path, Event::Save, None)
+                        self.handle_file_event(&path, Event::Save, None, None)
                     })
             }
             _ => None,
@@ -255,9 +342,20 @@ impl<O: FileOperations> Server<O> {
             CODE_ACTION_METHOD => vec![Message::Response(code_actions(request))],
             EXECUTE_COMMAND_METHOD => match prepare_execute_command(request) {
                 PreparedRequest::Ready { id, command } => {
+                    let mut tracker = DocumentTracker::default();
+                    let guard = if matches!(command.action, ActionCommand::Pull) {
+                        std::fs::read_to_string(&command.absolute_path)
+                            .ok()
+                            .and_then(|text| {
+                                tracker.open(command.absolute_path.clone(), &text).ok()?;
+                                tracker.begin_clean_operation(&command.absolute_path).ok()
+                            })
+                    } else {
+                        None
+                    };
                     vec![
                         Message::Response(Response::new_ok(id, ())),
-                        self.process_command(command, None),
+                        self.process_command(command, guard, None),
                     ]
                 }
                 PreparedRequest::Immediate(messages) => messages,
@@ -274,6 +372,7 @@ impl<O: FileOperations> Server<O> {
         &mut self,
         command: PreparedCommand,
         guard: Option<OperationGuard>,
+        running: Option<&AtomicBool>,
     ) -> Message {
         let resolved = match crate::project::resolve_file(&command.absolute_path, true) {
             Ok(Some(resolved)) => resolved,
@@ -291,17 +390,23 @@ impl<O: FileOperations> Server<O> {
                 ));
             }
         };
-        if matches!(command.action, ActionCommand::Pull)
-            && guard.as_ref().is_some_and(|guard| !guard.try_claim())
-        {
-            return save_first_warning(&resolved.relative_path);
-        }
         match command.action {
-            ActionCommand::Pull => transfer_feedback(
-                &resolved.relative_path,
-                self.operations
-                    .pull(&resolved.config_path, &resolved.relative_path, false),
-            ),
+            ActionCommand::Pull => {
+                let Some(guard) = guard else {
+                    return save_first_warning(&resolved.relative_path);
+                };
+                match self.pull_with_guard(
+                    &resolved.config_path,
+                    &resolved.relative_path,
+                    guard,
+                    running,
+                ) {
+                    GuardedPullResult::Completed(result) => {
+                        transfer_feedback(&resolved.relative_path, result)
+                    }
+                    GuardedPullResult::Cancelled => save_first_warning(&resolved.relative_path),
+                }
+            }
             ActionCommand::Push => transfer_feedback(
                 &resolved.relative_path,
                 self.operations
@@ -342,6 +447,7 @@ impl<O: FileOperations> Server<O> {
         path: &Path,
         event: Event,
         guard: Option<OperationGuard>,
+        running: Option<&AtomicBool>,
     ) -> Option<Message> {
         let resolved = match crate::project::resolve_file(path, true) {
             Ok(Some(resolved)) => resolved,
@@ -367,11 +473,17 @@ impl<O: FileOperations> Server<O> {
                 let Some(guard) = guard else {
                     return Some(save_first_warning(&resolved.relative_path));
                 };
-                if !guard.try_claim() {
-                    return Some(save_first_warning(&resolved.relative_path));
+                match self.pull_with_guard(
+                    &resolved.config_path,
+                    &resolved.relative_path,
+                    guard,
+                    running,
+                ) {
+                    GuardedPullResult::Completed(result) => result,
+                    GuardedPullResult::Cancelled => {
+                        return Some(save_first_warning(&resolved.relative_path));
+                    }
                 }
-                self.operations
-                    .pull(&resolved.config_path, &resolved.relative_path, false)
             }
             Event::Save => {
                 self.operations
@@ -387,6 +499,43 @@ impl<O: FileOperations> Server<O> {
         }
         None
     }
+
+    fn pull_with_guard(
+        &mut self,
+        config_path: &Path,
+        relative_path: &str,
+        guard: OperationGuard,
+        running: Option<&AtomicBool>,
+    ) -> GuardedPullResult {
+        let prepared = match self
+            .operations
+            .prepare_pull(config_path, relative_path, false)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return GuardedPullResult::Completed(Err(error)),
+        };
+        if running.is_some_and(|running| !running.load(Ordering::Acquire)) {
+            return GuardedPullResult::Cancelled;
+        }
+        let (request, authorization) = PullAuthorization::request(guard);
+        let result = self.operations.apply_pull(prepared, request);
+        match authorization.decision() {
+            PULL_AUTH_DENIED => GuardedPullResult::Cancelled,
+            PULL_AUTHORIZED => GuardedPullResult::Completed(result),
+            PULL_AUTH_PENDING => match result {
+                Err(error) => GuardedPullResult::Completed(Err(error)),
+                Ok(_) => GuardedPullResult::Completed(Err(anyhow::anyhow!(
+                    "Pull apply completed without final authorization"
+                ))),
+            },
+            _ => unreachable!("invalid Pull authorization state"),
+        }
+    }
+}
+
+enum GuardedPullResult {
+    Completed(Result<TransferOutcome>),
+    Cancelled,
 }
 
 fn code_actions(request: Request) -> Response {
@@ -650,9 +799,15 @@ pub fn main_loop<O: FileOperations + Send + 'static>(
                 return;
             }
             let message = match work {
-                Work::Open { path, guard } => server.handle_file_event(&path, Event::Open, guard),
-                Work::Save { path } => server.handle_file_event(&path, Event::Save, None),
-                Work::Command { command, guard } => Some(server.process_command(command, guard)),
+                Work::Open { path, guard } => {
+                    server.handle_file_event(&path, Event::Open, guard, Some(&worker_running))
+                }
+                Work::Save { path } => {
+                    server.handle_file_event(&path, Event::Save, None, Some(&worker_running))
+                }
+                Work::Command { command, guard } => {
+                    Some(server.process_command(command, guard, Some(&worker_running)))
+                }
             };
             if !worker_running.load(Ordering::Acquire) {
                 return;
@@ -980,10 +1135,13 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum Call {
-        Pull {
+        PullPrepare {
             config_path: PathBuf,
             rel: String,
             force: bool,
+        },
+        PullApply {
+            rel: String,
         },
         Push {
             config_path: PathBuf,
@@ -1091,13 +1249,37 @@ mod tests {
     }
 
     impl FileOperations for FakeOperations {
-        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
-            self.calls.borrow_mut().push(Call::Pull {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            config_path: &Path,
+            rel: &str,
+            force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.calls.borrow_mut().push(Call::PullPrepare {
                 config_path: config_path.to_path_buf(),
                 rel: rel.to_string(),
                 force,
             });
-            self.result(rel)
+            match self.failure {
+                Some(_) => self.result(rel).map(|_| unreachable!()),
+                None => Ok(rel.to_string()),
+            }
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.calls.borrow_mut().push(Call::PullApply {
+                rel: prepared.clone(),
+            });
+            if !request.try_claim() {
+                return Err(crate::error::Exit::Conflict("cancelled".into()).into());
+            }
+            self.result(&prepared)
         }
 
         fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
@@ -1260,11 +1442,16 @@ mod tests {
 
         assert_eq!(
             *calls.borrow(),
-            vec![Call::Pull {
-                config_path: fixture.config_path,
-                rel: "src/nested/hello world.c".to_string(),
-                force: false,
-            }]
+            vec![
+                Call::PullPrepare {
+                    config_path: fixture.config_path,
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                },
+                Call::PullApply {
+                    rel: "src/nested/hello world.c".to_string(),
+                },
+            ]
         );
     }
 
@@ -1279,7 +1466,7 @@ mod tests {
         fixture.set_editor("[editor]\npull_on_open = false\n");
         server.handle_notification(&server_connection, did_open(fixture.uri()));
 
-        assert_eq!(calls.borrow().len(), 1);
+        assert_eq!(calls.borrow().len(), 2);
     }
 
     #[test]
@@ -1403,12 +1590,14 @@ mod tests {
     struct CorruptingConfigOperations;
 
     impl FileOperations for CorruptingConfigOperations {
-        fn pull(
+        type PreparedPull = String;
+
+        fn prepare_pull(
             &mut self,
             config_path: &Path,
             _rel: &str,
             _force: bool,
-        ) -> Result<TransferOutcome> {
+        ) -> Result<Self::PreparedPull> {
             fs::write(
                 config_path,
                 format!(
@@ -1418,6 +1607,15 @@ mod tests {
             )?;
             crate::config::Config::load(config_path)?;
             unreachable!("malformed config must fail")
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(
@@ -1502,14 +1700,65 @@ mod tests {
 
     struct SendOperations;
 
-    impl FileOperations for SendOperations {
-        fn pull(
+    struct UnauthorizedSuccessOperations;
+
+    impl FileOperations for UnauthorizedSuccessOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            _request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Unchanged))
+        }
+
+        fn push(
             &mut self,
             _config_path: &Path,
             rel: &str,
             _force: bool,
         ) -> Result<TransferOutcome> {
             Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    impl FileOperations for SendOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(
@@ -1768,10 +2017,13 @@ mod tests {
         assert_eq!(
             *calls.borrow(),
             vec![
-                Call::Pull {
+                Call::PullPrepare {
                     config_path: fixture.config_path.clone(),
                     rel: "src/nested/hello world.c".to_string(),
                     force: false,
+                },
+                Call::PullApply {
+                    rel: "src/nested/hello world.c".to_string(),
                 },
                 Call::Push {
                     config_path: fixture.config_path,
@@ -1780,6 +2032,51 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn pull_preparation_failure_never_applies_and_emits_safe_warning() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut server = Server::new(FakeOperations::failing(Rc::clone(&calls), Failure::Generic));
+
+        let (response, messages) = process_server_request(
+            &mut server,
+            execute_command_request(83, PULL_COMMAND, vec![uri]),
+        );
+
+        assert!(response.error.is_none());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].typ, MessageType::WARNING);
+        assert!(messages[0].message.contains("operation failed"));
+        assert!(!messages[0].message.contains("transport unavailable"));
+        assert_eq!(
+            calls.borrow().as_slice(),
+            &[Call::PullPrepare {
+                config_path: fixture.config_path,
+                rel: "src/nested/hello world.c".to_string(),
+                force: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn pull_apply_success_without_authorization_is_rejected_safely() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+        let mut server = Server::new(UnauthorizedSuccessOperations);
+
+        let (response, messages) = process_server_request(
+            &mut server,
+            execute_command_request(84, PULL_COMMAND, vec![uri]),
+        );
+
+        assert!(response.error.is_none());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].typ, MessageType::WARNING);
+        assert!(messages[0].message.contains("operation failed"));
+        assert!(!messages[0].message.contains("authorization"));
     }
 
     #[test]
@@ -1820,6 +2117,26 @@ mod tests {
         assert_eq!(request.local_path(), local);
         assert!(request.try_claim());
         assert!(!request.try_claim());
+    }
+
+    #[test]
+    fn pull_request_public_api_is_object_safe_and_one_shot() {
+        fn accepts_trait_object(_operations: &mut dyn FileOperations<PreparedPull = String>) {}
+
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("local.c");
+        fs::write(&local, b"saved local bytes").unwrap();
+        let mut documents = DocumentTracker::default();
+        documents.open(local.clone(), "saved local bytes").unwrap();
+        let (request, authorization) =
+            PullAuthorization::request(documents.begin_clean_operation(&local).unwrap());
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut operations = FakeOperations::successful(calls);
+
+        accepts_trait_object(&mut operations);
+        assert!(request.try_claim());
+        assert!(!request.try_claim());
+        assert_eq!(authorization.decision(), PULL_AUTHORIZED);
     }
 
     #[test]
@@ -2190,13 +2507,32 @@ mod tests {
     }
 
     impl FileOperations for RecordingSendOperations {
-        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
-            self.calls.lock().unwrap().push(Call::Pull {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            config_path: &Path,
+            rel: &str,
+            force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.calls.lock().unwrap().push(Call::PullPrepare {
                 config_path: config_path.to_path_buf(),
                 rel: rel.to_string(),
                 force,
             });
-            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::PullApply {
+                rel: prepared.clone(),
+            });
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
@@ -2325,7 +2661,7 @@ mod tests {
             message,
             Message::Notification(notification) if notification.method == "window/showMessage"
         )));
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
         finish_loop(&client, loop_thread, 202);
     }
 
@@ -2401,7 +2737,7 @@ mod tests {
             message,
             Message::Notification(notification) if notification.method == "window/showMessage"
         )));
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
         finish_loop(&client, loop_thread, 233);
     }
 
@@ -2794,10 +3130,13 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             vec![
-                Call::Pull {
+                Call::PullPrepare {
                     config_path: fixture.config_path.clone(),
                     rel: "src/nested/hello world.c".to_string(),
                     force: false,
+                },
+                Call::PullApply {
+                    rel: "src/nested/hello world.c".to_string(),
                 },
                 Call::Push {
                     config_path: fixture.config_path.clone(),
@@ -2851,13 +3190,42 @@ mod tests {
         finished: mpsc::SyncSender<()>,
     }
 
-    impl FileOperations for BlockingOperations {
-        fn pull(
+    struct BlockingNoopPullOperations {
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+        apply_attempts: Arc<AtomicUsize>,
+        successful_applies: Arc<AtomicUsize>,
+    }
+
+    struct IdentityPreparedPull {
+        relative_path: String,
+        expected_local: LocalIdentity,
+    }
+
+    struct IdentityCheckingOperations {
+        local_path: PathBuf,
+        state_path: PathBuf,
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+        apply_attempts: Arc<AtomicUsize>,
+        successful_applies: Arc<AtomicUsize>,
+    }
+
+    impl FileOperations for IdentityCheckingOperations {
+        type PreparedPull = IdentityPreparedPull;
+
+        fn prepare_pull(
             &mut self,
             _config_path: &Path,
             rel: &str,
             _force: bool,
-        ) -> Result<TransferOutcome> {
+        ) -> Result<Self::PreparedPull> {
+            let prepared = IdentityPreparedPull {
+                relative_path: rel.to_string(),
+                expected_local: LocalIdentity::capture(&self.local_path)?,
+            };
             self.started.send(()).unwrap();
             let (lock, wake) = &*self.release;
             let mut released = lock.lock().unwrap();
@@ -2865,7 +3233,387 @@ mod tests {
                 released = wake.wait(released).unwrap();
             }
             self.finished.send(()).unwrap();
+            Ok(prepared)
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.apply_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if LocalIdentity::capture(&self.local_path)? != prepared.expected_local {
+                return Err(crate::error::Exit::Conflict(
+                    "local file changed while preparing pull".into(),
+                )
+                .into());
+            }
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            fs::write(&self.local_path, b"remote replacement")?;
+            fs::create_dir_all(self.state_path.parent().unwrap())?;
+            fs::write(&self.state_path, b"mutated state")?;
+            self.successful_applies.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(TransferOutcome::new(
+                &prepared.relative_path,
+                TransferStatus::Transferred,
+            ))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
             Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    struct ShutdownDuringPullPreparationOperations {
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+        stopped: mpsc::SyncSender<()>,
+        apply_attempts: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ShutdownDuringPullPreparationOperations {
+        fn drop(&mut self) {
+            let _ = self.stopped.send(());
+        }
+    }
+
+    impl FileOperations for ShutdownDuringPullPreparationOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.started.send(()).unwrap();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.finished.send(()).unwrap();
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.apply_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    impl FileOperations for BlockingNoopPullOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.started.send(()).unwrap();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.finished.send(()).unwrap();
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.apply_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            if !request.try_claim() {
+                return Err(crate::error::Exit::Conflict("cancelled".into()).into());
+            }
+            self.successful_applies.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Unchanged))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn pull_edit_during_preparation_cancels_commit() {
+        let fixture = Fixture::new("");
+        let original_local = fs::read(&fixture.file_path).unwrap();
+        let state_path = fixture
+            .config_path
+            .parent()
+            .unwrap()
+            .join(crate::names::STATE_DIR)
+            .join("state.json");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let apply_attempts = Arc::new(AtomicUsize::new(0));
+        let successful_applies = Arc::new(AtomicUsize::new(0));
+        let operations = BlockingNoopPullOperations {
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+            apply_attempts: Arc::clone(&apply_attempts),
+            successful_applies: Arc::clone(&successful_applies),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                271,
+                PULL_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let response = receive_request_messages(&client_connection, 271, 1);
+        assert!(
+            response_with_id(response.into_iter().next().unwrap(), 271)
+                .error
+                .is_none()
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull preparation should start");
+
+        client_connection
+            .sender
+            .send(Message::Notification(did_change(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(code_action_request(272, &fixture.uri())))
+            .unwrap();
+        let barrier = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("protocol barrier response");
+        assert!(response_with_id(barrier, 272).error.is_none());
+        release_barrier(&release);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull preparation should finish");
+        let feedback = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull feedback");
+
+        let warning = match feedback {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
+            }
+            other => panic!("expected one save-and-retry warning, got {other:?}"),
+        };
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert!(warning.message.contains("save the file and retry"));
+        assert_eq!(fs::read(&fixture.file_path).unwrap(), original_local);
+        assert!(!state_path.exists());
+        assert_eq!(apply_attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(successful_applies.load(AtomicOrdering::SeqCst), 0);
+        assert!(client_connection.receiver.try_recv().is_err());
+
+        finish_loop(&client_connection, loop_thread, 273);
+    }
+
+    #[test]
+    fn saved_disk_identity_change_between_prepare_and_apply_is_a_conflict() {
+        let fixture = Fixture::new("");
+        let state_path = fixture
+            .config_path
+            .parent()
+            .unwrap()
+            .join(crate::names::STATE_DIR)
+            .join("state.json");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let apply_attempts = Arc::new(AtomicUsize::new(0));
+        let successful_applies = Arc::new(AtomicUsize::new(0));
+        let operations = IdentityCheckingOperations {
+            local_path: fixture.file_path.clone(),
+            state_path: state_path.clone(),
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+            apply_attempts: Arc::clone(&apply_attempts),
+            successful_applies: Arc::clone(&successful_applies),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                274,
+                PULL_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_request_messages(&client_connection, 274, 1);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull preparation should start");
+        fs::write(&fixture.file_path, b"saved disk edit").unwrap();
+        release_barrier(&release);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull preparation should finish");
+        let feedback = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("conflict feedback");
+        let warning = match feedback {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
+            }
+            other => panic!("expected conflict warning, got {other:?}"),
+        };
+
+        assert_eq!(warning.typ, MessageType::WARNING);
+        assert!(warning.message.contains("conflict"));
+        assert!(!warning.message.contains("save the file and retry"));
+        assert_eq!(fs::read(&fixture.file_path).unwrap(), b"saved disk edit");
+        assert!(!state_path.exists());
+        assert_eq!(apply_attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(successful_applies.load(AtomicOrdering::SeqCst), 0);
+        finish_loop(&client_connection, loop_thread, 275);
+    }
+
+    #[test]
+    fn shutdown_during_blocked_pull_preparation_skips_apply_and_late_feedback() {
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let apply_attempts = Arc::new(AtomicUsize::new(0));
+        let operations = ShutdownDuringPullPreparationOperations {
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+            stopped: stopped_tx,
+            apply_attempts: Arc::clone(&apply_attempts),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull preparation should start");
+
+        send_shutdown_request(&client_connection, 276);
+        let shutdown = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prompt shutdown response");
+        assert!(response_with_id(shutdown, 276).error.is_none());
+        release_barrier(&release);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pull preparation should finish");
+        stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should stop after preparation");
+        assert_eq!(apply_attempts.load(AtomicOrdering::SeqCst), 0);
+        assert!(client_connection.receiver.try_recv().is_err());
+
+        send_exit(&client_connection);
+        loop_thread.join().unwrap().unwrap();
+    }
+
+    impl FileOperations for BlockingOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.started.send(()).unwrap();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            self.finished.send(()).unwrap();
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(
@@ -2891,6 +3639,7 @@ mod tests {
         started: mpsc::SyncSender<()>,
         release: Arc<(Mutex<bool>, Condvar)>,
         finished: mpsc::SyncSender<()>,
+        processed: Option<mpsc::SyncSender<()>>,
     }
 
     struct BlockingCompareOperations {
@@ -2914,14 +3663,26 @@ mod tests {
     }
 
     impl FileOperations for BlockingCompareOperations {
-        fn pull(
+        type PreparedPull = String;
+
+        fn prepare_pull(
             &mut self,
             _config_path: &Path,
             rel: &str,
             _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.non_compare_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
         ) -> Result<TransferOutcome> {
             self.non_compare_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(
@@ -3288,13 +4049,24 @@ mod tests {
     }
 
     impl FileOperations for FailingCompareOperations {
-        fn pull(
+        type PreparedPull = String;
+
+        fn prepare_pull(
             &mut self,
             _config_path: &Path,
             rel: &str,
             _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
         ) -> Result<TransferOutcome> {
-            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(
@@ -3426,10 +4198,17 @@ mod tests {
     }
 
     impl FileOperations for QueueBlockingOperations {
-        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            config_path: &Path,
+            rel: &str,
+            force: bool,
+        ) -> Result<Self::PreparedPull> {
             let is_first = {
                 let mut calls = self.calls.lock().unwrap();
-                calls.push(Call::Pull {
+                calls.push(Call::PullPrepare {
                     config_path: config_path.to_path_buf(),
                     rel: rel.to_string(),
                     force,
@@ -3445,7 +4224,19 @@ mod tests {
                 }
                 self.finished.send(()).unwrap();
             }
-            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::PullApply {
+                rel: prepared.clone(),
+            });
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
@@ -3462,6 +4253,9 @@ mod tests {
                 config_path: config_path.to_path_buf(),
                 rel: rel.to_string(),
             });
+            if let Some(processed) = &self.processed {
+                processed.send(()).unwrap();
+            }
             Ok(FileCheckResult {
                 path: rel.to_string(),
                 status: FileCheckStatus::Passed,
@@ -3578,13 +4372,32 @@ mod tests {
     }
 
     impl FileOperations for ShutdownBlockingOperations {
-        fn pull(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
-            self.calls.lock().unwrap().push(Call::Pull {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            config_path: &Path,
+            rel: &str,
+            force: bool,
+        ) -> Result<Self::PreparedPull> {
+            self.calls.lock().unwrap().push(Call::PullPrepare {
                 config_path: config_path.to_path_buf(),
                 rel: rel.to_string(),
                 force,
             });
-            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::PullApply {
+                rel: prepared.clone(),
+            });
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Transferred))
         }
 
         fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
@@ -3802,6 +4615,7 @@ mod tests {
             started: started_tx,
             release: Arc::clone(&release),
             finished: finished_tx,
+            processed: None,
         };
         let (server_connection, client_connection) = Connection::memory();
         let loop_thread =
@@ -3862,9 +4676,134 @@ mod tests {
         assert_eq!(warning.typ, MessageType::WARNING);
         assert!(warning.message.contains("src/nested/hello world.c"));
         assert!(!warning.message.contains("/changed"));
-        assert_eq!(calls.lock().unwrap().len(), 1, "stale target must not run");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                Call::PullPrepare {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                },
+                Call::PullApply {
+                    rel: "src/nested/hello world.c".to_string(),
+                },
+            ],
+            "stale target must not run",
+        );
         assert!(no_duplicate, "command must receive exactly one response");
         assert!(response_with_id(shutdown, 162).error.is_none());
+    }
+
+    #[test]
+    fn queued_open_re_resolves_after_project_roots_change() {
+        let fixture = Fixture::new("[editor]\npull_on_open = true\n");
+        let second_path = fixture
+            .config_path
+            .parent()
+            .unwrap()
+            .join("src/nested/second.c");
+        fs::write(&second_path, b"second\n").unwrap();
+        let second_uri = Uri::from_str(&format!("file://{}", second_path.display())).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let (processed_tx, processed_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let operations = QueueBlockingOperations {
+            calls: Arc::clone(&calls),
+            started: started_tx,
+            release: Arc::clone(&release),
+            finished: finished_tx,
+            processed: Some(processed_tx),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client_connection
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first automatic pull should block");
+        client_connection
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                second_uri.clone(),
+                "second\n",
+            )))
+            .unwrap();
+        client_connection
+            .sender
+            .send(Message::Request(code_action_request(163, &second_uri)))
+            .unwrap();
+        let queued = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued-open protocol barrier");
+        assert!(response_with_id(queued, 163).error.is_none());
+
+        let other_root = fixture.config_path.parent().unwrap().join("other");
+        fs::create_dir(&other_root).unwrap();
+        let probe_path = other_root.join("probe.c");
+        fs::write(&probe_path, b"probe\n").unwrap();
+        let probe_uri = Uri::from_str(&format!("file://{}", probe_path.display())).unwrap();
+        fixture.set_raw_config(
+            "[connection]\nhost = \"example.invalid\"\nuser = \"u\"\npassword = \"p\"\n\
+             [paths]\nlocal_root = \"other\"\nremote_root = \"/changed\"\n",
+        );
+        client_connection
+            .sender
+            .send(Message::Request(execute_command_request(
+                164,
+                COMPILE_COMMAND,
+                vec![serde_json::to_value(probe_uri).unwrap()],
+            )))
+            .unwrap();
+        let compile_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("compile acknowledgement");
+        assert!(response_with_id(compile_response, 164).error.is_none());
+        release_barrier(&release);
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first preparation should finish");
+        processed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("compile barrier after queued open");
+        let feedback = (0..2)
+            .map(|_| {
+                client_connection
+                    .receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("queued open and compile feedback")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                Call::PullPrepare {
+                    config_path: fixture.config_path.clone(),
+                    rel: "src/nested/hello world.c".to_string(),
+                    force: false,
+                },
+                Call::PullApply {
+                    rel: "src/nested/hello world.c".to_string(),
+                },
+                Call::Compile {
+                    config_path: fixture.config_path.clone(),
+                    rel: "probe.c".to_string(),
+                },
+            ],
+            "queued open must not prepare its stale target",
+        );
+        assert!(feedback.iter().all(|message| matches!(
+            message,
+            Message::Notification(notification) if notification.method == "window/showMessage"
+        )));
+        finish_loop(&client_connection, loop_thread, 165);
     }
 
     #[test]
