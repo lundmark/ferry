@@ -50,7 +50,7 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
     )?;
 
     for path in state.files.keys() {
-        if !path.is_empty() && scope_contains(&scope, path) {
+        if !path.is_empty() && !is_state_path(path) && scope_contains(&scope, path) {
             entries.entry(path.clone()).or_default().in_state = true;
         }
     }
@@ -846,6 +846,20 @@ mod tests {
             Some(&presence(None, None, true))
         );
         assert!(!actual.entries.contains_key("area-old/x.c"));
+    }
+
+    #[test]
+    fn root_scope_excludes_state_only_ferry_paths_on_segment_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state_with(&[".ferry", ".ferry/state.json", ".ferry-old/x.c"]);
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let actual = inventory(&mut remote, root.path(), &state, SyncScope::RootDirectory).unwrap();
+
+        assert_eq!(
+            actual.entries,
+            BTreeMap::from([(".ferry-old/x.c".into(), presence(None, None, true))])
+        );
     }
 
     #[test]
