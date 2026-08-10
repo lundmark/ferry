@@ -3,7 +3,7 @@ name = "Ferry"
 version = "0.2.0"
 schema_version = 1
 authors = ["Simon Lundmark <simon@dagg.ai>"]
-description = "Configurable pull-on-open and push-on-save for Ferry projects, with manual pull, push, and compile-check file actions."
+description = "Configurable Ferry project sync with manual file and folder actions, native diff, and opt-in pull-on-open and push-on-save."
 repository = "https://github.com/simon/zed_ftp"
 
 # Attach the LSP to Zed's built-in C language. C headers (.h) are covered

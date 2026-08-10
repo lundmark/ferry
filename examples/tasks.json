@@ -18,6 +18,32 @@
     "hide": "on_success"
   },
   {
+    "label": "Ferry: sync current file",
+    "command": "ferry",
+    "args": ["sync", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
+    "use_new_terminal": false,
+    "reveal": "always",
+    "hide": "on_success"
+  },
+  {
+    "label": "Ferry: sync current folder",
+    "command": "ferry",
+    "args": ["sync", "$ZED_DIRNAME"],
+    "cwd": "$ZED_DIRNAME",
+    "use_new_terminal": false,
+    "reveal": "always",
+    "hide": "on_success"
+  },
+  {
+    "label": "Ferry: choose path to sync...",
+    "command": "ferry",
+    "args": ["sync", "--select"],
+    "cwd": "$ZED_DIRNAME",
+    "use_new_terminal": false,
+    "reveal": "always"
+  },
+  {
     "label": "Ferry: compile-check current file",
     "command": "ferry",
     "args": ["cc", "$ZED_FILE"],
@@ -41,14 +67,5 @@
     "cwd": "$ZED_WORKTREE_ROOT",
     "use_new_terminal": false,
     "reveal": "always"
-  },
-  {
-    "label": "Ferry: DELETE current file locally and remotely",
-    "command": "ferry",
-    "args": ["rm", "$ZED_FILE"],
-    "cwd": "$ZED_DIRNAME",
-    "use_new_terminal": false,
-    "reveal": "always",
-    "hide": "on_success"
   }
 ]
