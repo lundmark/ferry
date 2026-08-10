@@ -25,19 +25,25 @@ use crate::commands::ExecutionMode;
 use crate::commands::cc::{self, FileCheckResult};
 use crate::commands::file_transfer::TransferOutcome;
 use crate::commands::pull::{LocalIdentity, PreparedPull as CorePreparedPull, fetch_remote_one};
-use document_state::{DocumentTracker, OperationGuard};
+use crate::commands::sync::scope::SyncScope;
+use crate::commands::sync::{CommitGate, SyncEventKind, SyncOutcome};
+use document_state::{DocumentScope, DocumentTracker, OperationGuard};
 use lsp_types::request::{Request as LspRequest, ShowMessageRequest};
 
 pub const PULL_COMMAND: &str = "ferry.pull";
 pub const COMPARE_COMMAND: &str = "ferry.compare";
 pub const PUSH_COMMAND: &str = "ferry.push";
 pub const FORCE_PULL_COMMAND: &str = "ferry.forcePull";
+pub const SYNC_FILE_COMMAND: &str = "ferry.syncFile";
+pub const SYNC_FOLDER_COMMAND: &str = "ferry.syncFolder";
 pub const COMPILE_COMMAND: &str = "ferry.compile";
 pub const ACTION_COMMANDS: &[&str] = &[
     PULL_COMMAND,
     COMPARE_COMMAND,
     FORCE_PULL_COMMAND,
     PUSH_COMMAND,
+    SYNC_FILE_COMMAND,
+    SYNC_FOLDER_COMMAND,
     COMPILE_COMMAND,
 ];
 
@@ -82,9 +88,19 @@ pub trait FileOperations {
         anyhow::bail!("native diff is unavailable")
     }
 
+    fn sync(&mut self, _request: SyncRequest) -> Result<SyncOutcome> {
+        anyhow::bail!("scoped sync is unavailable")
+    }
+
     fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
         Arc::new(|| Ok(()))
     }
+}
+
+pub struct SyncRequest {
+    pub config_path: PathBuf,
+    pub scope: SyncScope,
+    pub gate: Arc<dyn CommitGate>,
 }
 
 const PULL_AUTH_PENDING: u8 = 0;
@@ -247,6 +263,16 @@ impl FileOperations for FerryOperations {
         )
     }
 
+    fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+        crate::commands::sync::run_scoped(
+            &request.config_path,
+            request.scope,
+            false,
+            ExecutionMode::Apply,
+            request.gate.as_ref(),
+        )
+    }
+
     fn shutdown_callback(&self) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
         let shutdown = self.snapshots.shutdown_handle();
         Arc::new(move || shutdown.shutdown())
@@ -375,8 +401,19 @@ impl<O: FileOperations> Server<O> {
                             .ok()
                             .and_then(|text| {
                                 tracker.open(command.absolute_path.clone(), &text).ok()?;
-                                tracker.begin_clean_operation(&command.absolute_path).ok()
+                                tracker
+                                    .begin_clean_operation(&command.absolute_path)
+                                    .ok()
+                                    .map(CommandGuard::File)
                             })
+                    } else if matches!(
+                        command.action,
+                        ActionCommand::SyncFile | ActionCommand::SyncFolder
+                    ) {
+                        sync_document_scope_at_ack(&command)
+                            .ok()
+                            .and_then(|scope| tracker.begin_clean_scope(scope).ok())
+                            .map(|guard| CommandGuard::Scope(Arc::new(guard)))
                     } else {
                         None
                     };
@@ -398,7 +435,7 @@ impl<O: FileOperations> Server<O> {
     fn process_command(
         &mut self,
         command: PreparedCommand,
-        guard: Option<OperationGuard>,
+        guard: Option<CommandGuard>,
         running: Option<&AtomicBool>,
     ) -> Message {
         let resolved = match crate::project::resolve_file(&command.absolute_path, true) {
@@ -419,7 +456,7 @@ impl<O: FileOperations> Server<O> {
         };
         match command.action {
             ActionCommand::Pull => {
-                let Some(guard) = guard else {
+                let Some(CommandGuard::File(guard)) = guard else {
                     return save_first_warning(&resolved.relative_path);
                 };
                 match self.pull_with_guard(
@@ -449,7 +486,7 @@ impl<O: FileOperations> Server<O> {
                     .compile(&resolved.config_path, &resolved.relative_path),
             ),
             ActionCommand::Compare => {
-                let Some(guard) = guard else {
+                let Some(CommandGuard::File(guard)) = guard else {
                     return save_first_warning(&resolved.relative_path);
                 };
                 match self.operations.compare(CompareRequest {
@@ -469,6 +506,18 @@ impl<O: FileOperations> Server<O> {
                         safe_error_summary(&error)
                     )),
                 }
+            }
+            ActionCommand::SyncFile | ActionCommand::SyncFolder => {
+                let Some(CommandGuard::Scope(gate)) = guard else {
+                    return save_scope_warning();
+                };
+                let scope = sync_scope_for(command.action, &resolved.relative_path)
+                    .expect("sync action must derive a scope");
+                sync_feedback(self.operations.sync(SyncRequest {
+                    config_path: resolved.config_path,
+                    scope,
+                    gate,
+                }))
             }
         }
     }
@@ -665,6 +714,8 @@ fn code_actions(request: Request) -> Response {
                 ("Ferry: Compare with Remote", COMPARE_COMMAND),
                 ("Ferry: Force Pull (overwrite local)", FORCE_PULL_COMMAND),
                 ("Ferry: Push", PUSH_COMMAND),
+                ("Ferry: Sync Current File", SYNC_FILE_COMMAND),
+                ("Ferry: Sync Current Folder", SYNC_FOLDER_COMMAND),
                 ("Ferry: Compile-check", COMPILE_COMMAND),
             ]
             .into_iter()
@@ -687,7 +738,14 @@ enum ActionCommand {
     Compare,
     ForcePull,
     Push,
+    SyncFile,
+    SyncFolder,
     Compile,
+}
+
+enum CommandGuard {
+    File(OperationGuard),
+    Scope(Arc<dyn CommitGate>),
 }
 
 struct PreparedCommand {
@@ -720,6 +778,8 @@ fn prepare_execute_command(request: Request) -> PreparedRequest {
         COMPARE_COMMAND => ActionCommand::Compare,
         FORCE_PULL_COMMAND => ActionCommand::ForcePull,
         PUSH_COMMAND => ActionCommand::Push,
+        SYNC_FILE_COMMAND => ActionCommand::SyncFile,
+        SYNC_FOLDER_COMMAND => ActionCommand::SyncFolder,
         COMPILE_COMMAND => ActionCommand::Compile,
         _ => {
             return PreparedRequest::Immediate(vec![Message::Response(invalid_params(
@@ -772,6 +832,70 @@ fn prepare_execute_command(request: Request) -> PreparedRequest {
             initial_relative_path: resolved.relative_path,
         },
     }
+}
+
+fn sync_scope_for(action: ActionCommand, relative_path: &str) -> Option<SyncScope> {
+    match action {
+        ActionCommand::SyncFile => Some(SyncScope::Path(relative_path.to_string())),
+        ActionCommand::SyncFolder => {
+            let parent = Path::new(relative_path).parent()?;
+            if parent.as_os_str().is_empty() {
+                Some(SyncScope::RootDirectory)
+            } else {
+                Some(SyncScope::Path(parent.to_string_lossy().into_owned()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn sync_document_scope_at_ack(
+    command: &PreparedCommand,
+) -> std::result::Result<DocumentScope, Message> {
+    let resolved = crate::project::resolve_file(&command.absolute_path, true)
+        .map_err(|error| {
+            warning_message(format!(
+                "ferry: {}; run a Ferry task for details",
+                safe_error_summary(&error)
+            ))
+        })?
+        .ok_or_else(|| {
+            warning_message("ferry: file is no longer in a Ferry project".to_string())
+        })?;
+    let scope = sync_scope_for(command.action, &resolved.relative_path)
+        .expect("only sync commands request a document scope");
+    let document_scope = match scope {
+        SyncScope::Path(_) if matches!(command.action, ActionCommand::SyncFile) => {
+            let path = command.absolute_path.canonicalize().map_err(|_| {
+                warning_message("ferry: operation failed; run a Ferry task for details".to_string())
+            })?;
+            DocumentScope::Exact(path)
+        }
+        SyncScope::RootDirectory => {
+            let root = resolved
+                .config
+                .paths
+                .local_root
+                .canonicalize()
+                .map_err(|_| {
+                    warning_message(
+                        "ferry: configuration error; run a Ferry task for details".to_string(),
+                    )
+                })?;
+            DocumentScope::Directory(root)
+        }
+        SyncScope::Path(_) => {
+            let parent = command.absolute_path.parent().ok_or_else(|| {
+                warning_message("ferry: operation failed; run a Ferry task for details".to_string())
+            })?;
+            let parent = parent.canonicalize().map_err(|_| {
+                warning_message("ferry: operation failed; run a Ferry task for details".to_string())
+            })?;
+            DocumentScope::Directory(parent)
+        }
+        SyncScope::LegacyProject => unreachable!("editor actions never use legacy scope"),
+    };
+    Ok(document_scope)
 }
 
 #[derive(Clone, Copy)]
@@ -828,7 +952,7 @@ enum Work<P> {
     },
     Command {
         command: PreparedCommand,
-        guard: Option<OperationGuard>,
+        guard: Option<CommandGuard>,
     },
     ForcePullPrepare(ForcePullPreparation),
     ForcePullApply(PendingForcePull<P>),
@@ -1434,12 +1558,38 @@ fn handle_request<P>(
                             .documents
                             .begin_clean_operation(&command.absolute_path)
                         {
-                            Ok(guard) => Some(guard),
+                            Ok(guard) => Some(CommandGuard::File(guard)),
                             Err(_) => {
                                 for message in operation_response(
                                     id,
                                     save_first_warning(&command.initial_relative_path),
                                 ) {
+                                    if connection.sender.send(message).is_err() {
+                                        return Ok(true);
+                                    }
+                                }
+                                return Ok(false);
+                            }
+                        }
+                    } else if matches!(
+                        command.action,
+                        ActionCommand::SyncFile | ActionCommand::SyncFolder
+                    ) {
+                        let scope = match sync_document_scope_at_ack(&command) {
+                            Ok(scope) => scope,
+                            Err(feedback) => {
+                                for message in operation_response(id, feedback) {
+                                    if connection.sender.send(message).is_err() {
+                                        return Ok(true);
+                                    }
+                                }
+                                return Ok(false);
+                            }
+                        };
+                        match coordinator.documents.begin_clean_scope(scope) {
+                            Ok(guard) => Some(CommandGuard::Scope(Arc::new(guard))),
+                            Err(_) => {
+                                for message in operation_response(id, save_scope_warning()) {
                                     if connection.sender.send(message).is_err() {
                                         return Ok(true);
                                     }
@@ -1521,6 +1671,12 @@ fn save_first_warning(relative_path: &str) -> Message {
     warning_message(format!("ferry: {relative_path}: save the file and retry"))
 }
 
+fn save_scope_warning() -> Message {
+    warning_message(
+        "ferry: folder changed in Zed; save all files in this folder and retry".to_string(),
+    )
+}
+
 fn info_message(message: String) -> Message {
     let notification = Notification::new(
         "window/showMessage".to_string(),
@@ -1532,11 +1688,47 @@ fn info_message(message: String) -> Message {
     Message::Notification(notification)
 }
 
-#[allow(dead_code)] // Task 9 will route scoped-sync worker outcomes through this mapper.
 fn scope_cancellation_feedback(outcome: &crate::commands::sync::SyncOutcome) -> Option<Message> {
     outcome.cancelled.then(|| {
         warning_message("ferry: folder changed in Zed; save all files and retry".to_string())
     })
+}
+
+fn sync_feedback(result: Result<SyncOutcome>) -> Message {
+    match result {
+        Err(error) => warning_message(format!(
+            "ferry: {}; run a Ferry task for details",
+            safe_error_summary(&error)
+        )),
+        Ok(outcome) if outcome.cancelled => {
+            scope_cancellation_feedback(&outcome).expect("cancelled sync must emit feedback")
+        }
+        Ok(outcome) if !outcome.issues.is_empty() => {
+            warning_message("ferry: conflict; run a Ferry task for details".to_string())
+        }
+        Ok(outcome) => {
+            let mut uploaded = 0usize;
+            let mut downloaded = 0usize;
+            let mut unchanged = 0usize;
+            let mut directories = 0usize;
+            let mut skipped = 0usize;
+            let mut forced = 0usize;
+            for event in outcome.events {
+                match event.kind {
+                    SyncEventKind::Uploaded => uploaded += 1,
+                    SyncEventKind::Downloaded => downloaded += 1,
+                    SyncEventKind::Unchanged => unchanged += 1,
+                    SyncEventKind::CreatedLocalDirectory
+                    | SyncEventKind::CreatedRemoteDirectory => directories += 1,
+                    SyncEventKind::SkippedAbsent => skipped += 1,
+                    SyncEventKind::ForcedRemoteOverwrite => forced += 1,
+                }
+            }
+            info_message(format!(
+                "ferry: sync complete: {uploaded} uploaded, {downloaded} downloaded, {unchanged} unchanged, {directories} directories created, {skipped} skipped, {forced} forced"
+            ))
+        }
+    }
 }
 
 fn transfer_feedback(relative_path: &str, result: Result<TransferOutcome>) -> Message {
@@ -1639,6 +1831,11 @@ mod tests {
         Compile {
             config_path: PathBuf,
             rel: String,
+        },
+        Sync {
+            config_path: PathBuf,
+            scope: SyncScope,
+            gate_current: bool,
         },
     }
 
@@ -2178,6 +2375,8 @@ mod tests {
                         COMPARE_COMMAND.to_string(),
                         FORCE_PULL_COMMAND.to_string(),
                         PUSH_COMMAND.to_string(),
+                        "ferry.syncFile".to_string(),
+                        "ferry.syncFolder".to_string(),
                         COMPILE_COMMAND.to_string(),
                     ],
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -2368,6 +2567,16 @@ mod tests {
                 {
                     "title": "Ferry: Push",
                     "command": "ferry.push",
+                    "arguments": [uri]
+                },
+                {
+                    "title": "Ferry: Sync Current File",
+                    "command": "ferry.syncFile",
+                    "arguments": [uri]
+                },
+                {
+                    "title": "Ferry: Sync Current Folder",
+                    "command": "ferry.syncFolder",
                     "arguments": [uri]
                 },
                 {
@@ -3848,6 +4057,236 @@ mod tests {
     }
 
     #[test]
+    fn execute_command_recognizes_both_scoped_sync_commands() {
+        let fixture = Fixture::new("");
+        let uri = serde_json::to_value(fixture.uri()).unwrap();
+
+        for (id, command) in [(182, "ferry.syncFile"), (183, "ferry.syncFolder")] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut server = Server::new(FakeOperations::successful(calls));
+            let (response, messages) = process_server_request(
+                &mut server,
+                execute_command_request(id, command, vec![uri.clone()]),
+            );
+
+            assert!(response.error.is_none(), "{command} must be executable");
+            assert_eq!(response.result, Some(serde_json::Value::Null));
+            assert_eq!(messages.len(), 1);
+        }
+    }
+
+    #[test]
+    fn scoped_sync_commands_pass_exact_file_nested_folder_and_root_folder_scopes() {
+        let fixture = Fixture::new("");
+        let root_file = fixture._temp.path().join("root.c");
+        fs::write(&root_file, "root\n").unwrap();
+        let root_uri = Uri::from_str(&format!("file://{}", root_file.display())).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+
+        for uri in [fixture.uri(), root_uri.clone()] {
+            let text = if uri == root_uri {
+                "root\n"
+            } else {
+                "int main(void) {}\n"
+            };
+            client
+                .sender
+                .send(Message::Notification(did_open_with_text(uri, text)))
+                .unwrap();
+        }
+
+        for (id, command, uri) in [
+            (184, SYNC_FILE_COMMAND, fixture.uri()),
+            (185, SYNC_FOLDER_COMMAND, fixture.uri()),
+            (186, SYNC_FOLDER_COMMAND, root_uri),
+        ] {
+            client
+                .sender
+                .send(Message::Request(execute_command_request(
+                    id,
+                    command,
+                    vec![serde_json::to_value(uri).unwrap()],
+                )))
+                .unwrap();
+            let messages = receive_request_messages(&client, id, 2);
+            assert!(messages.iter().any(
+                |message| matches!(message, Message::Response(response) if response.error.is_none())
+            ));
+        }
+
+        finish_loop(&client, loop_thread, 187);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                Call::Sync {
+                    config_path: fixture.config_path.clone(),
+                    scope: SyncScope::Path("src/nested/hello world.c".to_string()),
+                    gate_current: true,
+                },
+                Call::Sync {
+                    config_path: fixture.config_path.clone(),
+                    scope: SyncScope::Path("src/nested".to_string()),
+                    gate_current: true,
+                },
+                Call::Sync {
+                    config_path: fixture.config_path,
+                    scope: SyncScope::RootDirectory,
+                    gate_current: true,
+                },
+            ]
+        );
+    }
+
+    fn assert_scope_save_all_warning(messages: Vec<Message>, id: i32) {
+        let mut saw_response = false;
+        let mut warnings = Vec::new();
+        for message in messages {
+            match message {
+                Message::Response(response) if response.id == RequestId::from(id) => {
+                    assert!(response.error.is_none());
+                    saw_response = true;
+                }
+                Message::Notification(notification)
+                    if notification.method == "window/showMessage" =>
+                {
+                    warnings.push(
+                        serde_json::from_value::<ShowMessageParams>(notification.params).unwrap(),
+                    );
+                }
+                other => panic!("unexpected scoped-sync admission message: {other:?}"),
+            }
+        }
+        assert!(saw_response);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].typ, MessageType::WARNING);
+        assert_eq!(
+            warnings[0].message,
+            "ferry: folder changed in Zed; save all files in this folder and retry"
+        );
+    }
+
+    #[test]
+    fn dirty_current_file_refuses_both_scoped_sync_actions() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_change(fixture.uri())))
+            .unwrap();
+
+        for (id, command) in [(188, SYNC_FILE_COMMAND), (189, SYNC_FOLDER_COMMAND)] {
+            client
+                .sender
+                .send(Message::Request(execute_command_request(
+                    id,
+                    command,
+                    vec![serde_json::to_value(fixture.uri()).unwrap()],
+                )))
+                .unwrap();
+            assert_scope_save_all_warning(receive_request_messages(&client, id, 2), id);
+        }
+
+        finish_loop(&client, loop_thread, 190);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folder_sync_refuses_dirty_descendant_but_not_dirty_sibling_outside_scope() {
+        let fixture = Fixture::new("");
+        let inside_path = fixture.file_path.parent().unwrap().join("inside.c");
+        let outside_dir = fixture._temp.path().join("src/other");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_path = outside_dir.join("outside.c");
+        fs::write(&inside_path, "inside\n").unwrap();
+        fs::write(&outside_path, "outside\n").unwrap();
+        let inside_uri = Uri::from_str(&format!("file://{}", inside_path.display())).unwrap();
+        let outside_uri = Uri::from_str(&format!("file://{}", outside_path.display())).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (client, loop_thread) = start_recording_loop(Arc::clone(&calls));
+
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                inside_uri.clone(),
+                "inside\n",
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_change(inside_uri)))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                191,
+                SYNC_FOLDER_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        assert_scope_save_all_warning(receive_request_messages(&client, 191, 2), 191);
+        assert!(calls.lock().unwrap().is_empty());
+
+        client
+            .sender
+            .send(Message::Notification(did_save(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_save(
+                Uri::from_str(&format!(
+                    "file://{}",
+                    fixture
+                        .file_path
+                        .parent()
+                        .unwrap()
+                        .join("inside.c")
+                        .display()
+                ))
+                .unwrap(),
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_open_with_text(
+                outside_uri.clone(),
+                "outside\n",
+            )))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(did_change(outside_uri)))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                192,
+                SYNC_FOLDER_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        let messages = receive_request_messages(&client, 192, 2);
+        assert!(messages.iter().any(
+            |message| matches!(message, Message::Response(response) if response.error.is_none())
+        ));
+
+        finish_loop(&client, loop_thread, 193);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[Call::Sync {
+                config_path: fixture.config_path,
+                scope: SyncScope::Path("src/nested".to_string()),
+                gate_current: true,
+            }]
+        );
+    }
+
+    #[test]
     fn pull_preparation_failure_never_applies_and_emits_safe_warning() {
         let fixture = Fixture::new("");
         let uri = serde_json::to_value(fixture.uri()).unwrap();
@@ -4379,6 +4818,606 @@ mod tests {
                 status: FileCheckStatus::Passed,
                 diagnostics: String::new(),
             })
+        }
+
+        fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            self.calls.lock().unwrap().push(Call::Sync {
+                config_path: request.config_path,
+                scope: request.scope,
+                gate_current: request.gate.is_current(),
+            });
+            Ok(SyncOutcome::default())
+        }
+    }
+
+    struct BlockingSyncOperations {
+        started: mpsc::SyncSender<SyncScope>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl FileOperations for BlockingSyncOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Unchanged))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Unchanged))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+
+        fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            self.started.send(request.scope).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| anyhow!("timed out waiting to release sync"))?;
+            let mut mutation = || Ok(());
+            let decision = request.gate.commit(&mut mutation)?;
+            Ok(SyncOutcome {
+                cancelled: decision == crate::commands::sync::CommitDecision::Cancelled,
+                ..SyncOutcome::default()
+            })
+        }
+    }
+
+    fn start_blocking_sync_loop() -> (
+        Connection,
+        thread::JoinHandle<Result<()>>,
+        mpsc::Receiver<SyncScope>,
+        mpsc::SyncSender<()>,
+    ) {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let operations = BlockingSyncOperations {
+            started: started_tx,
+            release: release_rx,
+        };
+        let (server_connection, client_connection) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        (client_connection, loop_thread, started_rx, release_tx)
+    }
+
+    fn receive_show_message(client: &Connection, context: &str) -> ShowMessageParams {
+        match client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
+        {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value(notification.params).unwrap()
+            }
+            other => panic!("expected {context}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_sync_acknowledges_before_completion_and_keeps_code_actions_responsive() {
+        let fixture = Fixture::new("");
+        let (client, loop_thread, started, release) = start_blocking_sync_loop();
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                194,
+                SYNC_FOLDER_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+
+        receive_acknowledgement(&client, 194);
+        assert_eq!(
+            started.recv_timeout(Duration::from_secs(2)).unwrap(),
+            SyncScope::Path("src/nested".to_string())
+        );
+        assert!(client.receiver.try_recv().is_err(), "sync is still blocked");
+
+        client
+            .sender
+            .send(Message::Request(code_action_request(195, &fixture.uri())))
+            .unwrap();
+        let response = response_with_id(
+            client
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("responsive Code Action response"),
+            195,
+        );
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap().as_array().unwrap().len(), 7);
+
+        release.send(()).unwrap();
+        let feedback = receive_show_message(&client, "scoped-sync completion");
+        assert_eq!(feedback.typ, MessageType::INFO);
+        assert!(feedback.message.starts_with("ferry: sync complete:"));
+        finish_loop(&client, loop_thread, 196);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SyncLifecycleNotification {
+        Open,
+        Change,
+        Save,
+        Close,
+    }
+
+    #[test]
+    fn open_change_save_and_close_beneath_in_flight_folder_cancel_before_commit() {
+        for (offset, lifecycle) in [
+            SyncLifecycleNotification::Open,
+            SyncLifecycleNotification::Change,
+            SyncLifecycleNotification::Save,
+            SyncLifecycleNotification::Close,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = Fixture::new("");
+            let sibling_path = fixture.file_path.parent().unwrap().join("sibling.c");
+            fs::write(&sibling_path, "sibling\n").unwrap();
+            let sibling_uri = Uri::from_str(&format!("file://{}", sibling_path.display())).unwrap();
+            let (client, loop_thread, started, release) = start_blocking_sync_loop();
+            client
+                .sender
+                .send(Message::Notification(did_open(fixture.uri())))
+                .unwrap();
+            let command_id = 200 + i32::try_from(offset).unwrap() * 3;
+            client
+                .sender
+                .send(Message::Request(execute_command_request(
+                    command_id,
+                    SYNC_FOLDER_COMMAND,
+                    vec![serde_json::to_value(fixture.uri()).unwrap()],
+                )))
+                .unwrap();
+            receive_acknowledgement(&client, command_id);
+            started
+                .recv_timeout(Duration::from_secs(2))
+                .expect("folder sync started");
+
+            let notification = match lifecycle {
+                SyncLifecycleNotification::Open => did_open_with_text(sibling_uri, "sibling\n"),
+                SyncLifecycleNotification::Change => did_change(fixture.uri()),
+                SyncLifecycleNotification::Save => did_save(fixture.uri()),
+                SyncLifecycleNotification::Close => did_close(fixture.uri()),
+            };
+            client
+                .sender
+                .send(Message::Notification(notification))
+                .unwrap();
+
+            let barrier_id = command_id + 1;
+            client
+                .sender
+                .send(Message::Request(code_action_request(
+                    barrier_id,
+                    &fixture.uri(),
+                )))
+                .unwrap();
+            let barrier = response_with_id(
+                client
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("lifecycle barrier response"),
+                barrier_id,
+            );
+            assert!(barrier.error.is_none(), "{lifecycle:?}");
+
+            release.send(()).unwrap();
+            let feedback = receive_show_message(&client, "scope cancellation feedback");
+            assert_eq!(feedback.typ, MessageType::WARNING, "{lifecycle:?}");
+            assert_eq!(
+                feedback.message, "ferry: folder changed in Zed; save all files and retry",
+                "{lifecycle:?}"
+            );
+            finish_loop(&client, loop_thread, command_id + 2);
+        }
+    }
+
+    struct QueueBlockingSyncOperations {
+        calls: Arc<Mutex<Vec<Call>>>,
+        started: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        pushed: mpsc::SyncSender<()>,
+    }
+
+    impl FileOperations for QueueBlockingSyncOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Unchanged))
+        }
+
+        fn push(&mut self, config_path: &Path, rel: &str, force: bool) -> Result<TransferOutcome> {
+            self.calls.lock().unwrap().push(Call::Push {
+                config_path: config_path.to_path_buf(),
+                rel: rel.to_string(),
+                force,
+            });
+            self.pushed.send(()).unwrap();
+            Ok(TransferOutcome::new(rel, TransferStatus::Transferred))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+
+        fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            self.calls.lock().unwrap().push(Call::Sync {
+                config_path: request.config_path,
+                scope: request.scope,
+                gate_current: request.gate.is_current(),
+            });
+            self.started.send(()).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| anyhow!("timed out releasing queued sync"))?;
+            let mut mutation = || Ok(());
+            let decision = request.gate.commit(&mut mutation)?;
+            Ok(SyncOutcome {
+                cancelled: decision == crate::commands::sync::CommitDecision::Cancelled,
+                ..SyncOutcome::default()
+            })
+        }
+    }
+
+    #[test]
+    fn queued_save_runs_after_folder_cancellation_and_re_resolves_project_root() {
+        let fixture = Fixture::new("[editor]\npush_on_save = true\n");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (pushed_tx, pushed_rx) = mpsc::sync_channel(1);
+        let operations = QueueBlockingSyncOperations {
+            calls: Arc::clone(&calls),
+            started: started_tx,
+            release: release_rx,
+            pushed: pushed_tx,
+        };
+        let (server_connection, client) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                212,
+                SYNC_FOLDER_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_acknowledgement(&client, 212);
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("folder sync started");
+
+        fixture.set_raw_config(
+            "[connection]\nhost = \"example.invalid\"\nuser = \"u\"\npassword = \"p\"\n\
+             [paths]\nlocal_root = \"src\"\nremote_root = \"/changed\"\n\
+             [editor]\npush_on_save = true\n",
+        );
+        client
+            .sender
+            .send(Message::Notification(did_save(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(code_action_request(213, &fixture.uri())))
+            .unwrap();
+        let barrier = response_with_id(
+            client
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("queued save protocol barrier"),
+            213,
+        );
+        assert!(barrier.error.is_none());
+        assert!(
+            pushed_rx.try_recv().is_err(),
+            "save stays behind folder sync"
+        );
+
+        release_tx.send(()).unwrap();
+        pushed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued save processed after sync");
+        let feedback = receive_show_message(&client, "cancelled folder sync");
+        assert_eq!(feedback.typ, MessageType::WARNING);
+        assert_eq!(
+            feedback.message,
+            "ferry: folder changed in Zed; save all files and retry"
+        );
+        finish_loop(&client, loop_thread, 214);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[
+                Call::Sync {
+                    config_path: fixture.config_path.clone(),
+                    scope: SyncScope::Path("src/nested".to_string()),
+                    gate_current: true,
+                },
+                Call::Push {
+                    config_path: fixture.config_path,
+                    rel: "nested/hello world.c".to_string(),
+                    force: false,
+                },
+            ]
+        );
+    }
+
+    struct StagedSyncOperations {
+        destination: PathBuf,
+        state_path: PathBuf,
+        staged: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        stopped: mpsc::SyncSender<()>,
+    }
+
+    impl Drop for StagedSyncOperations {
+        fn drop(&mut self) {
+            let _ = self.stopped.send(());
+        }
+    }
+
+    impl FileOperations for StagedSyncOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Unchanged))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Unchanged))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+
+        fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            self.staged.send(()).unwrap();
+            self.release
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| anyhow!("timed out releasing staged sync"))?;
+            let destination = self.destination.clone();
+            let state_path = self.state_path.clone();
+            let mut mutation = || {
+                fs::write(&destination, b"remote replacement")?;
+                fs::write(&state_path, b"mutated state")?;
+                Ok(())
+            };
+            let decision = request.gate.commit(&mut mutation)?;
+            Ok(SyncOutcome {
+                cancelled: decision == crate::commands::sync::CommitDecision::Cancelled,
+                ..SyncOutcome::default()
+            })
+        }
+    }
+
+    #[test]
+    fn shutdown_after_sync_staging_is_prompt_and_denies_replacement_state_and_feedback() {
+        let fixture = Fixture::new("");
+        let original = fs::read(&fixture.file_path).unwrap();
+        let state_path = fixture._temp.path().join("staged-state.json");
+        let (staged_tx, staged_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
+        let operations = StagedSyncOperations {
+            destination: fixture.file_path.clone(),
+            state_path: state_path.clone(),
+            staged: staged_tx,
+            release: release_rx,
+            stopped: stopped_tx,
+        };
+        let (server_connection, client) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                215,
+                SYNC_FILE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_acknowledgement(&client, 215);
+        staged_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sync reached staged commit boundary");
+
+        let shutdown_started = Instant::now();
+        send_shutdown_request(&client, 216);
+        let shutdown = client
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prompt shutdown response while sync is staged");
+        assert!(response_with_id(shutdown, 216).error.is_none());
+        assert!(shutdown_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fs::read(&fixture.file_path).unwrap(), original);
+        assert!(!state_path.exists());
+
+        send_exit(&client);
+        loop_thread.join().unwrap().unwrap();
+        assert!(
+            client
+                .receiver
+                .try_recv()
+                .expect_err("LSP writer closed")
+                .is_disconnected(),
+            "detached worker must not retain the LSP writer"
+        );
+
+        release_tx.send(()).unwrap();
+        stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("staged sync worker stopped after release");
+        assert_eq!(fs::read(&fixture.file_path).unwrap(), original);
+        assert!(!state_path.exists());
+        assert!(
+            client.receiver.try_recv().is_err(),
+            "no late worker feedback"
+        );
+    }
+
+    fn show_message_params(message: Message) -> ShowMessageParams {
+        match message {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value(notification.params).unwrap()
+            }
+            other => panic!("expected showMessage notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_feedback_uses_typed_counts_and_redacts_paths_secrets_and_raw_transport_text() {
+        let hostile_path = format!("/absolute/{REVIEW_SECRET}/raw LIST record");
+        let events = [
+            SyncEventKind::Uploaded,
+            SyncEventKind::Downloaded,
+            SyncEventKind::Unchanged,
+            SyncEventKind::CreatedLocalDirectory,
+            SyncEventKind::CreatedRemoteDirectory,
+            SyncEventKind::SkippedAbsent,
+            SyncEventKind::ForcedRemoteOverwrite,
+        ]
+        .into_iter()
+        .map(|kind| crate::commands::sync::SyncEvent {
+            path: hostile_path.clone(),
+            kind,
+        })
+        .collect();
+        let success = show_message_params(sync_feedback(Ok(SyncOutcome {
+            events,
+            issues: Vec::new(),
+            cancelled: false,
+        })));
+        assert_eq!(success.typ, MessageType::INFO);
+        assert_eq!(
+            success.message,
+            "ferry: sync complete: 1 uploaded, 1 downloaded, 1 unchanged, 2 directories created, 1 skipped, 1 forced"
+        );
+
+        let conflict = show_message_params(sync_feedback(Ok(SyncOutcome {
+            events: Vec::new(),
+            issues: vec![crate::commands::sync::SyncIssue::FileConflict {
+                path: hostile_path.clone(),
+                state: crate::state::FileState::BothChanged,
+            }],
+            cancelled: false,
+        })));
+        assert_eq!(conflict.typ, MessageType::WARNING);
+        assert_eq!(
+            conflict.message,
+            "ferry: conflict; run a Ferry task for details"
+        );
+
+        let cancelled = show_message_params(sync_feedback(Ok(SyncOutcome {
+            events: vec![crate::commands::sync::SyncEvent {
+                path: hostile_path.clone(),
+                kind: SyncEventKind::Uploaded,
+            }],
+            issues: Vec::new(),
+            cancelled: true,
+        })));
+        assert_eq!(cancelled.typ, MessageType::WARNING);
+        assert_eq!(
+            cancelled.message,
+            "ferry: folder changed in Zed; save all files and retry"
+        );
+
+        let auth_error = show_message_params(sync_feedback(Err(crate::error::Exit::Auth(
+            format!("login rejected for {REVIEW_SECRET}"),
+        )
+        .into())));
+        assert_eq!(auth_error.typ, MessageType::WARNING);
+        assert_eq!(
+            auth_error.message,
+            "ferry: connection/authentication error; run a Ferry task for details"
+        );
+
+        for feedback in [success, conflict, cancelled, auth_error] {
+            assert!(!feedback.message.contains(REVIEW_SECRET));
+            assert!(!feedback.message.contains("/absolute"));
+            assert!(!feedback.message.contains("raw LIST"));
         }
     }
 
@@ -5060,7 +6099,7 @@ mod tests {
         let action_messages = receive_request_messages(&client_connection, 130, 1);
         let actions = response_with_id(action_messages.into_iter().next().unwrap(), 130);
         assert!(actions.error.is_none());
-        assert_eq!(actions.result.unwrap().as_array().unwrap().len(), 5);
+        assert_eq!(actions.result.unwrap().as_array().unwrap().len(), 7);
 
         let mut feedback = Vec::new();
         for (id, command) in [
@@ -5889,7 +6928,7 @@ mod tests {
         let responsive_action = response_with_id(responsive_action, 302);
         assert_eq!(
             responsive_action.result.unwrap().as_array().unwrap().len(),
-            5
+            7
         );
 
         release_barrier(&release);
@@ -6599,7 +7638,7 @@ mod tests {
             141,
         );
         assert!(action.error.is_none());
-        assert_eq!(action.result.unwrap().as_array().unwrap().len(), 5);
+        assert_eq!(action.result.unwrap().as_array().unwrap().len(), 7);
         assert!(response_with_id(prompt_shutdown, 142).error.is_none());
     }
 

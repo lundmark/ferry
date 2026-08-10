@@ -11,7 +11,8 @@ use ferry::error::Exit;
 use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
 use ferry::state::{FileRecord, StateFile};
-use std::process::Command;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
 use support::{remote_path, start_ftp, write_config};
 
 fn seed_state(local_root: &std::path::Path, rel: &str, known_bytes: &[u8]) {
@@ -736,4 +737,185 @@ fn prepared_force_pull_requires_a_remote_file() {
     );
     assert!(!absent_local_path.exists());
     assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+}
+
+fn write_lsp_frame(writer: &mut impl Write, value: &serde_json::Value) {
+    let payload = serde_json::to_vec(value).unwrap();
+    write!(writer, "Content-Length: {}\r\n\r\n", payload.len()).unwrap();
+    writer.write_all(&payload).unwrap();
+    writer.flush().unwrap();
+}
+
+fn read_lsp_frame(reader: &mut impl BufRead) -> Option<serde_json::Value> {
+    let mut content_length = None;
+    let mut saw_header = false;
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).unwrap();
+        if read == 0 {
+            assert!(!saw_header, "truncated LSP header at stdout EOF");
+            return None;
+        }
+        saw_header = true;
+        if line == "\r\n" {
+            break;
+        }
+        let line = line
+            .strip_suffix("\r\n")
+            .expect("every stdout header line must use CRLF framing");
+        let (name, value) = line
+            .split_once(':')
+            .expect("unframed stdout byte or malformed LSP header");
+        if name.eq_ignore_ascii_case("Content-Length") {
+            assert!(content_length.is_none(), "duplicate Content-Length header");
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let content_length = content_length.expect("LSP stdout frame must have Content-Length");
+    let mut payload = vec![0; content_length];
+    reader
+        .read_exact(&mut payload)
+        .expect("complete LSP stdout payload");
+    Some(serde_json::from_slice(&payload).expect("LSP stdout payload must be JSON"))
+}
+
+#[test]
+#[ignore]
+fn ferry_lsp_scoped_sync_stdout_is_only_content_length_framed_json_rpc() {
+    let fixture = start_ftp();
+    let local = tempfile::tempdir().unwrap();
+    let _config = write_config(local.path(), &fixture);
+    let file_path = local.path().join("lsp-stdout-probe.txt");
+    let file_text = "scoped sync stdout probe\n";
+    std::fs::write(&file_path, file_text).unwrap();
+    let uri = format!("file://{}", file_path.display());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry-lsp"))
+        .current_dir(local.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    write_lsp_frame(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": format!("file://{}", local.path().display()),
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_lsp_frame(&mut stdout).expect("initialize response");
+    assert_eq!(initialize["id"], 1);
+    assert!(initialize.get("error").is_none());
+
+    write_lsp_frame(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    );
+    write_lsp_frame(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "text",
+                    "version": 1,
+                    "text": file_text
+                }
+            }
+        }),
+    );
+    write_lsp_frame(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/executeCommand",
+            "params": {
+                "command": "ferry.syncFile",
+                "arguments": [uri]
+            }
+        }),
+    );
+
+    let mut acknowledged = false;
+    let mut feedback = None;
+    for _ in 0..8 {
+        let message = read_lsp_frame(&mut stdout).expect("scoped-sync response or feedback");
+        if message.get("id") == Some(&serde_json::json!(2)) {
+            assert!(message.get("error").is_none());
+            acknowledged = true;
+        } else if message.get("method") == Some(&serde_json::json!("window/showMessage")) {
+            feedback = message["params"]["message"].as_str().map(str::to_string);
+        }
+        if acknowledged && feedback.is_some() {
+            break;
+        }
+    }
+    assert!(acknowledged, "scoped-sync command acknowledgement");
+    let feedback = feedback.expect("typed scoped-sync feedback notification");
+    assert!(feedback.starts_with("ferry: sync complete:"));
+    assert!(feedback.contains("uploaded"));
+
+    write_lsp_frame(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "shutdown",
+            "params": null
+        }),
+    );
+    let shutdown = read_lsp_frame(&mut stdout).expect("shutdown response");
+    assert_eq!(shutdown["id"], 3);
+    assert!(shutdown.get("error").is_none());
+    write_lsp_frame(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": null
+        }),
+    );
+    drop(stdin);
+
+    assert!(
+        read_lsp_frame(&mut stdout).is_none(),
+        "unexpected framed message after exit"
+    );
+    let status = child.wait().unwrap();
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    assert!(
+        status.success(),
+        "ferry-lsp failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let mut ftp =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    assert_eq!(
+        ftp.download(&remote_path("lsp-stdout-probe.txt")).unwrap(),
+        file_text.as_bytes()
+    );
 }
