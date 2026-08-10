@@ -186,6 +186,14 @@ not treat entries beneath a failed listing as remotely absent, classify them
 as `LocalOnly`, or upload them. Direct-file discovery likewise requires a
 conclusive remote existence/type result before absence-based classification.
 
+Explicit scopes and the picker use a strict FTP listing path rather than the
+legacy tolerant `Ftp::list` behavior. Every raw listing record must either
+parse into an entry or match an explicitly recognized ignorable control
+record. Blank records and `.`/`..` entries are accounted for deliberately;
+any other unparseable or unaccounted record fails the directory listing with a
+sanitized path-specific error. The existing tolerant listing behavior remains
+unchanged for legacy project-wide operations.
+
 ### Files
 
 Each selected file uses Ferry's existing three-hash classification and action
@@ -284,10 +292,24 @@ A current-folder action also registers a scope generation before its worker
 starts. Any `didOpen`, `didChange`, `didSave`, or `didClose` for a tracked
 document equal to or beneath that directory invalidates the generation, even
 if the event leaves the document clean. Shutdown invalidates it as well. The
-worker checks the generation immediately before every local or remote
-directory creation, upload, and local-file installation. Once invalidated it
-performs no further transfer mutations and reports that the folder changed in
-Zed and must be retried.
+worker checks the generation before beginning each transfer so stale work is
+not staged unnecessarily. Upload and download staging may write only sibling
+temporary entries; staging cannot replace a destination or update state.
+
+Every destination mutation--local or remote directory creation, remote
+temporary-file rename, local temporary-file rename, and its corresponding
+in-memory state-record update--requires a short-lived atomic commit claim from
+the same scope guard. Claim acquisition and document-event invalidation are
+mutually exclusive. While holding the claim, the worker rechecks the
+generation and then performs the destination mutation plus state-record
+update. If the generation is already invalid, no claim is issued; Ferry
+best-effort removes the staged temporary entry and leaves the destination and
+state unchanged. If the claim wins first, the mutation is ordered before the
+later editor event, which invalidates all subsequent work after the claim is
+released. CLI callers use an unconditional claim implementation.
+
+Once invalidated, the worker performs no further transfer mutations and
+reports that the folder changed in Zed and must be retried.
 
 Mutating LSP operations for one Ferry project are serialized behind the
 existing action coordinator while a folder action is active. Transfers that
@@ -362,8 +384,12 @@ Update the root README and extension README with:
   subtree checks, response correlation, background execution, and proof that
   the shared engine writes no stdout/stderr from an LSP worker.
 - Mid-flight descendant open/change/save/close and shutdown events invalidate
-  a folder action before its next transfer; completed progress is recorded
+  a folder action before its next commit claim; completed progress is recorded
   and queued operations revalidate after serialization.
+- A deterministic transfer seam pauses after local or remote temporary staging.
+  Separate `didChange`, `didSave`, and shutdown cases invalidate while
+  paused; after release, no destination replacement or state update occurs,
+  and temporary cleanup is attempted.
 
 ### FTP integration tests
 
@@ -379,6 +405,9 @@ Update the root README and extension README with:
 - Type conflicts do not overwrite either side.
 - A nested remote-listing failure aborts scoped sync before local-only
   classification, upload, directory creation, or state mutation.
+- A raw listing containing valid entries plus one malformed or unaccounted
+  record fails closed before upload, directory creation, destination
+  replacement, or state mutation.
 - Dry-run changes neither side, directory structure, nor state.
 - Bare project-wide sync retains its established behavior.
 
