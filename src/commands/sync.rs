@@ -17,40 +17,773 @@
 //! user says "just sync it already," last-write-wins from the local side
 //! since that's the side the user is actively editing.
 
-use crate::commands::file_transfer::RemoteDestinationSnapshot;
-use crate::commands::pull::download_one;
-use crate::commands::push::upload_one;
-use crate::commands::remote_hash;
+use self::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
+use self::scope::SyncScope;
+use crate::commands::file_transfer::{RemoteDestinationSnapshot, RemoteWrite};
+use crate::commands::pull::{ExpectedLocalDestination, download_one, download_one_guarded};
+use crate::commands::push::{
+    ExpectedLocalSource, ExpectedRemoteDestination, upload_one, upload_one_guarded,
+};
+use crate::commands::remote_hash::{self, RemoteFileRetrieval, RemoteHash};
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
-use crate::ftp::Ftp;
-use crate::hash::hash_file;
+use crate::ftp::{Ftp, StrictRemote};
+use crate::hash::{hash_bytes, hash_file};
 use crate::ignored::Matcher;
 use crate::state::{FileState, StateFile, classify};
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // The scoped sync engine wires this collector in Task 5.
 pub(crate) mod commit;
-#[allow(dead_code)]
 mod inventory;
+pub use inventory::EntryKind;
 pub mod scope;
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncEventKind {
+    Unchanged,
+    Uploaded,
+    Downloaded,
+    CreatedLocalDirectory,
+    CreatedRemoteDirectory,
+    SkippedAbsent,
+    ForcedRemoteOverwrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncEvent {
+    pub path: String,
+    pub kind: SyncEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncIssue {
+    FileConflict {
+        path: String,
+        state: FileState,
+    },
+    TypeConflict {
+        path: String,
+        local: EntryKind,
+        remote: EntryKind,
+    },
+}
+
+impl SyncIssue {
+    fn path(&self) -> &str {
+        match self {
+            Self::FileConflict { path, .. } | Self::TypeConflict { path, .. } => path,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub events: Vec<SyncEvent>,
+    pub issues: Vec<SyncIssue>,
+    pub cancelled: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct HashObservation {
+    path: String,
+    local: Option<String>,
+    remote: Option<String>,
+    known: Option<String>,
+}
+
+#[cfg(test)]
+fn plan_structured_files(mut observations: Vec<HashObservation>, force: bool) -> SyncOutcome {
+    observations.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut outcome = SyncOutcome::default();
+    for observation in observations {
+        let state = classify(
+            observation.local.as_deref(),
+            observation.remote.as_deref(),
+            observation.known.as_deref(),
+        );
+        let kind = match state {
+            FileState::InSync => Some(SyncEventKind::Unchanged),
+            FileState::LocalChanged | FileState::LocalOnly => Some(SyncEventKind::Uploaded),
+            FileState::RemoteChanged | FileState::RemoteOnly => Some(SyncEventKind::Downloaded),
+            FileState::BothChanged | FileState::Untracked if force => {
+                Some(SyncEventKind::ForcedRemoteOverwrite)
+            }
+            FileState::BothChanged | FileState::Untracked => {
+                outcome.issues.push(SyncIssue::FileConflict {
+                    path: observation.path,
+                    state,
+                });
+                continue;
+            }
+        };
+        if let Some(kind) = kind {
+            outcome.events.push(SyncEvent {
+                path: observation.path,
+                kind,
+            });
+        }
+    }
+    outcome
+}
+
+fn classify_inventory_shapes(
+    entries: std::collections::BTreeMap<String, inventory::InventoryEntry>,
+) -> (Vec<String>, SyncOutcome) {
+    let mut files = Vec::new();
+    let mut outcome = SyncOutcome::default();
+    for (path, entry) in entries {
+        match (entry.local, entry.remote) {
+            (None, None) if entry.in_state => outcome.events.push(SyncEvent {
+                path,
+                kind: SyncEventKind::SkippedAbsent,
+            }),
+            (Some(EntryKind::File), Some(EntryKind::File))
+            | (Some(EntryKind::File), None)
+            | (None, Some(EntryKind::File)) => files.push(path),
+            (Some(EntryKind::Directory), Some(EntryKind::Directory))
+            | (Some(EntryKind::Directory), None)
+            | (None, Some(EntryKind::Directory))
+            | (None, None) => {}
+            (Some(local), Some(remote)) => outcome.issues.push(SyncIssue::TypeConflict {
+                path,
+                local,
+                remote,
+            }),
+        }
+    }
+    (files, outcome)
+}
+
+#[derive(Debug)]
+struct ScheduledAction {
+    path: String,
+    kind: SyncEventKind,
+}
+
+fn execute_structured_plan(
+    actions: Vec<ScheduledAction>,
+    mut outcome: SyncOutcome,
+    gate: &dyn CommitGate,
+    mut execute: impl FnMut(&ScheduledAction) -> Result<CommitDecision>,
+    mut validate_directories: impl FnMut() -> Result<()>,
+) -> Result<SyncOutcome> {
+    for action in &actions {
+        if !gate.is_current() {
+            outcome.cancelled = true;
+            return Ok(outcome);
+        }
+        match execute(action)? {
+            CommitDecision::Committed => outcome.events.push(SyncEvent {
+                path: action.path.clone(),
+                kind: action.kind.clone(),
+            }),
+            CommitDecision::Cancelled => {
+                outcome.cancelled = true;
+                return Ok(outcome);
+            }
+        }
+    }
+
+    if !gate.is_current() {
+        outcome.cancelled = true;
+        return Ok(outcome);
+    }
+    validate_directories()?;
+    if !gate.is_current() {
+        outcome.cancelled = true;
+    }
+    Ok(outcome)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedLocalDirectory {
     Missing,
     Directory { canonical_in_root: PathBuf },
 }
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ExpectedDirectorySnapshots {
     pub relative: String,
     pub local: ExpectedLocalDirectory,
     pub remote: RemoteDestinationSnapshot,
+}
+
+#[derive(Debug)]
+struct PreparedTransfer {
+    event: ScheduledAction,
+    operation: PreparedOperation,
+}
+
+#[derive(Debug)]
+enum PreparedOperation {
+    Upload {
+        remote_path: String,
+        bytes: Vec<u8>,
+        hash: String,
+        source: ExpectedLocalSource,
+        destination: ExpectedRemoteDestination,
+    },
+    Download {
+        local_path: PathBuf,
+        remote: RemoteHash,
+        destination: ExpectedLocalDestination,
+    },
+}
+
+pub fn run_scoped(
+    config_path: &Path,
+    scope: SyncScope,
+    force: bool,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<SyncOutcome> {
+    if scope == SyncScope::LegacyProject {
+        anyhow::bail!("scoped sync requires an explicit path");
+    }
+
+    let cfg = Config::load(config_path)?;
+    let local_root = cfg.paths.local_root.clone();
+    let state_path = state_path_for(&local_root, mode);
+    let mut state = StateFile::load_or_default(&state_path)?;
+    let initial_files = state.files.clone();
+    let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
+    let mut remote = Ftp::connect(
+        &cfg.connection.host,
+        cfg.connection.port,
+        &cfg.connection.user,
+        &cfg.connection.password,
+        cfg.connection.passive,
+    )?;
+
+    let execution = run_scoped_with(
+        &mut remote,
+        &mut state,
+        &local_root,
+        &cfg.paths.remote_root,
+        &matcher,
+        scope,
+        force,
+        mode,
+        gate,
+    );
+    let should_save = execution.is_ok() || state.files != initial_files;
+    let save = if mode.should_apply() && should_save {
+        state.save(&state_path)
+    } else {
+        Ok(())
+    };
+
+    match (execution, save) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(save_error)) => Err(error.context(format!(
+            "also failed to save completed sync state: {save_error:#}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scoped_with<R>(
+    remote: &mut R,
+    state: &mut StateFile,
+    local_root: &Path,
+    remote_root: &str,
+    matcher: &Matcher,
+    scope: SyncScope,
+    force: bool,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<SyncOutcome>
+where
+    R: StrictRemote + RemoteFileRetrieval + RemoteWrite,
+{
+    let inventory = inventory::collect(remote, local_root, remote_root, matcher, state, scope)?;
+    let entries = inventory.entries;
+    let (file_paths, mut outcome) = classify_inventory_shapes(entries.clone());
+    let directories = capture_directory_snapshots(local_root, &entries)?;
+
+    let mut transfers = Vec::new();
+    for relative in file_paths {
+        let entry = entries
+            .get(&relative)
+            .expect("file path came from scoped inventory");
+        let local_path = local_root.join(&relative);
+        let remote_path = remote_join(remote_root, &relative);
+        let local_hash = if entry.local == Some(EntryKind::File) {
+            Some(
+                hash_file(&local_path)
+                    .with_context(|| format!("hashing local {}", local_path.display()))?,
+            )
+        } else {
+            None
+        };
+        let remote_hash = if entry.remote == Some(EntryKind::File) {
+            Some(remote_hash::compute_with(
+                remote,
+                state,
+                &relative,
+                &remote_path,
+                true,
+            )?)
+        } else {
+            None
+        };
+        let known = state
+            .files
+            .get(&relative)
+            .map(|record| record.sha256.as_str());
+        let file_state = classify(
+            local_hash.as_deref(),
+            remote_hash.as_ref().map(|hash| hash.sha256.as_str()),
+            known,
+        );
+
+        match file_state {
+            FileState::InSync => outcome.events.push(SyncEvent {
+                path: relative,
+                kind: SyncEventKind::Unchanged,
+            }),
+            FileState::LocalChanged | FileState::LocalOnly => {
+                let destination = capture_remote_destination(remote, remote_root, &remote_path)?;
+                transfers.push(prepare_upload(
+                    local_root,
+                    &local_path,
+                    relative,
+                    remote_path,
+                    local_hash.expect("upload state has a local hash"),
+                    destination,
+                    SyncEventKind::Uploaded,
+                )?);
+            }
+            FileState::RemoteChanged | FileState::RemoteOnly => {
+                transfers.push(prepare_download(
+                    remote,
+                    local_root,
+                    &local_path,
+                    local_hash.as_deref(),
+                    relative,
+                    remote_path,
+                    remote_hash.expect("download state has a remote hash"),
+                )?);
+            }
+            FileState::BothChanged | FileState::Untracked if force => {
+                let destination = capture_remote_destination(remote, remote_root, &remote_path)?;
+                transfers.push(prepare_upload(
+                    local_root,
+                    &local_path,
+                    relative,
+                    remote_path,
+                    local_hash.expect("forced upload has a local hash"),
+                    destination,
+                    SyncEventKind::ForcedRemoteOverwrite,
+                )?);
+            }
+            FileState::BothChanged | FileState::Untracked => {
+                outcome.issues.push(SyncIssue::FileConflict {
+                    path: relative,
+                    state: file_state,
+                });
+            }
+        }
+    }
+
+    let scheduled = transfers
+        .iter()
+        .map(|transfer| ScheduledAction {
+            path: transfer.event.path.clone(),
+            kind: transfer.event.kind.clone(),
+        })
+        .collect();
+    let mut transfers = transfers.into_iter();
+    outcome = execute_structured_plan(
+        scheduled,
+        outcome,
+        gate,
+        |_action| {
+            let transfer = transfers
+                .next()
+                .expect("scheduled action has a prepared transfer");
+            match transfer.operation {
+                PreparedOperation::Upload {
+                    remote_path,
+                    bytes,
+                    hash,
+                    source,
+                    destination,
+                } => upload_one_guarded(
+                    remote,
+                    state,
+                    &transfer.event.path,
+                    remote_root,
+                    &remote_path,
+                    &bytes,
+                    &hash,
+                    &source,
+                    &destination,
+                    mode,
+                    gate,
+                ),
+                PreparedOperation::Download {
+                    local_path,
+                    remote,
+                    destination,
+                } => download_one_guarded(
+                    state,
+                    &local_path,
+                    &transfer.event.path,
+                    &remote,
+                    &destination,
+                    mode,
+                    gate,
+                ),
+            }
+        },
+        || Ok(()),
+    )?;
+    if outcome.cancelled {
+        sort_outcome(&mut outcome);
+        return Ok(outcome);
+    }
+
+    if !gate.is_current() {
+        outcome.cancelled = true;
+        sort_outcome(&mut outcome);
+        return Ok(outcome);
+    }
+    for expected in &directories {
+        if !gate.is_current() {
+            outcome.cancelled = true;
+            sort_outcome(&mut outcome);
+            return Ok(outcome);
+        }
+        validate_directory_snapshot(remote, local_root, remote_root, expected)?;
+    }
+    if !gate.is_current() {
+        outcome.cancelled = true;
+    }
+    sort_outcome(&mut outcome);
+    Ok(outcome)
+}
+
+fn prepare_upload(
+    local_root: &Path,
+    local_path: &Path,
+    relative: String,
+    remote_path: String,
+    local_hash: String,
+    destination: ExpectedRemoteDestination,
+    kind: SyncEventKind,
+) -> Result<PreparedTransfer> {
+    let source = ExpectedLocalSource::capture(local_root, local_path)?;
+    let bytes = std::fs::read(&source.path)
+        .with_context(|| format!("reading local {}", source.path.display()))?;
+    if hash_bytes(&bytes) != local_hash {
+        anyhow::bail!("local source changed while planning {relative}");
+    }
+    Ok(PreparedTransfer {
+        event: ScheduledAction {
+            path: relative,
+            kind,
+        },
+        operation: PreparedOperation::Upload {
+            remote_path,
+            bytes,
+            hash: local_hash,
+            source,
+            destination,
+        },
+    })
+}
+
+fn capture_remote_destination<R: RemoteWrite>(
+    remote: &mut R,
+    remote_root: &str,
+    remote_path: &str,
+) -> Result<ExpectedRemoteDestination> {
+    Ok(ExpectedRemoteDestination {
+        snapshot: remote.destination_snapshot(remote_root, remote_path)?,
+    })
+}
+
+fn prepare_download<R: RemoteFileRetrieval>(
+    remote: &mut R,
+    local_root: &Path,
+    local_path: &Path,
+    expected_local_hash: Option<&str>,
+    relative: String,
+    remote_path: String,
+    remote_hash: RemoteHash,
+) -> Result<PreparedTransfer> {
+    let expected_remote = remote_snapshot(&remote_hash);
+    let remote_hash = remote_hash::complete_for_install(remote, &remote_path, remote_hash)?;
+    if remote_snapshot(&remote_hash) != expected_remote {
+        anyhow::bail!("remote source changed while planning {relative}");
+    }
+    let destination = ExpectedLocalDestination::capture(local_root, local_path)?;
+    verify_planned_local_hash(local_path, expected_local_hash)?;
+    Ok(PreparedTransfer {
+        event: ScheduledAction {
+            path: relative,
+            kind: SyncEventKind::Downloaded,
+        },
+        operation: PreparedOperation::Download {
+            local_path: local_path.to_path_buf(),
+            remote: remote_hash,
+            destination,
+        },
+    })
+}
+
+fn verify_planned_local_hash(path: &Path, expected: Option<&str>) -> Result<()> {
+    let current = match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading local destination {}", path.display()));
+        }
+        Ok(_) => {
+            let metadata = std::fs::metadata(path)
+                .with_context(|| format!("reading local destination {}", path.display()))?;
+            if !metadata.is_file() {
+                anyhow::bail!("local destination changed at {}", path.display());
+            }
+            Some(
+                hash_file(path)
+                    .with_context(|| format!("hashing local destination {}", path.display()))?,
+            )
+        }
+    };
+    if current.as_deref() != expected {
+        anyhow::bail!(
+            "local destination changed while planning {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn remote_snapshot(hash: &RemoteHash) -> RemoteDestinationSnapshot {
+    RemoteDestinationSnapshot::File {
+        size: hash.size,
+        modified: hash.mtime,
+        sha256: hash.sha256.clone(),
+    }
+}
+
+fn capture_directory_snapshots(
+    local_root: &Path,
+    entries: &BTreeMap<String, inventory::InventoryEntry>,
+) -> Result<Vec<ExpectedDirectorySnapshots>> {
+    let canonical_root = local_root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing local_root {}", local_root.display()))?;
+    let mut snapshots = Vec::new();
+    for (relative, entry) in entries {
+        let is_directory = matches!(
+            (entry.local, entry.remote),
+            (Some(EntryKind::Directory), Some(EntryKind::Directory))
+                | (Some(EntryKind::Directory), None)
+                | (None, Some(EntryKind::Directory))
+        );
+        if !is_directory {
+            continue;
+        }
+        let local = if entry.local == Some(EntryKind::Directory) {
+            let path = local_root.join(relative);
+            let canonical_in_root = path
+                .canonicalize()
+                .with_context(|| format!("canonicalizing local directory {}", path.display()))?;
+            if !canonical_in_root.starts_with(&canonical_root) {
+                anyhow::bail!(
+                    "local directory {} resolves outside local_root {}",
+                    path.display(),
+                    local_root.display()
+                );
+            }
+            ExpectedLocalDirectory::Directory { canonical_in_root }
+        } else {
+            ExpectedLocalDirectory::Missing
+        };
+        let remote = if entry.remote == Some(EntryKind::Directory) {
+            RemoteDestinationSnapshot::Directory
+        } else {
+            RemoteDestinationSnapshot::Missing
+        };
+        snapshots.push(ExpectedDirectorySnapshots {
+            relative: relative.clone(),
+            local,
+            remote,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn validate_directory_snapshot<R: RemoteWrite>(
+    remote: &mut R,
+    local_root: &Path,
+    remote_root: &str,
+    expected: &ExpectedDirectorySnapshots,
+) -> Result<()> {
+    let local_path = local_root.join(&expected.relative);
+    match &expected.local {
+        ExpectedLocalDirectory::Missing => match std::fs::symlink_metadata(&local_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!(
+                "local directory destination appeared at {}",
+                local_path.display()
+            ),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading local directory {}", local_path.display()));
+            }
+        },
+        ExpectedLocalDirectory::Directory { canonical_in_root } => {
+            let metadata = std::fs::metadata(&local_path)
+                .with_context(|| format!("reading local directory {}", local_path.display()))?;
+            let canonical = local_path.canonicalize().with_context(|| {
+                format!("canonicalizing local directory {}", local_path.display())
+            })?;
+            if !metadata.is_dir() || canonical != *canonical_in_root {
+                anyhow::bail!("local directory changed at {}", local_path.display());
+            }
+        }
+    }
+
+    let remote_path = remote_join(remote_root, &expected.relative);
+    let current = remote.destination_snapshot(remote_root, &remote_path)?;
+    if current != expected.remote {
+        anyhow::bail!(
+            "remote directory changed during scoped sync at {:?}",
+            expected.relative
+        );
+    }
+    Ok(())
+}
+
+fn sort_outcome(outcome: &mut SyncOutcome) {
+    outcome
+        .events
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    outcome
+        .issues
+        .sort_by(|left, right| left.path().cmp(right.path()));
+}
+
+fn outcome_error(outcome: &SyncOutcome) -> Result<Option<anyhow::Error>> {
+    if let Some(SyncIssue::TypeConflict {
+        path,
+        local,
+        remote,
+    }) = outcome
+        .issues
+        .iter()
+        .find(|issue| matches!(issue, SyncIssue::TypeConflict { .. }))
+    {
+        return Ok(Some(anyhow::anyhow!(
+            "sync aborted: type conflict at {path} ({local:?} locally, {remote:?} remotely)"
+        )));
+    }
+    if outcome.cancelled {
+        return Ok(Some(anyhow::anyhow!(
+            "sync cancelled because the selected scope changed; retry"
+        )));
+    }
+    if outcome
+        .issues
+        .iter()
+        .any(|issue| matches!(issue, SyncIssue::FileConflict { .. }))
+    {
+        return Ok(Some(
+            crate::error::Exit::Conflict(
+                "sync aborted: one or more files diverged on both sides (use --force to take local)"
+                    .into(),
+            )
+            .into(),
+        ));
+    }
+    Ok(None)
+}
+
+fn resolve_scoped_cli_path(config_path: &Path, input: &str) -> Result<SyncScope> {
+    let cfg = Config::load(config_path)?;
+    let scope = scope::from_cli_path(&cfg.paths.local_root, Some(input))?;
+    if scope == SyncScope::LegacyProject {
+        anyhow::bail!("explicit sync path resolved to legacy project scope");
+    }
+    Ok(scope)
+}
+
+fn render_outcome(outcome: &SyncOutcome, mode: ExecutionMode) -> Result<()> {
+    for event in &outcome.events {
+        match event.kind {
+            SyncEventKind::Unchanged => {}
+            SyncEventKind::Uploaded => {
+                if mode.is_dry_run() {
+                    println!("would upload {}", event.path);
+                } else {
+                    println!("uploaded {}", event.path);
+                }
+            }
+            SyncEventKind::Downloaded => {
+                if mode.is_dry_run() {
+                    println!("would download {}", event.path);
+                } else {
+                    println!("downloaded {}", event.path);
+                }
+            }
+            SyncEventKind::CreatedLocalDirectory => {
+                if mode.is_dry_run() {
+                    println!("would create local directory {}", event.path);
+                } else {
+                    println!("created local directory {}", event.path);
+                }
+            }
+            SyncEventKind::CreatedRemoteDirectory => {
+                if mode.is_dry_run() {
+                    println!("would create remote directory {}", event.path);
+                } else {
+                    println!("created remote directory {}", event.path);
+                }
+            }
+            SyncEventKind::SkippedAbsent => {
+                eprintln!("skip (not on local or remote): {}", event.path);
+            }
+            SyncEventKind::ForcedRemoteOverwrite => {
+                if mode.is_dry_run() {
+                    eprintln!(
+                        "would overwrite remote with local (--force): {}",
+                        event.path
+                    );
+                } else {
+                    eprintln!("overwriting remote with local (--force): {}", event.path);
+                }
+            }
+        }
+    }
+
+    for issue in &outcome.issues {
+        match issue {
+            SyncIssue::FileConflict { path, state } => eprintln!(
+                "conflict ({state:?}, local and remote diverged): {path} — pass --force to take local"
+            ),
+            SyncIssue::TypeConflict {
+                path,
+                local,
+                remote,
+            } => eprintln!("type conflict: {path} is {local:?} locally and {remote:?} remotely"),
+        }
+    }
+
+    if let Some(error) = outcome_error(outcome)? {
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn run_cli(
@@ -63,7 +796,13 @@ pub fn run_cli(
     if path.is_none() && !select {
         return run_legacy(config_path, force, mode);
     }
-    anyhow::bail!("scoped sync is not implemented yet")
+    if select {
+        anyhow::bail!("interactive path selection is not implemented yet");
+    }
+    let input = path.expect("non-select scoped sync has a path");
+    let scope = resolve_scoped_cli_path(config_path, input)?;
+    let outcome = run_scoped(config_path, scope, force, mode, &UnconditionalCommitGate)?;
+    render_outcome(&outcome, mode)
 }
 
 fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
@@ -242,4 +981,445 @@ fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::commit::{CommitDecision, CommitGate};
+    use super::inventory::InventoryEntry;
+    use super::{
+        HashObservation, SyncEvent, SyncEventKind, SyncIssue, SyncOutcome, plan_structured_files,
+    };
+    use crate::state::FileState;
+    use anyhow::Result;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn observation(
+        path: &str,
+        local: Option<&str>,
+        remote: Option<&str>,
+        known: Option<&str>,
+    ) -> HashObservation {
+        HashObservation {
+            path: path.to_string(),
+            local: local.map(str::to_string),
+            remote: remote.map(str::to_string),
+            known: known.map(str::to_string),
+        }
+    }
+
+    struct DestinationSnapshotRemote {
+        snapshot: crate::commands::file_transfer::RemoteDestinationSnapshot,
+    }
+
+    impl crate::commands::file_transfer::RemoteWrite for DestinationSnapshotRemote {
+        fn upload_bytes(&mut self, _path: &str, _bytes: &[u8]) -> Result<()> {
+            unreachable!("snapshot capture does not upload")
+        }
+
+        fn rename(&mut self, _from: &str, _to: &str) -> Result<()> {
+            unreachable!("snapshot capture does not rename")
+        }
+
+        fn rm(&mut self, _path: &str) -> Result<()> {
+            unreachable!("snapshot capture does not remove")
+        }
+
+        fn mkdir(&mut self, _path: &str) -> Result<()> {
+            unreachable!("snapshot capture does not create directories")
+        }
+
+        fn mkdir_scoped_strict(&mut self, _path: &str) -> Result<()> {
+            unreachable!("snapshot capture does not create directories")
+        }
+
+        fn mtime(&mut self, _path: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+            unreachable!("snapshot capture does not query MDTM")
+        }
+
+        fn destination_snapshot(
+            &mut self,
+            _remote_root: &str,
+            _path: &str,
+        ) -> Result<crate::commands::file_transfer::RemoteDestinationSnapshot> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    #[test]
+    fn structured_upload_planning_captures_the_strict_destination_snapshot() {
+        let snapshot = crate::commands::file_transfer::RemoteDestinationSnapshot::File {
+            size: 7,
+            modified: chrono::Utc::now(),
+            sha256: "strict-list-hash".into(),
+        };
+        let mut remote = DestinationSnapshotRemote {
+            snapshot: snapshot.clone(),
+        };
+
+        let captured =
+            super::capture_remote_destination(&mut remote, "/remote", "/remote/file.c").unwrap();
+
+        assert_eq!(captured.snapshot, snapshot);
+    }
+
+    #[test]
+    fn structured_hash_combinations_keep_existing_action_semantics() {
+        let cases = [
+            (Some("a"), Some("a"), Some("a"), SyncEventKind::Unchanged),
+            (Some("b"), Some("a"), Some("a"), SyncEventKind::Uploaded),
+            (Some("a"), Some("b"), Some("a"), SyncEventKind::Downloaded),
+            (Some("a"), None, None, SyncEventKind::Uploaded),
+            (None, Some("a"), None, SyncEventKind::Downloaded),
+        ];
+
+        for (local, remote, known, expected) in cases {
+            let outcome =
+                plan_structured_files(vec![observation("file.c", local, remote, known)], false);
+            assert_eq!(
+                outcome.events,
+                vec![SyncEvent {
+                    path: "file.c".into(),
+                    kind: expected,
+                }]
+            );
+            assert!(outcome.issues.is_empty());
+        }
+    }
+
+    #[test]
+    fn structured_both_changed_and_untracked_are_conflicts_without_force() {
+        let outcome = plan_structured_files(
+            vec![
+                observation("both.c", Some("local"), Some("remote"), Some("known")),
+                observation("new.c", Some("same"), Some("same"), None),
+            ],
+            false,
+        );
+
+        assert!(outcome.events.is_empty());
+        assert_eq!(
+            outcome.issues,
+            vec![
+                SyncIssue::FileConflict {
+                    path: "both.c".into(),
+                    state: FileState::BothChanged,
+                },
+                SyncIssue::FileConflict {
+                    path: "new.c".into(),
+                    state: FileState::Untracked,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_force_uses_local_wins_for_both_conflict_states() {
+        let outcome = plan_structured_files(
+            vec![
+                observation("both.c", Some("local"), Some("remote"), Some("known")),
+                observation("new.c", Some("same"), Some("same"), None),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            outcome.events,
+            vec![
+                SyncEvent {
+                    path: "both.c".into(),
+                    kind: SyncEventKind::ForcedRemoteOverwrite,
+                },
+                SyncEvent {
+                    path: "new.c".into(),
+                    kind: SyncEventKind::ForcedRemoteOverwrite,
+                },
+            ]
+        );
+        assert!(outcome.issues.is_empty());
+    }
+
+    #[test]
+    fn structured_events_and_issues_are_ordered_by_relative_path() {
+        let outcome = plan_structured_files(
+            vec![
+                observation("z.c", Some("z"), None, None),
+                observation("a.c", None, Some("a"), None),
+                observation("m.c", Some("local"), Some("remote"), Some("known")),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            outcome
+                .events
+                .iter()
+                .map(|event| event.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.c", "z.c"]
+        );
+        assert_eq!(
+            outcome
+                .issues
+                .iter()
+                .map(SyncIssue::path)
+                .collect::<Vec<_>>(),
+            ["m.c"]
+        );
+    }
+
+    #[test]
+    fn structured_type_mismatch_and_state_only_absence_stay_distinct() {
+        let entries = BTreeMap::from([
+            (
+                "stale.c".to_string(),
+                InventoryEntry {
+                    local: None,
+                    remote: None,
+                    in_state: true,
+                },
+            ),
+            (
+                "type.c".to_string(),
+                InventoryEntry {
+                    local: Some(super::EntryKind::File),
+                    remote: Some(super::EntryKind::Directory),
+                    in_state: true,
+                },
+            ),
+        ]);
+
+        let (file_paths, outcome) = super::classify_inventory_shapes(entries);
+
+        assert!(file_paths.is_empty());
+        assert_eq!(
+            outcome.events,
+            vec![SyncEvent {
+                path: "stale.c".into(),
+                kind: SyncEventKind::SkippedAbsent,
+            }]
+        );
+        assert_eq!(
+            outcome.issues,
+            vec![SyncIssue::TypeConflict {
+                path: "type.c".into(),
+                local: super::EntryKind::File,
+                remote: super::EntryKind::Directory,
+            }]
+        );
+    }
+
+    struct TestGate {
+        current: AtomicBool,
+    }
+
+    impl TestGate {
+        fn current() -> Self {
+            Self {
+                current: AtomicBool::new(true),
+            }
+        }
+
+        fn cancelled() -> Self {
+            Self {
+                current: AtomicBool::new(false),
+            }
+        }
+
+        fn invalidate(&self) {
+            self.current.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl CommitGate for TestGate {
+        fn is_current(&self) -> bool {
+            self.current.load(Ordering::SeqCst)
+        }
+
+        fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+            if !self.is_current() {
+                return Ok(CommitDecision::Cancelled);
+            }
+            mutation()?;
+            Ok(CommitDecision::Committed)
+        }
+    }
+
+    fn action(path: &str) -> super::ScheduledAction {
+        super::ScheduledAction {
+            path: path.to_string(),
+            kind: SyncEventKind::Uploaded,
+        }
+    }
+
+    #[test]
+    fn structured_gate_invalid_before_first_transfer_does_not_stage() {
+        let gate = TestGate::cancelled();
+        let mut staged = Vec::new();
+
+        let outcome = super::execute_structured_plan(
+            vec![action("a.c")],
+            SyncOutcome::default(),
+            &gate,
+            |action| {
+                staged.push(action.path.clone());
+                Ok(CommitDecision::Committed)
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(outcome.cancelled);
+        assert!(outcome.events.is_empty());
+        assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn structured_gate_invalidation_between_entries_preserves_prior_commit() {
+        let gate = TestGate::current();
+        let mut staged = Vec::new();
+
+        let outcome = super::execute_structured_plan(
+            vec![action("a.c"), action("b.c")],
+            SyncOutcome::default(),
+            &gate,
+            |action| {
+                staged.push(action.path.clone());
+                if action.path == "a.c" {
+                    gate.invalidate();
+                }
+                Ok(CommitDecision::Committed)
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(outcome.cancelled);
+        assert_eq!(staged, ["a.c"]);
+        assert_eq!(
+            outcome.events,
+            vec![SyncEvent {
+                path: "a.c".into(),
+                kind: SyncEventKind::Uploaded,
+            }]
+        );
+    }
+
+    #[test]
+    fn structured_all_unchanged_invalidated_during_final_validation_is_cancelled() {
+        let gate = TestGate::current();
+        let mut validations = 0;
+
+        let outcome = super::execute_structured_plan(
+            Vec::new(),
+            SyncOutcome {
+                events: vec![SyncEvent {
+                    path: "same.c".into(),
+                    kind: SyncEventKind::Unchanged,
+                }],
+                ..SyncOutcome::default()
+            },
+            &gate,
+            |_| panic!("unchanged plan must not stage"),
+            || {
+                validations += 1;
+                gate.invalidate();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(validations, 1);
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.events[0].kind, SyncEventKind::Unchanged);
+    }
+
+    #[test]
+    fn structured_run_scoped_exposes_the_guarded_structured_api() {
+        let _: fn(
+            &std::path::Path,
+            super::scope::SyncScope,
+            bool,
+            crate::commands::ExecutionMode,
+            &dyn CommitGate,
+        ) -> Result<SyncOutcome> = super::run_scoped;
+    }
+
+    #[test]
+    fn structured_cli_file_conflicts_map_to_conflict_exit() {
+        let outcome = SyncOutcome {
+            issues: vec![SyncIssue::FileConflict {
+                path: "conflict.c".into(),
+                state: FileState::BothChanged,
+            }],
+            ..SyncOutcome::default()
+        };
+
+        let error = super::outcome_error(&outcome).unwrap().unwrap();
+        assert!(matches!(
+            error.downcast_ref::<crate::error::Exit>(),
+            Some(crate::error::Exit::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn structured_cli_type_conflicts_map_to_generic_errors() {
+        let outcome = SyncOutcome {
+            issues: vec![SyncIssue::TypeConflict {
+                path: "type.c".into(),
+                local: super::EntryKind::File,
+                remote: super::EntryKind::Directory,
+            }],
+            ..SyncOutcome::default()
+        };
+
+        let error = super::outcome_error(&outcome).unwrap().unwrap();
+        assert!(error.downcast_ref::<crate::error::Exit>().is_none());
+        assert!(format!("{error:#}").contains("type conflict"));
+    }
+
+    #[test]
+    fn structured_cli_explicit_paths_never_resolve_to_legacy_project() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(crate::names::CONFIG_FILE),
+            r#"
+[connection]
+host = "example.invalid"
+user = "u"
+password = "p"
+[paths]
+local_root = "."
+remote_root = "/remote"
+"#,
+        )
+        .unwrap();
+        let config = project.path().join(crate::names::CONFIG_FILE);
+
+        assert_eq!(
+            super::resolve_scoped_cli_path(&config, ".").unwrap(),
+            super::scope::SyncScope::RootDirectory
+        );
+        assert_eq!(
+            super::resolve_scoped_cli_path(&config, "file.c").unwrap(),
+            super::scope::SyncScope::Path("file.c".into())
+        );
+    }
+
+    #[test]
+    fn structured_download_planning_rejects_local_hash_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.c");
+        std::fs::write(&target, b"current").unwrap();
+        let current = crate::hash::hash_bytes(b"current");
+
+        super::verify_planned_local_hash(&target, Some(&current)).unwrap();
+        let error = super::verify_planned_local_hash(&target, Some("inventoried-old")).unwrap_err();
+        assert!(format!("{error:#}").contains("local destination changed"));
+
+        let missing = root.path().join("missing.c");
+        super::verify_planned_local_hash(&missing, None).unwrap();
+        assert!(super::verify_planned_local_hash(&missing, Some("expected-present")).is_err());
+    }
 }

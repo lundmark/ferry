@@ -1,8 +1,284 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
+}
+
+#[derive(Clone)]
+enum FakeFtpScenario {
+    Missing,
+    TypeConflict,
+    FileConflict(Vec<u8>),
+}
+
+impl FakeFtpScenario {
+    fn listing(&self, path: &str) -> String {
+        match (self, path) {
+            (Self::Missing, "/remote") => String::new(),
+            (Self::TypeConflict, "/remote") => {
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 type.c\r\n".into()
+            }
+            (Self::TypeConflict, "/remote/type.c") => String::new(),
+            (Self::FileConflict(bytes), "/remote") => format!(
+                "-rw-r--r-- 1 owner group {} Aug 10 12:00 conflict.c\r\n",
+                bytes.len()
+            ),
+            _ => String::new(),
+        }
+    }
+
+    fn file(&self, path: &str) -> Option<&[u8]> {
+        match (self, path) {
+            (Self::FileConflict(bytes), "/remote/conflict.c") => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+struct FakeFtpServer {
+    port: u16,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl FakeFtpServer {
+    fn spawn(scenario: FakeFtpScenario) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut control, _) = listener.accept().unwrap();
+            writeln!(control, "220 Ferry CLI test server\r").unwrap();
+            control.flush().unwrap();
+            let mut reader = BufReader::new(control.try_clone().unwrap());
+            let mut data_listener = None;
+
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let command = line.trim_end_matches(['\r', '\n']);
+                let verb = command
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                match verb.as_str() {
+                    "USER" => write_control(&mut control, "331 Password required"),
+                    "PASS" => write_control(&mut control, "230 Logged in"),
+                    "TYPE" | "OPTS" | "NOOP" => write_control(&mut control, "200 OK"),
+                    "SYST" => write_control(&mut control, "215 UNIX Type: L8"),
+                    "PWD" => write_control(&mut control, "257 \"/remote\""),
+                    "EPSV" => {
+                        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                        let port = listener.local_addr().unwrap().port();
+                        data_listener = Some(listener);
+                        write_control(
+                            &mut control,
+                            &format!("229 Entering Extended Passive Mode (|||{port}|)"),
+                        );
+                    }
+                    "PASV" => {
+                        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                        let port = listener.local_addr().unwrap().port();
+                        data_listener = Some(listener);
+                        write_control(
+                            &mut control,
+                            &format!(
+                                "227 Entering Passive Mode (127,0,0,1,{},{})",
+                                port / 256,
+                                port % 256
+                            ),
+                        );
+                    }
+                    "LIST" => {
+                        let path = command
+                            .split_once(' ')
+                            .map(|(_, path)| path)
+                            .unwrap_or("/remote");
+                        transfer_data(
+                            &mut control,
+                            data_listener.take().expect("LIST after passive command"),
+                            scenario.listing(path).as_bytes(),
+                        );
+                    }
+                    "MDTM" => {
+                        if scenario.file(command.split_once(' ').unwrap().1).is_some() {
+                            write_control(&mut control, "213 20260810120000");
+                        } else {
+                            write_control(&mut control, "550 Missing");
+                        }
+                    }
+                    "SIZE" => {
+                        if let Some(bytes) = scenario.file(command.split_once(' ').unwrap().1) {
+                            write_control(&mut control, &format!("213 {}", bytes.len()));
+                        } else {
+                            write_control(&mut control, "550 Missing");
+                        }
+                    }
+                    "RETR" => {
+                        let path = command.split_once(' ').unwrap().1;
+                        transfer_data(
+                            &mut control,
+                            data_listener.take().expect("RETR after passive command"),
+                            scenario.file(path).expect("known RETR path"),
+                        );
+                    }
+                    "QUIT" => {
+                        write_control(&mut control, "221 Goodbye");
+                        break;
+                    }
+                    _ => write_control(&mut control, "200 OK"),
+                }
+            }
+        });
+        Self {
+            port,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for FakeFtpServer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+fn write_control(stream: &mut TcpStream, line: &str) {
+    write!(stream, "{line}\r\n").unwrap();
+    stream.flush().unwrap();
+}
+
+fn transfer_data(control: &mut TcpStream, listener: TcpListener, bytes: &[u8]) {
+    write_control(control, "150 Opening data connection");
+    let (mut data, _) = listener.accept().unwrap();
+    data.write_all(bytes).unwrap();
+    data.flush().unwrap();
+    drop(data);
+    write_control(control, "226 Transfer complete");
+}
+
+fn scoped_config(project: &std::path::Path, port: u16) -> std::path::PathBuf {
+    let path = project.join(ferry::names::CONFIG_FILE);
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[connection]
+host = "127.0.0.1"
+port = {port}
+user = "u"
+password = "p"
+[paths]
+local_root = "."
+remote_root = "/remote"
+"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn sync_cli_accepts_bare_and_rejects_invalid_scope_combinations() {
+    let bare_help = bin().args(["sync", "--help"]).output().unwrap();
+    assert!(bare_help.status.success());
+
+    let multiple = bin().args(["sync", "one", "two"]).output().unwrap();
+    assert_eq!(multiple.status.code(), Some(2));
+
+    let path_and_select = bin().args(["sync", "one", "--select"]).output().unwrap();
+    assert_eq!(path_and_select.status.code(), Some(2));
+}
+
+#[test]
+fn scoped_sync_missing_path_is_exact_and_creates_no_state() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("unselected.c"), b"must stay local").unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", "missing.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("path not found locally or remotely"),
+        "stderr={stderr}"
+    );
+    assert!(project.path().join("unselected.c").is_file());
+    assert!(
+        !project.path().join(ferry::names::STATE_DIR).exists(),
+        "missing explicit path must not create state"
+    );
+}
+
+#[test]
+fn scoped_sync_type_conflict_exits_one() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::TypeConflict);
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("type.c"), b"local file").unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", "type.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("type conflict"), "stderr={stderr}");
+    assert_eq!(
+        std::fs::read(project.path().join("type.c")).unwrap(),
+        b"local file"
+    );
+}
+
+#[test]
+fn scoped_sync_file_conflict_exits_two() {
+    let remote_bytes = b"remote bytes".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::FileConflict(remote_bytes));
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("conflict.c"), b"local bytes").unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        "conflict.c".into(),
+        ferry::state::FileRecord {
+            sha256: ferry::hash::hash_bytes(b"known bytes"),
+            size: b"known bytes".len() as u64,
+            remote_mtime: "2026-08-09T12:00:00Z".parse().unwrap(),
+            last_synced: "2026-08-09T12:01:00Z".parse().unwrap(),
+        },
+    );
+    state
+        .save(
+            &project
+                .path()
+                .join(ferry::names::STATE_DIR)
+                .join("state.json"),
+        )
+        .unwrap();
+
+    let output = bin()
+        .args(["sync", "conflict.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflict"), "stderr={stderr}");
 }
 
 #[test]

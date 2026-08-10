@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 pub(crate) enum LocalLeafKind {
     RegularFile,
     SymlinkToFile,
@@ -17,7 +16,6 @@ pub(crate) enum LocalLeafKind {
     SymlinkToDirectory,
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 impl LocalLeafKind {
     pub(crate) fn is_file(self) -> bool {
         matches!(self, Self::RegularFile | Self::SymlinkToFile)
@@ -25,7 +23,6 @@ impl LocalLeafKind {
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 struct PresentLocalEntry {
     kind: LocalLeafKind,
     canonical: PathBuf,
@@ -36,7 +33,6 @@ struct PresentLocalEntry {
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 enum LocalEntrySnapshot {
     Missing,
     Present(PresentLocalEntry),
@@ -48,7 +44,6 @@ enum LocalEntrySnapshot {
 /// caller path, so a stable in-root symlinked ancestor cannot redirect a
 /// staged or committed write.
 #[derive(Debug)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 pub(crate) struct LocalPathExpectation {
     canonical_root: PathBuf,
     root_identity: Handle,
@@ -58,7 +53,6 @@ pub(crate) struct LocalPathExpectation {
     entry: LocalEntrySnapshot,
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 impl LocalPathExpectation {
     pub(crate) fn capture(local_root: &Path, path: &Path) -> Result<Self> {
         let canonical_root = local_root
@@ -230,7 +224,6 @@ impl LocalPathExpectation {
     }
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn capture_local_entry(canonical_root: &Path, path: &Path) -> Result<LocalEntrySnapshot> {
     let symlink_metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -275,7 +268,6 @@ fn capture_local_entry(canonical_root: &Path, path: &Path) -> Result<LocalEntryS
     }))
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn same_local_entry(expected: &LocalEntrySnapshot, current: &LocalEntrySnapshot) -> bool {
     match (expected, current) {
         (LocalEntrySnapshot::Missing, LocalEntrySnapshot::Missing) => true,
@@ -292,7 +284,6 @@ fn same_local_entry(expected: &LocalEntrySnapshot, current: &LocalEntrySnapshot)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 pub(crate) enum RemoteDestinationSnapshot {
     Missing,
     File {
@@ -303,12 +294,13 @@ pub(crate) enum RemoteDestinationSnapshot {
     Directory,
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 pub(crate) trait RemoteWrite {
     fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
     fn rename(&mut self, from: &str, to: &str) -> Result<()>;
     fn rm(&mut self, path: &str) -> Result<()>;
+    #[allow(dead_code, reason = "wired by scoped directory commits in Task 6")]
     fn mkdir(&mut self, path: &str) -> Result<()>;
+    #[allow(dead_code, reason = "wired by scoped directory commits in Task 6")]
     fn mkdir_scoped_strict(&mut self, path: &str) -> Result<()>;
     fn mtime(&mut self, path: &str) -> Result<DateTime<Utc>>;
     fn destination_snapshot(
@@ -318,7 +310,6 @@ pub(crate) trait RemoteWrite {
     ) -> Result<RemoteDestinationSnapshot>;
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 trait StrictDestinationRead {
     fn list_destination_strict(&mut self, directory: &str) -> Result<Vec<Entry>>;
     fn download_destination(&mut self, path: &str) -> Result<Vec<u8>>;
@@ -368,7 +359,6 @@ impl RemoteWrite for Ftp {
     }
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn snapshot_remote_destination<R: StrictDestinationRead + ?Sized>(
     remote: &mut R,
     remote_root: &str,
@@ -408,7 +398,6 @@ fn snapshot_remote_destination<R: StrictDestinationRead + ?Sized>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 enum StrictRemoteResolution {
     Missing,
     File { size: u64, modified: DateTime<Utc> },
@@ -418,7 +407,6 @@ enum StrictRemoteResolution {
 /// Resolve a destination from the configured remote root through complete,
 /// strict directory listings. Only absence of the final leaf from a
 /// successfully parsed parent listing is authoritative `Missing`.
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn resolve_remote_destination<R: StrictDestinationRead + ?Sized>(
     remote: &mut R,
     remote_root: &str,
@@ -474,7 +462,6 @@ fn resolve_remote_destination<R: StrictDestinationRead + ?Sized>(
     unreachable!("validated destination has at least one segment")
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn normalize_remote_root(root: &str) -> Result<String> {
     if root.is_empty() {
         anyhow::bail!("remote_root must not be empty");
@@ -487,7 +474,6 @@ fn normalize_remote_root(root: &str) -> Result<String> {
     })
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn relative_remote_destination<'a>(remote_root: &str, path: &'a str) -> Result<&'a str> {
     if path.chars().any(char::is_control) || path.contains('\\') || path.ends_with('/') {
         anyhow::bail!("unsafe remote destination");
@@ -509,7 +495,6 @@ fn relative_remote_destination<'a>(remote_root: &str, path: &'a str) -> Result<&
     Ok(relative)
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn strict_remote_child_name(directory: &str, entry: &Entry) -> Result<String> {
     let supplied = entry.name.as_str();
     if supplied.chars().any(char::is_control) {
@@ -533,7 +518,6 @@ fn strict_remote_child_name(directory: &str, entry: &Entry) -> Result<String> {
     Ok(name.to_string())
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5/6")]
 fn remote_path_join(directory: &str, name: &str) -> String {
     if directory == "/" {
         format!("/{name}")

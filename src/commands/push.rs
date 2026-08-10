@@ -358,13 +358,11 @@ pub fn upload_one(
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 pub(crate) struct ExpectedLocalSource {
     pub path: PathBuf,
     snapshot: LocalPathExpectation,
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 impl ExpectedLocalSource {
     pub(crate) fn capture(local_root: &Path, path: &Path) -> Result<Self> {
         let snapshot = LocalPathExpectation::capture(local_root, path)?;
@@ -391,7 +389,6 @@ impl ExpectedLocalSource {
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 pub(crate) struct ExpectedRemoteDestination {
     pub snapshot: RemoteDestinationSnapshot,
 }
@@ -570,7 +567,6 @@ fn cleanup_remote_snapshot<R: RemoteWrite>(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 pub(crate) fn upload_one_guarded<R: RemoteWrite>(
     remote: &mut R,
     state: &mut StateFile,
@@ -622,7 +618,6 @@ pub(crate) fn upload_one_guarded<R: RemoteWrite>(
     result
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 fn verify_remote_temp<R: RemoteWrite>(
     remote: &mut R,
     remote_root: &str,
@@ -650,7 +645,6 @@ fn verify_remote_temp<R: RemoteWrite>(
     Ok(())
 }
 
-#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 fn verify_remote_destination<R: RemoteWrite>(
     remote: &mut R,
     remote_root: &str,

@@ -9,7 +9,7 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EntryKind {
+pub enum EntryKind {
     File,
     Directory,
 }
