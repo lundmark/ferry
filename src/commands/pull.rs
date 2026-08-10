@@ -5,6 +5,9 @@
 //! way an accidentally-empty remote (or an interrupted upload by someone
 //! else) cannot wipe your working tree.
 
+// Task 4 exposes guarded primitives that the scoped engine wires in Task 5.
+#![allow(dead_code)]
+
 mod prepared;
 
 pub use prepared::{
@@ -12,12 +15,15 @@ pub use prepared::{
     fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one,
 };
 
+use crate::commands::file_transfer::LocalPathExpectation;
 use crate::commands::remote_hash;
+use crate::commands::remote_hash::RemoteHash;
+use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
-use crate::hash::hash_file;
+use crate::hash::{hash_bytes, hash_file};
 use crate::ignored::Matcher;
 use crate::state::{FileRecord, FileState, StateFile, classify};
 use anyhow::{Context, Result};
@@ -271,29 +277,97 @@ pub fn download_one(
     if mode.is_dry_run() {
         return Ok(());
     }
-    write_local_atomic(local_path, bytes)?;
     let remote_mtime = ftp
         .mtime(remote_path)
         .with_context(|| format!("fetching mtime for {remote_path}"))?;
-    record_download(state, rel, new_hash, bytes.len() as u64, remote_mtime);
+    let mut staged = Some(stage_local_write(local_path, bytes)?);
+    let mut mutation = || {
+        staged
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("download commit mutation invoked more than once"))?
+            .commit()?;
+        record_download(state, rel, new_hash, bytes.len() as u64, remote_mtime);
+        Ok(())
+    };
+    UnconditionalCommitGate.commit(&mut mutation)?;
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpectedLocalDestination {
+    snapshot: LocalPathExpectation,
+}
+
+impl ExpectedLocalDestination {
+    pub(crate) fn capture(local_root: &Path, local_path: &Path) -> Result<Self> {
+        Ok(Self {
+            snapshot: LocalPathExpectation::capture(local_root, local_path)?,
+        })
+    }
+
+    fn verify_unchanged(&self, local_path: &Path) -> Result<()> {
+        self.snapshot
+            .verify_supplied_path(local_path)
+            .with_context(|| format!("local destination changed for {}", local_path.display()))?;
+        self.snapshot
+            .verify_unchanged()
+            .with_context(|| format!("local destination changed for {}", local_path.display()))?;
+        if !self.snapshot.is_file_or_missing() {
+            anyhow::bail!(
+                "local destination changed for {}: not a file",
+                local_path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn download_one_guarded(
+    state: &mut StateFile,
+    local_path: &Path,
+    rel: &str,
+    remote: &RemoteHash,
+    expected: &ExpectedLocalDestination,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<CommitDecision> {
+    if mode.is_dry_run() {
+        return Ok(CommitDecision::Committed);
+    }
+    let bytes = remote
+        .bytes
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("remote payload missing for guarded download {rel}"))?;
+    if bytes.len() as u64 != remote.size || hash_bytes(bytes) != remote.sha256 {
+        anyhow::bail!("remote payload changed before guarded download {rel}");
+    }
+
+    expected.verify_unchanged(local_path)?;
+    let mut staged = Some(stage_local_write_scoped(expected, bytes)?);
+    let mut mutation = || {
+        expected.verify_unchanged(local_path)?;
+        staged
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("download commit mutation invoked more than once"))?
+            .commit()?;
+        record_download(state, rel, &remote.sha256, remote.size, remote.mtime);
+        Ok(())
+    };
+    gate.commit(&mut mutation)
 }
 
 /// Write `bytes` to `path` via a sibling `.tmp.zedftp` file and `rename` so
 /// readers never observe a half-written file. The temp file is removed on
 /// any failure before the rename.
-fn write_local_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    stage_local_write(path, bytes)?.commit()
-}
-
-struct StagedLocalWrite {
+pub(crate) struct StagedLocalWrite {
     tmp: PathBuf,
     target: PathBuf,
     created_dirs: Vec<PathBuf>,
     committed: bool,
 }
 
-fn stage_local_write(path: &Path, bytes: &[u8]) -> Result<StagedLocalWrite> {
+pub(crate) fn stage_local_write(path: &Path, bytes: &[u8]) -> Result<StagedLocalWrite> {
     let created_dirs = create_missing_parent_dirs(path)?;
     let tmp = tmp_path(path);
     let mut file = match std::fs::OpenOptions::new()
@@ -324,6 +398,43 @@ fn stage_local_write(path: &Path, bytes: &[u8]) -> Result<StagedLocalWrite> {
     drop(file);
     write_result?;
 
+    Ok(staged)
+}
+
+fn stage_local_write_scoped(
+    expected: &ExpectedLocalDestination,
+    bytes: &[u8],
+) -> Result<StagedLocalWrite> {
+    expected.snapshot.verify_anchor()?;
+    let target = expected.snapshot.resolved_path();
+    let tmp = tmp_path(&target);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("creating temp file {}", tmp.display()))?;
+    let staged = StagedLocalWrite {
+        tmp,
+        target,
+        created_dirs: Vec::new(),
+        committed: false,
+    };
+
+    if let Err(error) = expected.snapshot.verify_anchor() {
+        drop(file);
+        drop(staged);
+        return Err(error).context("local target parent changed after staging");
+    }
+
+    let write_result = (|| -> Result<()> {
+        file.write_all(bytes)
+            .with_context(|| format!("writing temp file {}", staged.tmp.display()))?;
+        file.flush()
+            .with_context(|| format!("flushing temp file {}", staged.tmp.display()))?;
+        Ok(())
+    })();
+    drop(file);
+    write_result?;
     Ok(staged)
 }
 
@@ -412,7 +523,316 @@ fn record_download(
 
 #[cfg(test)]
 mod staging_tests {
-    use super::{stage_local_write, tmp_path};
+    use super::{ExpectedLocalDestination, download_one_guarded, stage_local_write, tmp_path};
+    use crate::commands::ExecutionMode;
+    use crate::commands::remote_hash::RemoteHash;
+    use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
+    use crate::hash::hash_bytes;
+    use crate::state::{FileRecord, StateFile};
+    use anyhow::Result;
+    use chrono::{TimeZone, Utc};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn remote(bytes: &[u8]) -> RemoteHash {
+        RemoteHash {
+            sha256: hash_bytes(bytes),
+            size: bytes.len() as u64,
+            mtime: Utc.with_ymd_and_hms(2026, 8, 10, 9, 0, 0).unwrap(),
+            from_cache: false,
+            bytes: Some(bytes.to_vec()),
+            pre_download: None,
+        }
+    }
+
+    fn old_record() -> FileRecord {
+        FileRecord {
+            sha256: hash_bytes(b"old state"),
+            size: b"old state".len() as u64,
+            remote_mtime: Utc.with_ymd_and_hms(2026, 8, 9, 9, 0, 0).unwrap(),
+            last_synced: Utc.with_ymd_and_hms(2026, 8, 9, 9, 1, 0).unwrap(),
+        }
+    }
+
+    struct CancelAfterStaging {
+        tmp: PathBuf,
+        saw_temp: AtomicBool,
+    }
+
+    impl CommitGate for CancelAfterStaging {
+        fn is_current(&self) -> bool {
+            true
+        }
+
+        fn commit(&self, _mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+            self.saw_temp.store(self.tmp.is_file(), Ordering::SeqCst);
+            Ok(CommitDecision::Cancelled)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum HookOrder {
+        Before,
+        After,
+    }
+
+    struct HookGate {
+        order: HookOrder,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl HookGate {
+        fn before(hook: impl FnOnce() + Send + 'static) -> Self {
+            Self {
+                order: HookOrder::Before,
+                hook: Mutex::new(Some(Box::new(hook))),
+            }
+        }
+
+        fn after(hook: impl FnOnce() + Send + 'static) -> Self {
+            Self {
+                order: HookOrder::After,
+                hook: Mutex::new(Some(Box::new(hook))),
+            }
+        }
+
+        fn run_hook(&self) {
+            self.hook.lock().unwrap().take().unwrap()();
+        }
+    }
+
+    impl CommitGate for HookGate {
+        fn is_current(&self) -> bool {
+            true
+        }
+
+        fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+            if matches!(self.order, HookOrder::Before) {
+                self.run_hook();
+            }
+            mutation()?;
+            if matches!(self.order, HookOrder::After) {
+                self.run_hook();
+            }
+            Ok(CommitDecision::Committed)
+        }
+    }
+
+    struct PanicGate;
+
+    impl CommitGate for PanicGate {
+        fn is_current(&self) -> bool {
+            panic!("dry run must not inspect the gate")
+        }
+
+        fn commit(&self, _mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+            panic!("dry run must not claim the gate")
+        }
+    }
+
+    #[test]
+    fn guarded_download_dry_run_commits_without_staging_or_state_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        std::fs::write(&target, b"local").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let mut state = StateFile::default();
+
+        let decision = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &remote(b"remote"),
+            &expected,
+            ExecutionMode::DryRun,
+            &PanicGate,
+        )
+        .unwrap();
+
+        assert_eq!(decision, CommitDecision::Committed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"local");
+        assert!(!tmp_path(&target).exists());
+        assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn guarded_download_cancellation_after_staging_preserves_destination_and_state() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        let tmp = tmp_path(&target);
+        std::fs::write(&target, b"original local").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let mut state = StateFile::default();
+        let original_record = old_record();
+        state
+            .files
+            .insert("page.txt".into(), original_record.clone());
+        let gate = CancelAfterStaging {
+            tmp: tmp.clone(),
+            saw_temp: AtomicBool::new(false),
+        };
+
+        let decision = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &remote(b"new remote"),
+            &expected,
+            ExecutionMode::Apply,
+            &gate,
+        )
+        .unwrap();
+
+        assert_eq!(decision, CommitDecision::Cancelled);
+        assert!(gate.saw_temp.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original local");
+        assert_eq!(state.files.get("page.txt"), Some(&original_record));
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn guarded_download_fails_when_the_parent_disappears_without_recreating_it() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("nested");
+        let target = parent.join("page.txt");
+        std::fs::create_dir(&parent).unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        let mut state = StateFile::default();
+
+        let error = download_one_guarded(
+            &mut state,
+            &target,
+            "nested/page.txt",
+            &remote(b"new remote"),
+            &expected,
+            ExecutionMode::Apply,
+            &UnconditionalCommitGate,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("parent"));
+        assert!(!parent.exists());
+        assert!(!tmp_path(&target).exists());
+        assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn guarded_download_rejects_destination_identity_change_inside_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        std::fs::write(&target, b"same bytes").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let changed = target.clone();
+        let gate = HookGate::before(move || {
+            std::fs::remove_file(&changed).unwrap();
+            std::fs::write(&changed, b"same bytes").unwrap();
+        });
+        let mut state = StateFile::default();
+
+        let error = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &remote(b"new remote"),
+            &expected,
+            ExecutionMode::Apply,
+            &gate,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("destination changed"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"same bytes");
+        assert!(state.files.is_empty());
+        assert!(!tmp_path(&target).exists());
+    }
+
+    #[test]
+    fn guarded_download_rejects_destination_type_change_inside_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        std::fs::write(&target, b"local").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let changed = target.clone();
+        let gate = HookGate::before(move || {
+            std::fs::remove_file(&changed).unwrap();
+            std::fs::create_dir(&changed).unwrap();
+        });
+        let mut state = StateFile::default();
+
+        let error = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &remote(b"new remote"),
+            &expected,
+            ExecutionMode::Apply,
+            &gate,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("destination changed"));
+        assert!(target.is_dir());
+        assert!(state.files.is_empty());
+        assert!(!tmp_path(&target).exists());
+    }
+
+    #[test]
+    fn guarded_download_rename_failure_cleans_temp_without_updating_state() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        let tmp = tmp_path(&target);
+        std::fs::write(&target, b"local").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let removed_tmp = tmp.clone();
+        let gate = HookGate::before(move || std::fs::remove_file(removed_tmp).unwrap());
+        let mut state = StateFile::default();
+
+        let error = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &remote(b"new remote"),
+            &expected,
+            ExecutionMode::Apply,
+            &gate,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("renaming"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"local");
+        assert!(state.files.is_empty());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn guarded_download_claim_can_commit_before_late_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        std::fs::write(&target, b"local").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let invalidated = target.clone();
+        let gate = HookGate::after(move || std::fs::write(invalidated, b"late edit").unwrap());
+        let mut state = StateFile::default();
+        let expected_remote = remote(b"new remote");
+
+        let decision = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &expected_remote,
+            &expected,
+            ExecutionMode::Apply,
+            &gate,
+        )
+        .unwrap();
+
+        assert_eq!(decision, CommitDecision::Committed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"late edit");
+        assert_eq!(state.files["page.txt"].sha256, expected_remote.sha256);
+        assert!(!tmp_path(&target).exists());
+    }
 
     #[test]
     fn staging_preserves_a_preexisting_temp_file() {

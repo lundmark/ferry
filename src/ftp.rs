@@ -116,6 +116,14 @@ fn strict_list_transport_error(dir: &str, _error: suppaftp::FtpError) -> anyhow:
     )
 }
 
+#[allow(dead_code)]
+fn strict_mkdir_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp mkdir {}: remote create failed",
+        sanitize_for_message(path)
+    )
+}
+
 fn parse_listing_tolerant(lines: &[String]) -> Vec<Entry> {
     lines
         .iter()
@@ -244,6 +252,17 @@ impl Ftp {
         Ok(())
     }
 
+    /// Issue exactly one `MKD` command and propagate every server failure.
+    ///
+    /// Scoped commits must not use [`Self::mkdir`]'s tolerant LIST fallback:
+    /// a generic 550 is never evidence that a directory already exists.
+    #[allow(dead_code)]
+    pub(crate) fn mkdir_scoped_strict(&mut self, path: &str) -> Result<()> {
+        self.inner
+            .mkdir(path)
+            .map_err(|error| strict_mkdir_transport_error(path, error))
+    }
+
     /// Create a remote directory. Returns Ok if the directory was created OR
     /// already exists. Other errors are propagated.
     ///
@@ -280,7 +299,7 @@ impl Ftp {
 mod tests {
     use super::{
         ExactFilePresence, exact_nlst_presence, parse_listing_strict, parse_listing_tolerant,
-        strict_list_transport_error,
+        strict_list_transport_error, strict_mkdir_transport_error,
     };
 
     const VALID_POSIX_FILE: &str = "-rw-r--r-- 1 owner group 42 Jan 1 2000 file.txt";
@@ -302,6 +321,25 @@ mod tests {
         assert!(!message.contains('\u{1b}'));
         assert!(!message.contains("attacker-reply"));
         assert!(message.contains("remote listing failed"));
+    }
+
+    #[test]
+    fn strict_mkdir_transport_error_omits_server_response_and_escapes_path() {
+        const ATTACKER_REPLY: &str = "\u{1b}[31mattacker-reply";
+        let transport_error =
+            suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+                suppaftp::Status::FileUnavailable,
+                ATTACKER_REPLY.as_bytes().to_vec(),
+            ));
+
+        let error = strict_mkdir_transport_error("/root/unsafe\nname", transport_error);
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ftp mkdir /root/unsafe\\nname"));
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("attacker-reply"));
+        assert!(message.contains("remote create failed"));
     }
 
     #[test]

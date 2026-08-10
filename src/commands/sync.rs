@@ -17,6 +17,7 @@
 //! user says "just sync it already," last-write-wins from the local side
 //! since that's the side the user is actively editing.
 
+use crate::commands::file_transfer::RemoteDestinationSnapshot;
 use crate::commands::pull::download_one;
 use crate::commands::push::upload_one;
 use crate::commands::remote_hash;
@@ -29,12 +30,28 @@ use crate::ignored::Matcher;
 use crate::state::{FileState, StateFile, classify};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // The scoped sync engine wires this collector in Task 5.
+pub(crate) mod commit;
 #[allow(dead_code)]
 mod inventory;
 pub mod scope;
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExpectedLocalDirectory {
+    Missing,
+    Directory { canonical_in_root: PathBuf },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExpectedDirectorySnapshots {
+    pub relative: String,
+    pub local: ExpectedLocalDirectory,
+    pub remote: RemoteDestinationSnapshot,
+}
 
 pub fn run_cli(
     config_path: &Path,
