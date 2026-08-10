@@ -448,7 +448,7 @@ fn collect_remote_children<R: StrictRemote + ?Sized>(
     Ok(())
 }
 
-fn list_remote_children<R: StrictRemote + ?Sized>(
+pub(super) fn list_remote_children<R: StrictRemote + ?Sized>(
     remote: &mut R,
     local_root: &Path,
     remote_root: &str,
@@ -484,9 +484,9 @@ fn list_remote_children<R: StrictRemote + ?Sized>(
     Ok(children)
 }
 
-struct RemoteChild {
-    name: String,
-    is_dir: bool,
+pub(super) struct RemoteChild {
+    pub(super) name: String,
+    pub(super) is_dir: bool,
 }
 
 fn remote_child_name(remote_root: &str, directory: &str, entry: &Entry) -> Result<String> {
@@ -528,7 +528,7 @@ fn record_remote(entries: &mut BTreeMap<String, InventoryEntry>, relative: &str,
     });
 }
 
-fn validate_relative_path(relative: &str) -> Result<()> {
+pub(super) fn validate_relative_path(relative: &str) -> Result<()> {
     if relative.is_empty()
         || relative.starts_with('/')
         || relative
@@ -575,7 +575,7 @@ fn validate_state_path_key(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn normalize_remote_root(root: &str) -> Result<String> {
+pub(super) fn normalize_remote_root(root: &str) -> Result<String> {
     if root.is_empty() {
         bail!("remote_root must not be empty");
     }
@@ -587,7 +587,7 @@ fn normalize_remote_root(root: &str) -> Result<String> {
     })
 }
 
-fn remote_join(directory: &str, name: &str) -> String {
+pub(super) fn remote_join(directory: &str, name: &str) -> String {
     if directory == "/" {
         format!("/{name}")
     } else {
@@ -611,7 +611,7 @@ fn join_relative(parent: &str, name: &str) -> String {
     }
 }
 
-fn is_state_path(relative: &str) -> bool {
+pub(super) fn is_state_path(relative: &str) -> bool {
     relative == crate::names::STATE_DIR
         || relative
             .strip_prefix(crate::names::STATE_DIR)

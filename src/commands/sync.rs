@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 // The scoped sync engine wires this collector in Task 5.
 pub(crate) mod commit;
 mod inventory;
+mod picker;
 #[cfg(test)]
 mod production_tests;
 pub use inventory::EntryKind;
@@ -1516,6 +1517,64 @@ fn render_outcome(outcome: &SyncOutcome, mode: ExecutionMode) -> Result<()> {
     Ok(())
 }
 
+fn require_interactive_terminal(stdin_is_terminal: bool, stdout_is_terminal: bool) -> Result<()> {
+    if !stdin_is_terminal || !stdout_is_terminal {
+        anyhow::bail!("ferry sync --select requires an interactive terminal; pass PATH directly");
+    }
+    Ok(())
+}
+
+pub fn require_select_terminal() -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    require_interactive_terminal(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+fn select_from_terminal(config: &Config) -> Result<Option<SyncScope>> {
+    let matcher = Matcher::new(&config.sync.ignore, &config.paths.local_root)?;
+    let mut ftp = Ftp::connect(
+        &config.connection.host,
+        config.connection.port,
+        &config.connection.user,
+        &config.connection.password,
+        config.connection.passive,
+    )?;
+    let mut remote = ScopedFtp { inner: &mut ftp };
+    let mut source = picker::ProjectPickerSource::new(
+        &mut remote,
+        &config.paths.local_root,
+        &config.paths.remote_root,
+        &matcher,
+    )?;
+    let mut io = picker::StdioPickerIo;
+    picker::select(&mut source, &mut io)
+}
+
+fn run_selected_with<Select, Run>(
+    config_path: &Path,
+    force: bool,
+    mode: ExecutionMode,
+    select_scope: Select,
+    run_scope: Run,
+) -> Result<()>
+where
+    Select: FnOnce(&Config) -> Result<Option<SyncScope>>,
+    Run: FnOnce(&Path, SyncScope, bool, ExecutionMode) -> Result<SyncOutcome>,
+{
+    let config = Config::load(config_path)?;
+    let Some(scope) = select_scope(&config)? else {
+        return Ok(());
+    };
+    if scope == SyncScope::LegacyProject {
+        anyhow::bail!("interactive selection cannot use legacy project scope");
+    }
+    let outcome = run_scope(config_path, scope, force, mode)?;
+    render_outcome(&outcome, mode)
+}
+
 pub fn run_cli(
     config_path: &Path,
     path: Option<&str>,
@@ -1527,7 +1586,16 @@ pub fn run_cli(
         return run_legacy(config_path, force, mode);
     }
     if select {
-        anyhow::bail!("interactive path selection is not implemented yet");
+        require_select_terminal()?;
+        return run_selected_with(
+            config_path,
+            force,
+            mode,
+            select_from_terminal,
+            |config_path, scope, force, mode| {
+                run_scoped(config_path, scope, force, mode, &UnconditionalCommitGate)
+            },
+        );
     }
     let input = path.expect("non-select scoped sync has a path");
     let scope = resolve_scoped_cli_path(config_path, input)?;
@@ -1806,5 +1874,122 @@ remote_root = "/remote"
         let missing = root.path().join("missing.c");
         super::verify_planned_local_hash(&missing, None).unwrap();
         assert!(super::verify_planned_local_hash(&missing, Some("expected-present")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod picker_cli_tests {
+    use super::scope::SyncScope;
+    use crate::commands::ExecutionMode;
+    use std::cell::Cell;
+
+    fn config(project: &std::path::Path) -> std::path::PathBuf {
+        let mirror = project.join("mirror");
+        std::fs::create_dir(&mirror).unwrap();
+        let path = project.join(crate::names::CONFIG_FILE);
+        std::fs::write(
+            &path,
+            r#"
+[connection]
+host = "example.invalid"
+user = "u"
+password = "p"
+[paths]
+local_root = "mirror"
+remote_root = "/chosen-root"
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn selected_cli_passes_one_scope_force_and_dry_run_to_structured_sync() {
+        let project = tempfile::tempdir().unwrap();
+        let config_path = config(project.path());
+        let calls = Cell::new(0);
+
+        super::run_selected_with(
+            &config_path,
+            true,
+            ExecutionMode::DryRun,
+            |loaded| {
+                assert_eq!(loaded.paths.local_root, project.path().join("mirror"));
+                assert_eq!(loaded.paths.remote_root, "/chosen-root");
+                Ok(Some(SyncScope::Path("areas/smoke.c".into())))
+            },
+            |path, scope, force, mode| {
+                calls.set(calls.get() + 1);
+                assert_eq!(path, config_path);
+                assert_eq!(scope, SyncScope::Path("areas/smoke.c".into()));
+                assert!(force);
+                assert_eq!(mode, ExecutionMode::DryRun);
+                Ok(super::SyncOutcome::default())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn selected_cli_cancellation_is_success_and_never_falls_back_to_legacy() {
+        let project = tempfile::tempdir().unwrap();
+        let config_path = config(project.path());
+        let calls = Cell::new(0);
+
+        super::run_selected_with(
+            &config_path,
+            false,
+            ExecutionMode::Apply,
+            |_| Ok(None),
+            |_, _, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(super::SyncOutcome::default())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 0);
+        assert!(
+            !project.path().join(crate::names::STATE_DIR).exists(),
+            "cancelled selection must not create state"
+        );
+    }
+
+    #[test]
+    fn selected_cli_rejects_legacy_project_without_running_sync() {
+        let project = tempfile::tempdir().unwrap();
+        let config_path = config(project.path());
+        let calls = Cell::new(0);
+
+        let error = super::run_selected_with(
+            &config_path,
+            false,
+            ExecutionMode::Apply,
+            |_| Ok(Some(SyncScope::LegacyProject)),
+            |_, _, _, _| {
+                calls.set(calls.get() + 1);
+                Ok(super::SyncOutcome::default())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(calls.get(), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use legacy project scope")
+        );
+    }
+    #[test]
+    fn interactive_terminal_error_text_is_exact() {
+        let error = super::require_interactive_terminal(false, true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ferry sync --select requires an interactive terminal; pass PATH directly"
+        );
+        assert!(super::require_interactive_terminal(true, false).is_err());
+        assert!(super::require_interactive_terminal(true, true).is_ok());
     }
 }
