@@ -101,4 +101,5 @@ pub mod remote_hash;
 pub mod rm;
 pub mod status;
 pub mod sync;
+pub(crate) mod transfer_temp;
 pub mod walk;

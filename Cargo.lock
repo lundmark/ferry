@@ -540,6 +540,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
+ "getrandom 0.4.2",
  "ignore",
  "lsp-server",
  "lsp-types",

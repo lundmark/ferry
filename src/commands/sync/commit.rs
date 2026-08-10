@@ -14,6 +14,10 @@ pub trait CommitGate: Send + Sync {
     /// Atomically order `mutation` against invalidation.
     ///
     /// Implementations must invoke `mutation` at most once.
+    /// Returning [`CommitDecision::Cancelled`] means `mutation` was not invoked.
+    /// Returning [`CommitDecision::Committed`] means `mutation` completed
+    /// successfully. If `mutation` returns an error, implementations must return
+    /// that error rather than report a committed decision.
     fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision>;
 }
 

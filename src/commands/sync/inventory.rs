@@ -1,4 +1,5 @@
 use super::scope::SyncScope;
+use crate::commands::transfer_temp::is_reserved_transfer_temp;
 use crate::ftp::{Entry, StrictRemote};
 use crate::ignored::Matcher;
 use crate::state::StateFile;
@@ -64,7 +65,7 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
             continue;
         }
         validate_state_path_key(path)?;
-        if is_state_path(path) {
+        if is_state_path(path) || is_reserved_transfer_temp(path) {
             continue;
         }
         entries.entry(path.clone()).or_default().in_state = true;
@@ -216,7 +217,7 @@ fn collect_local_node(
     entries: &mut BTreeMap<String, InventoryEntry>,
     ancestors: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    if is_state_path(relative) {
+    if is_state_path(relative) || is_reserved_transfer_temp(relative) {
         return Ok(());
     }
 
@@ -408,7 +409,7 @@ fn list_remote_children<R: StrictRemote + ?Sized>(
             bail!("duplicate remote entry {name:?} in {directory:?}");
         }
         let relative = join_relative(relative_directory, &name);
-        if is_state_path(&relative) {
+        if is_state_path(&relative) || is_reserved_transfer_temp(&relative) {
             continue;
         }
         if matcher.is_ignored(&local_root.join(&relative), entry.is_dir) {
@@ -865,6 +866,68 @@ mod tests {
         .unwrap();
 
         assert!(actual.entries.is_empty());
+    }
+
+    #[test]
+    fn root_scope_excludes_exact_local_transfer_temps_but_keeps_near_misses() {
+        let root = tempfile::tempdir().unwrap();
+        let exact = ".page.txt.ferry-tmp.0123456789abcdef0123456789abcdef";
+        let near_misses = [
+            ".page.txt.ferry-tmp.0123456789abcdef0123456789abcde",
+            ".page.txt.ferry-tmp.0123456789abcdef0123456789abcdeF",
+            "page.txt.ferry-tmp.0123456789abcdef0123456789abcdef",
+        ];
+        std::fs::write(root.path().join(exact), "stale temp").unwrap();
+        for name in near_misses {
+            std::fs::write(root.path().join(name), "user file").unwrap();
+        }
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let actual = inventory(
+            &mut remote,
+            root.path(),
+            &state_with(&[exact]),
+            SyncScope::RootDirectory,
+        )
+        .unwrap();
+
+        assert!(!actual.entries.contains_key(exact));
+        for name in near_misses {
+            assert_eq!(
+                actual.entries.get(name),
+                Some(&presence(Some(EntryKind::File), None, false))
+            );
+        }
+    }
+
+    #[test]
+    fn root_scope_excludes_exact_remote_transfer_temps_but_keeps_near_misses() {
+        let root = tempfile::tempdir().unwrap();
+        let exact = ".page.txt.ferry-tmp.0123456789abcdef0123456789abcdef";
+        let near_misses = [
+            ".page.txt.ferry-tmp.0123456789abcdef0123456789abcdef0",
+            "..ferry-tmp.0123456789abcdef0123456789abcdef",
+            ".page.txt.ferry-tmp.0123456789abcdef0123456789ABCDEf",
+        ];
+        let mut entries = vec![file(exact)];
+        entries.extend(near_misses.into_iter().map(file));
+        let mut remote = FakeRemote::default().directory("/remote", entries);
+
+        let actual = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::RootDirectory,
+        )
+        .unwrap();
+
+        assert!(!actual.entries.contains_key(exact));
+        for name in near_misses {
+            assert_eq!(
+                actual.entries.get(name),
+                Some(&presence(None, Some(EntryKind::File), false))
+            );
+        }
     }
 
     #[test]
