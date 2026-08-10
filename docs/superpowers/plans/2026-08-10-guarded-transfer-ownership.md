@@ -41,6 +41,8 @@ public methods remain unchanged.
    Retry occupied candidates through the same deterministic test seam.
 3. Re-snapshot inside the claim immediately before rename; clean only an exact
    owned snapshot.
+   Before ownership is established, clean upload/capture failures only after a
+   fresh strict snapshot proves the intended regular-file size and hash.
 4. Compute upload `last_synced` after successful rename immediately before
    state insertion.
 5. Run focused push and file-transfer tests.

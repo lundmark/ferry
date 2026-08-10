@@ -46,6 +46,13 @@ modification time, and content hash. Inside the claim, it strictly re-snapshots
 the temp and requires exact equality immediately before rename. Cleanup first
 requires the same exact snapshot, so a replaced temp is left untouched.
 
+Before that exact owned snapshot has been established, a failed upload or
+snapshot capture may trigger one fresh strict snapshot. Ferry removes the temp
+only when that snapshot proves a regular file with the intended size and hash;
+the server-provided modification time is captured only after that match. A
+successful first snapshot that has the wrong type or payload is not owned and
+is never removed.
+
 Destination and source checks stay in the claim. Successful rename is followed
 immediately by state insertion; upload computes `last_synced` at that point.
 `CommitDecision::Cancelled` means the mutation closure was not invoked, while

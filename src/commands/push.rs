@@ -406,6 +406,25 @@ pub(crate) struct StagedRemoteWrite {
     temp_snapshot: RemoteDestinationSnapshot,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IntendedRemoteTempPayload<'a> {
+    size: u64,
+    sha256: &'a str,
+}
+
+impl IntendedRemoteTempPayload<'_> {
+    fn matching_modified(self, snapshot: &RemoteDestinationSnapshot) -> Option<DateTime<Utc>> {
+        match snapshot {
+            RemoteDestinationSnapshot::File {
+                size,
+                modified,
+                sha256,
+            } if *size == self.size && sha256 == self.sha256 => Some(*modified),
+            _ => None,
+        }
+    }
+}
+
 const MAX_REMOTE_TEMP_CANDIDATES: usize = 32;
 
 fn stage_remote_write<R: RemoteWrite>(
@@ -477,6 +496,10 @@ fn stage_remote_write_guarded_with_candidates<R: RemoteWrite>(
     hash: &str,
     mut candidate: impl FnMut() -> Result<String>,
 ) -> Result<StagedRemoteWrite> {
+    let intended = IntendedRemoteTempPayload {
+        size: bytes.len() as u64,
+        sha256: hash,
+    };
     for _ in 0..MAX_REMOTE_TEMP_CANDIDATES {
         let temp_path = candidate()?;
         if remote.destination_snapshot(remote_root, &temp_path)?
@@ -485,26 +508,18 @@ fn stage_remote_write_guarded_with_candidates<R: RemoteWrite>(
             continue;
         }
         if let Err(error) = remote.upload_bytes(&temp_path, bytes) {
-            let _ = remote.rm(&temp_path);
+            cleanup_intended_remote_temp(remote, remote_root, &temp_path, intended);
             return Err(error).with_context(|| format!("uploading temp {temp_path}"));
         }
         let temp_snapshot = match remote.destination_snapshot(remote_root, &temp_path) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let _ = remote.rm(&temp_path);
+                cleanup_intended_remote_temp(remote, remote_root, &temp_path, intended);
                 return Err(error).with_context(|| format!("capturing remote temp {temp_path:?}"));
             }
         };
-        let modified = match &temp_snapshot {
-            RemoteDestinationSnapshot::File {
-                size,
-                modified,
-                sha256,
-            } if *size == bytes.len() as u64 && sha256 == hash => *modified,
-            _ => {
-                cleanup_remote_snapshot(remote, remote_root, &temp_path, &temp_snapshot);
-                anyhow::bail!("remote temp changed while staging at {temp_path:?}");
-            }
+        let Some(modified) = intended.matching_modified(&temp_snapshot) else {
+            anyhow::bail!("remote temp changed while staging at {temp_path:?}");
         };
         return Ok(StagedRemoteWrite {
             temp_path,
@@ -516,6 +531,20 @@ fn stage_remote_write_guarded_with_candidates<R: RemoteWrite>(
         });
     }
     anyhow::bail!("unable to reserve a unique remote transfer temp")
+}
+
+fn cleanup_intended_remote_temp<R: RemoteWrite>(
+    remote: &mut R,
+    remote_root: &str,
+    temp_path: &str,
+    intended: IntendedRemoteTempPayload<'_>,
+) {
+    let Ok(snapshot) = remote.destination_snapshot(remote_root, temp_path) else {
+        return;
+    };
+    if intended.matching_modified(&snapshot).is_some() {
+        let _ = remote.rm(temp_path);
+    }
 }
 
 fn cleanup_remote_snapshot<R: RemoteWrite>(
@@ -718,6 +747,10 @@ mod staging_tests {
             .collect()
     }
 
+    fn transfer_candidate(nonce: &str) -> String {
+        crate::commands::transfer_temp::remote_candidate("/remote/page.txt", nonce).unwrap()
+    }
+
     #[derive(Default)]
     struct FakeRemote {
         directories: BTreeSet<String>,
@@ -726,6 +759,7 @@ mod staging_tests {
         snapshots: BTreeMap<String, VecDeque<Result<RemoteDestinationSnapshot>>>,
         temp_snapshot_count: usize,
         replace_temp_on_snapshot: Option<(usize, Vec<u8>)>,
+        replace_temp_on_upload_error: Option<Vec<u8>>,
         events: Vec<String>,
         upload_error: bool,
         mtime_error: bool,
@@ -779,6 +813,10 @@ mod staging_tests {
             self.files.insert(path.to_string(), bytes.to_vec());
             self.mtimes.insert(path.to_string(), mtime(40));
             if self.upload_error {
+                if let Some(replacement) = self.replace_temp_on_upload_error.clone() {
+                    self.files.insert(path.to_string(), replacement);
+                    self.mtimes.insert(path.to_string(), mtime(58));
+                }
                 anyhow::bail!("scripted partial upload failure");
             }
             Ok(())
@@ -1249,14 +1287,109 @@ mod staging_tests {
                 .all(|event| !event.starts_with("snapshot ") && !event.starts_with("mtime "))
         );
     }
+
     #[test]
-    fn guarded_remote_staging_cleans_owned_temp_when_snapshot_capture_fails() {
+    fn guarded_remote_staging_preserves_replacement_seen_by_first_capture() {
         let mut remote = FakeRemote::with_remote_root();
-        let candidate = crate::commands::transfer_temp::remote_candidate(
+        let candidate = transfer_candidate("33333333333333333333333333333333");
+        remote.replace_temp_on_snapshot(2, b"foreign replacement");
+
+        let error = stage_remote_write_guarded_with_candidates(
+            &mut remote,
+            "/remote",
             "/remote/page.txt",
-            "22222222222222222222222222222222",
+            b"new local",
+            &hash_bytes(b"new local"),
+            || Ok(candidate.clone()),
         )
-        .unwrap();
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("remote temp changed"));
+        assert_eq!(remote.files[&candidate], b"foreign replacement");
+        assert!(transfer_temp_events(&remote.events, "rm ").is_empty());
+    }
+
+    #[test]
+    fn guarded_remote_staging_upload_error_preserves_foreign_replacement() {
+        let mut remote = FakeRemote {
+            upload_error: true,
+            replace_temp_on_upload_error: Some(b"foreign replacement".to_vec()),
+            ..FakeRemote::with_remote_root()
+        };
+        let candidate = transfer_candidate("44444444444444444444444444444444");
+
+        let error = stage_remote_write_guarded_with_candidates(
+            &mut remote,
+            "/remote",
+            "/remote/page.txt",
+            b"new local",
+            &hash_bytes(b"new local"),
+            || Ok(candidate.clone()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("upload"));
+        assert_eq!(remote.files[&candidate], b"foreign replacement");
+        assert!(transfer_temp_events(&remote.events, "rm ").is_empty());
+    }
+
+    #[test]
+    fn guarded_remote_staging_capture_error_preserves_unprovable_replacement() {
+        let mut remote = FakeRemote::with_remote_root();
+        let candidate = transfer_candidate("55555555555555555555555555555555");
+        remote.snapshots.insert(
+            candidate.clone(),
+            VecDeque::from([
+                Ok(RemoteDestinationSnapshot::Missing),
+                Err(anyhow::anyhow!("scripted temp snapshot failure")),
+            ]),
+        );
+        remote.replace_temp_on_snapshot(3, b"foreign replacement");
+
+        let error = stage_remote_write_guarded_with_candidates(
+            &mut remote,
+            "/remote",
+            "/remote/page.txt",
+            b"new local",
+            &hash_bytes(b"new local"),
+            || Ok(candidate.clone()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("capturing remote temp"));
+        assert_eq!(remote.files[&candidate], b"foreign replacement");
+        assert!(transfer_temp_events(&remote.events, "rm ").is_empty());
+        assert_eq!(transfer_temp_events(&remote.events, "snapshot ").len(), 3);
+    }
+
+    #[test]
+    fn guarded_remote_staging_upload_error_cleans_only_after_proving_intended_payload() {
+        let mut remote = FakeRemote {
+            upload_error: true,
+            ..FakeRemote::with_remote_root()
+        };
+        let candidate = transfer_candidate("66666666666666666666666666666666");
+
+        let error = stage_remote_write_guarded_with_candidates(
+            &mut remote,
+            "/remote",
+            "/remote/page.txt",
+            b"new local",
+            &hash_bytes(b"new local"),
+            || Ok(candidate.clone()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("upload"));
+        assert!(!remote.files.contains_key(&candidate));
+        assert_eq!(transfer_temp_events(&remote.events, "snapshot ").len(), 2);
+        assert_eq!(transfer_temp_events(&remote.events, "rm "), [candidate]);
+    }
+
+    #[test]
+    fn guarded_remote_staging_capture_error_cleans_after_retry_proves_intended_payload() {
+        let mut remote = FakeRemote::with_remote_root();
+        let candidate = transfer_candidate("22222222222222222222222222222222");
         remote.snapshots.insert(
             candidate.clone(),
             VecDeque::from([
@@ -1277,6 +1410,7 @@ mod staging_tests {
 
         assert!(format!("{error:#}").contains("capturing remote temp"));
         assert!(!remote.files.contains_key(&candidate));
+        assert_eq!(transfer_temp_events(&remote.events, "snapshot ").len(), 3);
         assert_eq!(transfer_temp_events(&remote.events, "rm "), [candidate]);
     }
 
