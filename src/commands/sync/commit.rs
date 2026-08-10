@@ -1,15 +1,14 @@
-// `is_current` and cancellation are consumed by the scoped/LSP guards in later tasks.
-#![allow(dead_code)]
-
 use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitDecision {
     Committed,
+    #[allow(dead_code, reason = "constructed by scoped commit gates in Task 5/9")]
     Cancelled,
 }
 
 pub trait CommitGate: Send + Sync {
+    #[allow(dead_code, reason = "queried by scoped commit gates in Task 5/9")]
     fn is_current(&self) -> bool;
 
     /// Atomically order `mutation` against invalidation.
