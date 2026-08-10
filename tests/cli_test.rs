@@ -11,7 +11,9 @@ fn bin() -> Command {
 enum FakeFtpScenario {
     Missing,
     TypeConflict,
+    TypeConflictWithClean(Vec<u8>, Vec<u8>),
     FileConflict(Vec<u8>),
+    BareLegacy(Vec<u8>),
 }
 
 impl FakeFtpScenario {
@@ -22,8 +24,23 @@ impl FakeFtpScenario {
                 "drwxr-xr-x 1 owner group 0 Aug 10 12:00 type.c\r\n".into()
             }
             (Self::TypeConflict, "/remote/type.c") => String::new(),
+            (Self::TypeConflictWithClean(clean, _), "/remote") => format!(
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 type.c\r\n-rw-r--r-- 1 owner group {} Aug 10 12:00 clean.c\r\n",
+                clean.len()
+            ),
+            (Self::TypeConflictWithClean(_, child), "/remote/type.c") => format!(
+                "-rw-r--r-- 1 owner group {} Aug 10 12:00 child.c\r\n",
+                child.len()
+            ),
             (Self::FileConflict(bytes), "/remote") => format!(
                 "-rw-r--r-- 1 owner group {} Aug 10 12:00 conflict.c\r\n",
+                bytes.len()
+            ),
+            (Self::BareLegacy(_), "/remote") => {
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 legacy\r\n".into()
+            }
+            (Self::BareLegacy(bytes), "/remote/legacy") => format!(
+                "-rw-r--r-- 1 owner group {} Aug 10 12:00 nested.c\r\n",
                 bytes.len()
             ),
             _ => String::new(),
@@ -33,6 +50,9 @@ impl FakeFtpScenario {
     fn file(&self, path: &str) -> Option<&[u8]> {
         match (self, path) {
             (Self::FileConflict(bytes), "/remote/conflict.c") => Some(bytes),
+            (Self::BareLegacy(bytes), "/remote/legacy/nested.c") => Some(bytes),
+            (Self::TypeConflictWithClean(clean, _), "/remote/clean.c") => Some(clean),
+            (Self::TypeConflictWithClean(_, child), "/remote/type.c/child.c") => Some(child),
             _ => None,
         }
     }
@@ -177,6 +197,8 @@ password = "p"
 [paths]
 local_root = "."
 remote_root = "/remote"
+[sync]
+ignore = [".ferry.toml"]
 "#
         ),
     )
@@ -185,9 +207,42 @@ remote_root = "/remote"
 }
 
 #[test]
-fn sync_cli_accepts_bare_and_rejects_invalid_scope_combinations() {
-    let bare_help = bin().args(["sync", "--help"]).output().unwrap();
-    assert!(bare_help.status.success());
+fn sync_cli_executes_bare_legacy_sync_and_rejects_invalid_scope_combinations() {
+    let bytes = b"from legacy remote".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::BareLegacy(bytes.clone()));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let bare = bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        bare.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("legacy/nested.c")).unwrap(),
+        bytes
+    );
+    assert!(String::from_utf8_lossy(&bare.stdout).contains("downloaded legacy/nested.c"));
+    let state = ferry::state::StateFile::load_or_default(
+        &project
+            .path()
+            .join(ferry::names::STATE_DIR)
+            .join("state.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .files
+            .get("legacy/nested.c")
+            .map(|record| record.sha256.as_str()),
+        Some(ferry::hash::hash_bytes(b"from legacy remote").as_str())
+    );
 
     let multiple = bin().args(["sync", "one", "two"]).output().unwrap();
     assert_eq!(multiple.status.code(), Some(2));
@@ -242,6 +297,55 @@ fn scoped_sync_type_conflict_exits_one() {
         std::fs::read(project.path().join("type.c")).unwrap(),
         b"local file"
     );
+}
+
+#[test]
+fn scoped_sync_type_conflict_keeps_clean_sibling_and_saves_progress() {
+    let clean = b"clean remote sibling".to_vec();
+    let expected_clean_hash = ferry::hash::hash_bytes(&clean);
+    let server = FakeFtpServer::spawn(FakeFtpScenario::TypeConflictWithClean(
+        clean.clone(),
+        b"blocked descendant".to_vec(),
+    ));
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("type.c"), b"local file").unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", ".", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("type conflict"), "stderr={stderr}");
+    assert_eq!(
+        std::fs::read(project.path().join("type.c")).unwrap(),
+        b"local file"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("clean.c")).unwrap(),
+        clean
+    );
+    assert!(!project.path().join("type.c").join("child.c").exists());
+
+    let state = ferry::state::StateFile::load_or_default(
+        &project
+            .path()
+            .join(ferry::names::STATE_DIR)
+            .join("state.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .files
+            .get("clean.c")
+            .map(|record| record.sha256.as_str()),
+        Some(expected_clean_hash.as_str())
+    );
+    assert!(!state.files.contains_key("type.c"));
+    assert!(!state.files.contains_key("type.c/child.c"));
 }
 
 #[test]

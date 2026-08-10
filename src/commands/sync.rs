@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 // The scoped sync engine wires this collector in Task 5.
 pub(crate) mod commit;
 mod inventory;
+#[cfg(test)]
+mod production_tests;
 pub use inventory::EntryKind;
 pub mod scope;
 
@@ -87,56 +89,59 @@ pub struct SyncOutcome {
     pub cancelled: bool,
 }
 
-#[cfg(test)]
-#[derive(Debug)]
-struct HashObservation {
-    path: String,
-    local: Option<String>,
-    remote: Option<String>,
-    known: Option<String>,
+fn is_at_or_below_conflict(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-#[cfg(test)]
-fn plan_structured_files(mut observations: Vec<HashObservation>, force: bool) -> SyncOutcome {
-    observations.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut outcome = SyncOutcome::default();
-    for observation in observations {
-        let state = classify(
-            observation.local.as_deref(),
-            observation.remote.as_deref(),
-            observation.known.as_deref(),
+fn type_conflict_prefixes(entries: &BTreeMap<String, inventory::InventoryEntry>) -> Vec<String> {
+    let mut prefixes: Vec<String> = Vec::new();
+    for (path, entry) in entries {
+        let is_conflict = matches!(
+            (entry.local, entry.remote),
+            (Some(local), Some(remote)) if local != remote
         );
-        let kind = match state {
-            FileState::InSync => Some(SyncEventKind::Unchanged),
-            FileState::LocalChanged | FileState::LocalOnly => Some(SyncEventKind::Uploaded),
-            FileState::RemoteChanged | FileState::RemoteOnly => Some(SyncEventKind::Downloaded),
-            FileState::BothChanged | FileState::Untracked if force => {
-                Some(SyncEventKind::ForcedRemoteOverwrite)
-            }
-            FileState::BothChanged | FileState::Untracked => {
-                outcome.issues.push(SyncIssue::FileConflict {
-                    path: observation.path,
-                    state,
-                });
-                continue;
-            }
-        };
-        if let Some(kind) = kind {
-            outcome.events.push(SyncEvent {
-                path: observation.path,
-                kind,
-            });
+        if is_conflict
+            && !prefixes
+                .iter()
+                .any(|prefix| is_at_or_below_conflict(path, prefix))
+        {
+            prefixes.push(path.clone());
         }
     }
-    outcome
+    prefixes
 }
 
 fn classify_inventory_shapes(
-    entries: std::collections::BTreeMap<String, inventory::InventoryEntry>,
+    entries: BTreeMap<String, inventory::InventoryEntry>,
 ) -> (Vec<String>, SyncOutcome) {
+    let conflict_prefixes = type_conflict_prefixes(&entries);
     let mut files = Vec::new();
     let mut outcome = SyncOutcome::default();
+
+    for prefix in &conflict_prefixes {
+        let entry = entries
+            .get(prefix)
+            .expect("type-conflict prefix came from inventory");
+        let (Some(local), Some(remote)) = (entry.local, entry.remote) else {
+            unreachable!("type conflicts require entries on both sides");
+        };
+        outcome.issues.push(SyncIssue::TypeConflict {
+            path: prefix.clone(),
+            local,
+            remote,
+        });
+    }
+
     for (path, entry) in entries {
+        if conflict_prefixes
+            .iter()
+            .any(|prefix| is_at_or_below_conflict(&path, prefix))
+        {
+            continue;
+        }
         match (entry.local, entry.remote) {
             (None, None) if entry.in_state => outcome.events.push(SyncEvent {
                 path,
@@ -149,11 +154,9 @@ fn classify_inventory_shapes(
             | (Some(EntryKind::Directory), None)
             | (None, Some(EntryKind::Directory))
             | (None, None) => {}
-            (Some(local), Some(remote)) => outcome.issues.push(SyncIssue::TypeConflict {
-                path,
-                local,
-                remote,
-            }),
+            (Some(_), Some(_)) => {
+                unreachable!("all type conflicts were suppressed by their prefix")
+            }
         }
     }
     (files, outcome)
@@ -170,7 +173,6 @@ fn execute_structured_plan(
     mut outcome: SyncOutcome,
     gate: &dyn CommitGate,
     mut execute: impl FnMut(&ScheduledAction) -> Result<CommitDecision>,
-    mut validate_directories: impl FnMut() -> Result<()>,
 ) -> Result<SyncOutcome> {
     for action in &actions {
         if !gate.is_current() {
@@ -189,14 +191,6 @@ fn execute_structured_plan(
         }
     }
 
-    if !gate.is_current() {
-        outcome.cancelled = true;
-        return Ok(outcome);
-    }
-    validate_directories()?;
-    if !gate.is_current() {
-        outcome.cancelled = true;
-    }
     Ok(outcome)
 }
 
@@ -401,51 +395,45 @@ where
         })
         .collect();
     let mut transfers = transfers.into_iter();
-    outcome = execute_structured_plan(
-        scheduled,
-        outcome,
-        gate,
-        |_action| {
-            let transfer = transfers
-                .next()
-                .expect("scheduled action has a prepared transfer");
-            match transfer.operation {
-                PreparedOperation::Upload {
-                    remote_path,
-                    bytes,
-                    hash,
-                    source,
-                    destination,
-                } => upload_one_guarded(
-                    remote,
-                    state,
-                    &transfer.event.path,
-                    remote_root,
-                    &remote_path,
-                    &bytes,
-                    &hash,
-                    &source,
-                    &destination,
-                    mode,
-                    gate,
-                ),
-                PreparedOperation::Download {
-                    local_path,
-                    remote,
-                    destination,
-                } => download_one_guarded(
-                    state,
-                    &local_path,
-                    &transfer.event.path,
-                    &remote,
-                    &destination,
-                    mode,
-                    gate,
-                ),
-            }
-        },
-        || Ok(()),
-    )?;
+    outcome = execute_structured_plan(scheduled, outcome, gate, |_action| {
+        let transfer = transfers
+            .next()
+            .expect("scheduled action has a prepared transfer");
+        match transfer.operation {
+            PreparedOperation::Upload {
+                remote_path,
+                bytes,
+                hash,
+                source,
+                destination,
+            } => upload_one_guarded(
+                remote,
+                state,
+                &transfer.event.path,
+                remote_root,
+                &remote_path,
+                &bytes,
+                &hash,
+                &source,
+                &destination,
+                mode,
+                gate,
+            ),
+            PreparedOperation::Download {
+                local_path,
+                remote,
+                destination,
+            } => download_one_guarded(
+                state,
+                &local_path,
+                &transfer.event.path,
+                &remote,
+                &destination,
+                mode,
+                gate,
+            ),
+        }
+    })?;
     if outcome.cancelled {
         sort_outcome(&mut outcome);
         return Ok(outcome);
@@ -584,7 +572,14 @@ fn capture_directory_snapshots(
         .canonicalize()
         .with_context(|| format!("canonicalizing local_root {}", local_root.display()))?;
     let mut snapshots = Vec::new();
+    let conflict_prefixes = type_conflict_prefixes(entries);
     for (relative, entry) in entries {
+        if conflict_prefixes
+            .iter()
+            .any(|prefix| is_at_or_below_conflict(relative, prefix))
+        {
+            continue;
+        }
         let is_directory = matches!(
             (entry.local, entry.remote),
             (Some(EntryKind::Directory), Some(EntryKind::Directory))
@@ -985,355 +980,10 @@ fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::commit::{CommitDecision, CommitGate};
-    use super::inventory::InventoryEntry;
-    use super::{
-        HashObservation, SyncEvent, SyncEventKind, SyncIssue, SyncOutcome, plan_structured_files,
-    };
+    use super::commit::CommitGate;
+    use super::{SyncIssue, SyncOutcome};
     use crate::state::FileState;
     use anyhow::Result;
-    use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn observation(
-        path: &str,
-        local: Option<&str>,
-        remote: Option<&str>,
-        known: Option<&str>,
-    ) -> HashObservation {
-        HashObservation {
-            path: path.to_string(),
-            local: local.map(str::to_string),
-            remote: remote.map(str::to_string),
-            known: known.map(str::to_string),
-        }
-    }
-
-    struct DestinationSnapshotRemote {
-        snapshot: crate::commands::file_transfer::RemoteDestinationSnapshot,
-    }
-
-    impl crate::commands::file_transfer::RemoteWrite for DestinationSnapshotRemote {
-        fn upload_bytes(&mut self, _path: &str, _bytes: &[u8]) -> Result<()> {
-            unreachable!("snapshot capture does not upload")
-        }
-
-        fn rename(&mut self, _from: &str, _to: &str) -> Result<()> {
-            unreachable!("snapshot capture does not rename")
-        }
-
-        fn rm(&mut self, _path: &str) -> Result<()> {
-            unreachable!("snapshot capture does not remove")
-        }
-
-        fn mkdir(&mut self, _path: &str) -> Result<()> {
-            unreachable!("snapshot capture does not create directories")
-        }
-
-        fn mkdir_scoped_strict(&mut self, _path: &str) -> Result<()> {
-            unreachable!("snapshot capture does not create directories")
-        }
-
-        fn mtime(&mut self, _path: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-            unreachable!("snapshot capture does not query MDTM")
-        }
-
-        fn destination_snapshot(
-            &mut self,
-            _remote_root: &str,
-            _path: &str,
-        ) -> Result<crate::commands::file_transfer::RemoteDestinationSnapshot> {
-            Ok(self.snapshot.clone())
-        }
-    }
-
-    #[test]
-    fn structured_upload_planning_captures_the_strict_destination_snapshot() {
-        let snapshot = crate::commands::file_transfer::RemoteDestinationSnapshot::File {
-            size: 7,
-            modified: chrono::Utc::now(),
-            sha256: "strict-list-hash".into(),
-        };
-        let mut remote = DestinationSnapshotRemote {
-            snapshot: snapshot.clone(),
-        };
-
-        let captured =
-            super::capture_remote_destination(&mut remote, "/remote", "/remote/file.c").unwrap();
-
-        assert_eq!(captured.snapshot, snapshot);
-    }
-
-    #[test]
-    fn structured_hash_combinations_keep_existing_action_semantics() {
-        let cases = [
-            (Some("a"), Some("a"), Some("a"), SyncEventKind::Unchanged),
-            (Some("b"), Some("a"), Some("a"), SyncEventKind::Uploaded),
-            (Some("a"), Some("b"), Some("a"), SyncEventKind::Downloaded),
-            (Some("a"), None, None, SyncEventKind::Uploaded),
-            (None, Some("a"), None, SyncEventKind::Downloaded),
-        ];
-
-        for (local, remote, known, expected) in cases {
-            let outcome =
-                plan_structured_files(vec![observation("file.c", local, remote, known)], false);
-            assert_eq!(
-                outcome.events,
-                vec![SyncEvent {
-                    path: "file.c".into(),
-                    kind: expected,
-                }]
-            );
-            assert!(outcome.issues.is_empty());
-        }
-    }
-
-    #[test]
-    fn structured_both_changed_and_untracked_are_conflicts_without_force() {
-        let outcome = plan_structured_files(
-            vec![
-                observation("both.c", Some("local"), Some("remote"), Some("known")),
-                observation("new.c", Some("same"), Some("same"), None),
-            ],
-            false,
-        );
-
-        assert!(outcome.events.is_empty());
-        assert_eq!(
-            outcome.issues,
-            vec![
-                SyncIssue::FileConflict {
-                    path: "both.c".into(),
-                    state: FileState::BothChanged,
-                },
-                SyncIssue::FileConflict {
-                    path: "new.c".into(),
-                    state: FileState::Untracked,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn structured_force_uses_local_wins_for_both_conflict_states() {
-        let outcome = plan_structured_files(
-            vec![
-                observation("both.c", Some("local"), Some("remote"), Some("known")),
-                observation("new.c", Some("same"), Some("same"), None),
-            ],
-            true,
-        );
-
-        assert_eq!(
-            outcome.events,
-            vec![
-                SyncEvent {
-                    path: "both.c".into(),
-                    kind: SyncEventKind::ForcedRemoteOverwrite,
-                },
-                SyncEvent {
-                    path: "new.c".into(),
-                    kind: SyncEventKind::ForcedRemoteOverwrite,
-                },
-            ]
-        );
-        assert!(outcome.issues.is_empty());
-    }
-
-    #[test]
-    fn structured_events_and_issues_are_ordered_by_relative_path() {
-        let outcome = plan_structured_files(
-            vec![
-                observation("z.c", Some("z"), None, None),
-                observation("a.c", None, Some("a"), None),
-                observation("m.c", Some("local"), Some("remote"), Some("known")),
-            ],
-            false,
-        );
-
-        assert_eq!(
-            outcome
-                .events
-                .iter()
-                .map(|event| event.path.as_str())
-                .collect::<Vec<_>>(),
-            ["a.c", "z.c"]
-        );
-        assert_eq!(
-            outcome
-                .issues
-                .iter()
-                .map(SyncIssue::path)
-                .collect::<Vec<_>>(),
-            ["m.c"]
-        );
-    }
-
-    #[test]
-    fn structured_type_mismatch_and_state_only_absence_stay_distinct() {
-        let entries = BTreeMap::from([
-            (
-                "stale.c".to_string(),
-                InventoryEntry {
-                    local: None,
-                    remote: None,
-                    in_state: true,
-                },
-            ),
-            (
-                "type.c".to_string(),
-                InventoryEntry {
-                    local: Some(super::EntryKind::File),
-                    remote: Some(super::EntryKind::Directory),
-                    in_state: true,
-                },
-            ),
-        ]);
-
-        let (file_paths, outcome) = super::classify_inventory_shapes(entries);
-
-        assert!(file_paths.is_empty());
-        assert_eq!(
-            outcome.events,
-            vec![SyncEvent {
-                path: "stale.c".into(),
-                kind: SyncEventKind::SkippedAbsent,
-            }]
-        );
-        assert_eq!(
-            outcome.issues,
-            vec![SyncIssue::TypeConflict {
-                path: "type.c".into(),
-                local: super::EntryKind::File,
-                remote: super::EntryKind::Directory,
-            }]
-        );
-    }
-
-    struct TestGate {
-        current: AtomicBool,
-    }
-
-    impl TestGate {
-        fn current() -> Self {
-            Self {
-                current: AtomicBool::new(true),
-            }
-        }
-
-        fn cancelled() -> Self {
-            Self {
-                current: AtomicBool::new(false),
-            }
-        }
-
-        fn invalidate(&self) {
-            self.current.store(false, Ordering::SeqCst);
-        }
-    }
-
-    impl CommitGate for TestGate {
-        fn is_current(&self) -> bool {
-            self.current.load(Ordering::SeqCst)
-        }
-
-        fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
-            if !self.is_current() {
-                return Ok(CommitDecision::Cancelled);
-            }
-            mutation()?;
-            Ok(CommitDecision::Committed)
-        }
-    }
-
-    fn action(path: &str) -> super::ScheduledAction {
-        super::ScheduledAction {
-            path: path.to_string(),
-            kind: SyncEventKind::Uploaded,
-        }
-    }
-
-    #[test]
-    fn structured_gate_invalid_before_first_transfer_does_not_stage() {
-        let gate = TestGate::cancelled();
-        let mut staged = Vec::new();
-
-        let outcome = super::execute_structured_plan(
-            vec![action("a.c")],
-            SyncOutcome::default(),
-            &gate,
-            |action| {
-                staged.push(action.path.clone());
-                Ok(CommitDecision::Committed)
-            },
-            || Ok(()),
-        )
-        .unwrap();
-
-        assert!(outcome.cancelled);
-        assert!(outcome.events.is_empty());
-        assert!(staged.is_empty());
-    }
-
-    #[test]
-    fn structured_gate_invalidation_between_entries_preserves_prior_commit() {
-        let gate = TestGate::current();
-        let mut staged = Vec::new();
-
-        let outcome = super::execute_structured_plan(
-            vec![action("a.c"), action("b.c")],
-            SyncOutcome::default(),
-            &gate,
-            |action| {
-                staged.push(action.path.clone());
-                if action.path == "a.c" {
-                    gate.invalidate();
-                }
-                Ok(CommitDecision::Committed)
-            },
-            || Ok(()),
-        )
-        .unwrap();
-
-        assert!(outcome.cancelled);
-        assert_eq!(staged, ["a.c"]);
-        assert_eq!(
-            outcome.events,
-            vec![SyncEvent {
-                path: "a.c".into(),
-                kind: SyncEventKind::Uploaded,
-            }]
-        );
-    }
-
-    #[test]
-    fn structured_all_unchanged_invalidated_during_final_validation_is_cancelled() {
-        let gate = TestGate::current();
-        let mut validations = 0;
-
-        let outcome = super::execute_structured_plan(
-            Vec::new(),
-            SyncOutcome {
-                events: vec![SyncEvent {
-                    path: "same.c".into(),
-                    kind: SyncEventKind::Unchanged,
-                }],
-                ..SyncOutcome::default()
-            },
-            &gate,
-            |_| panic!("unchanged plan must not stage"),
-            || {
-                validations += 1;
-                gate.invalidate();
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(validations, 1);
-        assert!(outcome.cancelled);
-        assert_eq!(outcome.events[0].kind, SyncEventKind::Unchanged);
-    }
 
     #[test]
     fn structured_run_scoped_exposes_the_guarded_structured_api() {

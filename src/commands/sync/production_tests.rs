@@ -1,0 +1,780 @@
+use super::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
+use super::scope::SyncScope;
+use super::{EntryKind, SyncEvent, SyncEventKind, SyncIssue, SyncOutcome, run_scoped_with};
+use crate::commands::ExecutionMode;
+use crate::commands::file_transfer::{RemoteDestinationSnapshot, RemoteWrite};
+use crate::commands::remote_hash::RemoteFileRetrieval;
+use crate::ftp::{Entry, ExactFilePresence, Remote, StrictRemote};
+use crate::hash::hash_bytes;
+use crate::ignored::Matcher;
+use crate::state::{FileRecord, StateFile};
+use anyhow::Result;
+use chrono::{DateTime, TimeZone, Utc};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+struct TestRemoteFile {
+    bytes: Vec<u8>,
+    modified: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct ProductionRemote {
+    directories: BTreeSet<String>,
+    files: BTreeMap<String, TestRemoteFile>,
+    events: Vec<String>,
+    invalidate_on_snapshot: Option<(String, Arc<AtomicBool>)>,
+}
+
+impl ProductionRemote {
+    fn with_root() -> Self {
+        Self {
+            directories: BTreeSet::from(["/remote".to_string()]),
+            ..Self::default()
+        }
+    }
+
+    fn directory(mut self, path: &str) -> Self {
+        self.directories.insert(path.to_string());
+        self
+    }
+
+    fn file(mut self, path: &str, bytes: &[u8]) -> Self {
+        self.files.insert(
+            path.to_string(),
+            TestRemoteFile {
+                bytes: bytes.to_vec(),
+                modified: test_mtime(1),
+            },
+        );
+        self
+    }
+
+    fn parent(path: &str) -> &str {
+        match path.rsplit_once('/') {
+            Some(("", _)) => "/",
+            Some((parent, _)) => parent,
+            None => "",
+        }
+    }
+
+    fn child_name<'a>(directory: &str, path: &'a str) -> Option<&'a str> {
+        let suffix = path.strip_prefix(directory)?.strip_prefix('/')?;
+        (!suffix.is_empty() && !suffix.contains('/')).then_some(suffix)
+    }
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: DateTime<Utc>) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir,
+            size,
+            modified,
+        }
+    }
+
+    fn strict_children(&self, directory: &str) -> Vec<Entry> {
+        let mut children = BTreeMap::new();
+        for path in &self.directories {
+            if path == directory {
+                continue;
+            }
+            if let Some(name) = Self::child_name(directory, path) {
+                children.insert(name.to_string(), Self::entry(name, true, 0, test_mtime(0)));
+            }
+        }
+        for (path, file) in &self.files {
+            if let Some(name) = Self::child_name(directory, path) {
+                children.insert(
+                    name.to_string(),
+                    Self::entry(name, false, file.bytes.len() as u64, file.modified),
+                );
+            }
+        }
+        children.into_values().collect()
+    }
+
+    fn snapshot(&self, path: &str) -> Result<RemoteDestinationSnapshot> {
+        if self.directories.contains(path) {
+            return Ok(RemoteDestinationSnapshot::Directory);
+        }
+        if let Some(file) = self.files.get(path) {
+            return Ok(RemoteDestinationSnapshot::File {
+                size: file.bytes.len() as u64,
+                modified: file.modified,
+                sha256: hash_bytes(&file.bytes),
+            });
+        }
+        if !self.directories.contains(Self::parent(path)) {
+            anyhow::bail!("missing remote parent for {path}");
+        }
+        Ok(RemoteDestinationSnapshot::Missing)
+    }
+
+    fn has_transfer_operation_below(&self, prefix: &str) -> bool {
+        self.events.iter().any(|event| {
+            !event.starts_with("list ")
+                && event
+                    .split_ascii_whitespace()
+                    .skip(1)
+                    .any(|path| path.starts_with(prefix))
+        })
+    }
+}
+
+impl Remote for ProductionRemote {
+    fn list_dir(&mut self, _dir: &str) -> Result<Vec<Entry>> {
+        anyhow::bail!("tolerant LIST must not be used")
+    }
+
+    fn file_size(&mut self, path: &str) -> Result<u64> {
+        self.files
+            .get(path)
+            .map(|file| file.bytes.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("missing remote file {path}"))
+    }
+
+    fn exact_file_presence(&mut self, path: &str) -> Result<ExactFilePresence> {
+        Ok(if self.files.contains_key(path) {
+            ExactFilePresence::Present
+        } else {
+            ExactFilePresence::Missing
+        })
+    }
+}
+
+impl StrictRemote for ProductionRemote {
+    fn list_dir_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.events.push(format!("list {dir}"));
+        if !self.directories.contains(dir) {
+            anyhow::bail!("strict LIST of non-directory {dir}");
+        }
+        Ok(self.strict_children(dir))
+    }
+}
+
+impl RemoteFileRetrieval for ProductionRemote {
+    fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
+        self.events.push(format!("mtime {remote_path}"));
+        self.files
+            .get(remote_path)
+            .map(|file| file.modified)
+            .ok_or_else(|| anyhow::anyhow!("missing remote mtime {remote_path}"))
+    }
+
+    fn size(&mut self, remote_path: &str) -> Result<u64> {
+        self.events.push(format!("size {remote_path}"));
+        self.files
+            .get(remote_path)
+            .map(|file| file.bytes.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("missing remote size {remote_path}"))
+    }
+
+    fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
+        self.events.push(format!("download {remote_path}"));
+        self.files
+            .get(remote_path)
+            .map(|file| file.bytes.clone())
+            .ok_or_else(|| anyhow::anyhow!("missing remote download {remote_path}"))
+    }
+}
+
+impl RemoteWrite for ProductionRemote {
+    fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+        self.events.push(format!("upload {path}"));
+        if !self.directories.contains(Self::parent(path)) {
+            anyhow::bail!("missing remote upload parent for {path}");
+        }
+        self.files.insert(
+            path.to_string(),
+            TestRemoteFile {
+                bytes: bytes.to_vec(),
+                modified: test_mtime(50),
+            },
+        );
+        Ok(())
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.events.push(format!("rename {from} {to}"));
+        let file = self
+            .files
+            .remove(from)
+            .ok_or_else(|| anyhow::anyhow!("missing remote rename source {from}"))?;
+        self.files.insert(to.to_string(), file);
+        Ok(())
+    }
+
+    fn rm(&mut self, path: &str) -> Result<()> {
+        self.events.push(format!("rm {path}"));
+        self.files.remove(path);
+        Ok(())
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.events.push(format!("mkdir {path}"));
+        self.directories.insert(path.to_string());
+        Ok(())
+    }
+
+    fn mkdir_scoped_strict(&mut self, path: &str) -> Result<()> {
+        self.events.push(format!("mkdir_strict {path}"));
+        self.directories.insert(path.to_string());
+        Ok(())
+    }
+
+    fn mtime(&mut self, path: &str) -> Result<DateTime<Utc>> {
+        self.events.push(format!("exact_mtime {path}"));
+        self.files
+            .get(path)
+            .map(|file| file.modified)
+            .ok_or_else(|| anyhow::anyhow!("missing exact remote mtime {path}"))
+    }
+
+    fn destination_snapshot(
+        &mut self,
+        _remote_root: &str,
+        path: &str,
+    ) -> Result<RemoteDestinationSnapshot> {
+        self.events.push(format!("snapshot {path}"));
+        let result = self.snapshot(path);
+        if let Some((expected, current)) = &self.invalidate_on_snapshot
+            && path == expected
+        {
+            current.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+fn test_mtime(second: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, second).unwrap()
+}
+
+fn matcher(root: &Path) -> Matcher {
+    Matcher::new(&[], root).unwrap()
+}
+
+fn run_production(
+    remote: &mut ProductionRemote,
+    root: &Path,
+    state: &mut StateFile,
+    scope: SyncScope,
+    force: bool,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<SyncOutcome> {
+    run_scoped_with(
+        remote,
+        state,
+        root,
+        "/remote",
+        &matcher(root),
+        scope,
+        force,
+        mode,
+        gate,
+    )
+}
+
+#[test]
+fn structured_type_conflict_subtree_local_directory_remote_file_keeps_clean_siblings() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("conflict")).unwrap();
+    std::fs::write(root.path().join("conflict/local-child.c"), b"local child").unwrap();
+    std::fs::write(root.path().join("clean.c"), b"clean local").unwrap();
+    std::fs::write(root.path().join("conflict-old.c"), b"near miss").unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/conflict", b"remote file");
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.issues,
+        vec![SyncIssue::TypeConflict {
+            path: "conflict".into(),
+            local: EntryKind::Directory,
+            remote: EntryKind::File,
+        }]
+    );
+    assert_eq!(
+        outcome.events,
+        vec![
+            SyncEvent {
+                path: "clean.c".into(),
+                kind: SyncEventKind::Uploaded,
+            },
+            SyncEvent {
+                path: "conflict-old.c".into(),
+                kind: SyncEventKind::Uploaded,
+            },
+        ]
+    );
+    assert!(state.files.contains_key("clean.c"));
+    assert!(state.files.contains_key("conflict-old.c"));
+    assert!(!state.files.contains_key("conflict/local-child.c"));
+    assert!(!remote.has_transfer_operation_below("/remote/conflict/"));
+}
+
+#[test]
+fn structured_type_conflict_subtree_local_file_remote_directory_keeps_clean_siblings() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("conflict"), b"local file").unwrap();
+    std::fs::write(root.path().join("clean.c"), b"clean local").unwrap();
+    std::fs::write(root.path().join("conflict-old.c"), b"near miss").unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/conflict")
+        .file("/remote/conflict/remote-child.c", b"remote child");
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.issues,
+        vec![SyncIssue::TypeConflict {
+            path: "conflict".into(),
+            local: EntryKind::File,
+            remote: EntryKind::Directory,
+        }]
+    );
+    assert_eq!(
+        outcome.events,
+        vec![
+            SyncEvent {
+                path: "clean.c".into(),
+                kind: SyncEventKind::Uploaded,
+            },
+            SyncEvent {
+                path: "conflict-old.c".into(),
+                kind: SyncEventKind::Uploaded,
+            },
+        ]
+    );
+    assert!(state.files.contains_key("clean.c"));
+    assert!(state.files.contains_key("conflict-old.c"));
+    assert!(!state.files.contains_key("conflict/remote-child.c"));
+    assert!(!remote.has_transfer_operation_below("/remote/conflict/"));
+}
+
+fn state_record(bytes: &[u8]) -> FileRecord {
+    FileRecord {
+        sha256: hash_bytes(bytes),
+        size: bytes.len() as u64,
+        remote_mtime: test_mtime(0),
+        last_synced: test_mtime(2),
+    }
+}
+
+fn run_hash_case(
+    local: Option<&[u8]>,
+    remote_bytes: Option<&[u8]>,
+    known: Option<&[u8]>,
+) -> SyncOutcome {
+    let root = tempfile::tempdir().unwrap();
+    if let Some(bytes) = local {
+        std::fs::write(root.path().join("file.c"), bytes).unwrap();
+    }
+    let mut remote = ProductionRemote::with_root();
+    if let Some(bytes) = remote_bytes {
+        remote = remote.file("/remote/file.c", bytes);
+    }
+    let mut state = StateFile::default();
+    if let Some(bytes) = known {
+        state.files.insert("file.c".into(), state_record(bytes));
+    }
+    run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("file.c".into()),
+        false,
+        ExecutionMode::DryRun,
+        &UnconditionalCommitGate,
+    )
+    .unwrap()
+}
+
+#[test]
+fn structured_production_hash_combinations_keep_existing_action_semantics() {
+    let cases = [
+        (
+            Some(b"a".as_slice()),
+            Some(b"a".as_slice()),
+            Some(b"a".as_slice()),
+            SyncEventKind::Unchanged,
+        ),
+        (
+            Some(b"b".as_slice()),
+            Some(b"a".as_slice()),
+            Some(b"a".as_slice()),
+            SyncEventKind::Uploaded,
+        ),
+        (
+            Some(b"a".as_slice()),
+            Some(b"b".as_slice()),
+            Some(b"a".as_slice()),
+            SyncEventKind::Downloaded,
+        ),
+        (Some(b"a".as_slice()), None, None, SyncEventKind::Uploaded),
+        (None, Some(b"a".as_slice()), None, SyncEventKind::Downloaded),
+    ];
+
+    for (local, remote, known, expected) in cases {
+        let outcome = run_hash_case(local, remote, known);
+        assert_eq!(
+            outcome.events,
+            vec![SyncEvent {
+                path: "file.c".into(),
+                kind: expected,
+            }]
+        );
+        assert!(outcome.issues.is_empty());
+        assert!(!outcome.cancelled);
+    }
+}
+
+fn conflict_project() -> (tempfile::TempDir, ProductionRemote, StateFile) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("both.c"), b"local").unwrap();
+    std::fs::write(root.path().join("untracked.c"), b"same").unwrap();
+    let remote = ProductionRemote::with_root()
+        .file("/remote/both.c", b"remote")
+        .file("/remote/untracked.c", b"same");
+    let mut state = StateFile::default();
+    state.files.insert("both.c".into(), state_record(b"known"));
+    (root, remote, state)
+}
+
+#[test]
+fn structured_production_conflicts_and_force_use_local_wins() {
+    let (root, mut remote, mut state) = conflict_project();
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::DryRun,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.issues,
+        vec![
+            SyncIssue::FileConflict {
+                path: "both.c".into(),
+                state: crate::state::FileState::BothChanged,
+            },
+            SyncIssue::FileConflict {
+                path: "untracked.c".into(),
+                state: crate::state::FileState::Untracked,
+            },
+        ]
+    );
+    assert!(outcome.events.is_empty());
+
+    let (root, mut remote, mut state) = conflict_project();
+    let forced = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        true,
+        ExecutionMode::DryRun,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        forced.events,
+        vec![
+            SyncEvent {
+                path: "both.c".into(),
+                kind: SyncEventKind::ForcedRemoteOverwrite,
+            },
+            SyncEvent {
+                path: "untracked.c".into(),
+                kind: SyncEventKind::ForcedRemoteOverwrite,
+            },
+        ]
+    );
+    assert!(forced.issues.is_empty());
+}
+
+#[test]
+fn structured_production_orders_events_and_distinguishes_type_and_stale_issues() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("z.c"), b"local").unwrap();
+    std::fs::write(root.path().join("m.c"), b"local").unwrap();
+    std::fs::write(root.path().join("type.c"), b"local file").unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/type.c")
+        .file("/remote/a.c", b"remote")
+        .file("/remote/m.c", b"remote");
+    let mut state = StateFile::default();
+    state.files.insert("m.c".into(), state_record(b"known"));
+    state.files.insert("stale.c".into(), state_record(b"stale"));
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::DryRun,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.events,
+        vec![
+            SyncEvent {
+                path: "a.c".into(),
+                kind: SyncEventKind::Downloaded,
+            },
+            SyncEvent {
+                path: "stale.c".into(),
+                kind: SyncEventKind::SkippedAbsent,
+            },
+            SyncEvent {
+                path: "z.c".into(),
+                kind: SyncEventKind::Uploaded,
+            },
+        ]
+    );
+    assert_eq!(
+        outcome.issues,
+        vec![
+            SyncIssue::FileConflict {
+                path: "m.c".into(),
+                state: crate::state::FileState::BothChanged,
+            },
+            SyncIssue::TypeConflict {
+                path: "type.c".into(),
+                local: EntryKind::File,
+                remote: EntryKind::Directory,
+            },
+        ]
+    );
+}
+
+struct SequenceGate {
+    current: Mutex<VecDeque<bool>>,
+    commits: AtomicUsize,
+}
+
+impl SequenceGate {
+    fn new(results: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            current: Mutex::new(results.into_iter().collect()),
+            commits: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CommitGate for SequenceGate {
+    fn is_current(&self) -> bool {
+        self.current.lock().unwrap().pop_front().unwrap_or(false)
+    }
+
+    fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        mutation()?;
+        Ok(CommitDecision::Committed)
+    }
+}
+
+#[test]
+fn structured_production_outer_cancellation_stages_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.c"), b"local").unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+    let gate = SequenceGate::new([false]);
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert_eq!(gate.commits.load(Ordering::SeqCst), 0);
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event.starts_with("upload "))
+    );
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn structured_production_upload_boundary_cancellation_stages_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.c"), b"local").unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+    let gate = SequenceGate::new([true, false]);
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert_eq!(gate.commits.load(Ordering::SeqCst), 0);
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event.starts_with("upload "))
+    );
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn structured_production_download_boundary_cancellation_stages_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/file.c", b"remote");
+    let mut state = StateFile::default();
+    let gate = SequenceGate::new([true, false]);
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert_eq!(gate.commits.load(Ordering::SeqCst), 0);
+    assert!(!root.path().join("file.c").exists());
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn structured_production_between_entries_keeps_the_first_commit_only() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.c"), b"first").unwrap();
+    std::fs::write(root.path().join("b.c"), b"second").unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+    let gate = SequenceGate::new([true, true, false]);
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert_eq!(
+        outcome.events,
+        vec![SyncEvent {
+            path: "a.c".into(),
+            kind: SyncEventKind::Uploaded,
+        }]
+    );
+    assert_eq!(gate.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(remote.files["/remote/a.c"].bytes, b"first");
+    assert!(!remote.files.contains_key("/remote/b.c"));
+    assert!(state.files.contains_key("a.c"));
+    assert!(!state.files.contains_key("b.c"));
+}
+
+struct LiveGate {
+    current: Arc<AtomicBool>,
+}
+
+impl CommitGate for LiveGate {
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+        if !self.is_current() {
+            return Ok(CommitDecision::Cancelled);
+        }
+        mutation()?;
+        Ok(CommitDecision::Committed)
+    }
+}
+
+#[test]
+fn structured_production_final_directory_validation_invalidation_cancels_unchanged_scope() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("shared")).unwrap();
+    let current = Arc::new(AtomicBool::new(true));
+    let mut remote = ProductionRemote::with_root().directory("/remote/shared");
+    remote.invalidate_on_snapshot = Some(("/remote/shared".into(), Arc::clone(&current)));
+    let mut state = StateFile::default();
+    let gate = LiveGate { current };
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert!(outcome.issues.is_empty());
+    assert!(
+        remote
+            .events
+            .iter()
+            .any(|event| event == "snapshot /remote/shared")
+    );
+    assert!(state.files.is_empty());
+}

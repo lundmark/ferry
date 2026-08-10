@@ -588,6 +588,9 @@ pub(crate) fn upload_one_guarded<R: RemoteWrite>(
     }
     source.verify_unchanged(hash)?;
     verify_remote_destination(remote, remote_root, remote_path, destination)?;
+    if !gate.is_current() {
+        return Ok(CommitDecision::Cancelled);
+    }
 
     let staged = stage_remote_write_guarded(remote, remote_root, remote_path, bytes, hash)?;
     let mut renamed = false;
@@ -726,7 +729,7 @@ mod staging_tests {
     use chrono::{DateTime, TimeZone, Utc};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn mtime(second: u32) -> DateTime<Utc> {
@@ -941,6 +944,22 @@ mod staging_tests {
         }
     }
 
+    struct CancelAtPreStage {
+        checks: AtomicUsize,
+        commits: AtomicUsize,
+    }
+
+    impl CommitGate for CancelAtPreStage {
+        fn is_current(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) == 0
+        }
+
+        fn commit(&self, _mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(CommitDecision::Cancelled)
+        }
+    }
+
     struct CancelAfterUpload {
         called: AtomicBool,
     }
@@ -1064,6 +1083,37 @@ mod staging_tests {
         assert_eq!(decision, CommitDecision::Committed);
         assert!(remote.events.is_empty());
         assert!(remote.files.is_empty());
+        assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn guarded_upload_cancels_at_pre_stage_boundary_without_creating_a_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"new local";
+        let (_path, source) = source(root.path(), bytes);
+        let destination = ExpectedRemoteDestination {
+            snapshot: RemoteDestinationSnapshot::Missing,
+        };
+        let mut remote = FakeRemote::with_remote_root();
+        let mut state = StateFile::default();
+        let gate = CancelAtPreStage {
+            checks: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+        };
+
+        assert!(gate.is_current(), "models the outer scoped-plan check");
+        let decision =
+            upload(&mut remote, &mut state, bytes, &source, &destination, &gate).unwrap();
+
+        assert_eq!(decision, CommitDecision::Cancelled);
+        assert_eq!(gate.commits.load(Ordering::SeqCst), 0);
+        assert!(
+            !remote
+                .events
+                .iter()
+                .any(|event| event.starts_with("upload "))
+        );
+        assert!(transfer_temp_paths(&remote).is_empty());
         assert!(state.files.is_empty());
     }
 

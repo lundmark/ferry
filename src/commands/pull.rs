@@ -344,6 +344,9 @@ pub(crate) fn download_one_guarded(
     }
 
     expected.verify_unchanged(local_path)?;
+    if !gate.is_current() {
+        return Ok(CommitDecision::Cancelled);
+    }
     let mut staged = Some(stage_local_write_scoped(expected, bytes)?);
     let mut mutation = || {
         expected.verify_unchanged(local_path)?;
@@ -667,7 +670,7 @@ mod staging_tests {
     use chrono::{TimeZone, Utc};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn transfer_temps(directory: &Path) -> Vec<PathBuf> {
         let mut temps = std::fs::read_dir(directory)
@@ -706,6 +709,28 @@ mod staging_tests {
             size: b"old state".len() as u64,
             remote_mtime: Utc.with_ymd_and_hms(2026, 8, 9, 9, 0, 0).unwrap(),
             last_synced: Utc.with_ymd_and_hms(2026, 8, 9, 9, 1, 0).unwrap(),
+        }
+    }
+
+    struct CancelAtPreStage {
+        checks: AtomicUsize,
+        commits: AtomicUsize,
+        directory: PathBuf,
+        saw_temp: AtomicBool,
+    }
+
+    impl CommitGate for CancelAtPreStage {
+        fn is_current(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) == 0
+        }
+
+        fn commit(&self, _mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            self.saw_temp.store(
+                !transfer_temps(&self.directory).is_empty(),
+                Ordering::SeqCst,
+            );
+            Ok(CommitDecision::Cancelled)
         }
     }
 
@@ -809,6 +834,40 @@ mod staging_tests {
 
         assert_eq!(decision, CommitDecision::Committed);
         assert_eq!(std::fs::read(&target).unwrap(), b"local");
+        assert!(transfer_temps(root.path()).is_empty());
+        assert!(state.files.is_empty());
+    }
+
+    #[test]
+    fn guarded_download_cancels_at_pre_stage_boundary_without_creating_a_temp() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("page.txt");
+        std::fs::write(&target, b"original local").unwrap();
+        let expected = ExpectedLocalDestination::capture(root.path(), &target).unwrap();
+        let mut state = StateFile::default();
+        let gate = CancelAtPreStage {
+            checks: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            directory: root.path().to_path_buf(),
+            saw_temp: AtomicBool::new(false),
+        };
+
+        assert!(gate.is_current(), "models the outer scoped-plan check");
+        let decision = download_one_guarded(
+            &mut state,
+            &target,
+            "page.txt",
+            &remote(b"new remote"),
+            &expected,
+            ExecutionMode::Apply,
+            &gate,
+        )
+        .unwrap();
+
+        assert_eq!(decision, CommitDecision::Cancelled);
+        assert_eq!(gate.commits.load(Ordering::SeqCst), 0);
+        assert!(!gate.saw_temp.load(Ordering::SeqCst));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original local");
         assert!(transfer_temps(root.path()).is_empty());
         assert!(state.files.is_empty());
     }
