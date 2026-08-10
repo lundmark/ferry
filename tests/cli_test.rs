@@ -24,6 +24,7 @@ enum HostileHashOperation {
 #[derive(Clone)]
 enum FakeFtpScenario {
     Missing,
+    DirectoryPrefix,
     TypeConflict,
     TypeConflictWithClean(Vec<u8>, Vec<u8>),
     FileConflict(Vec<u8>),
@@ -40,6 +41,10 @@ impl FakeFtpScenario {
     fn listing(&self, path: &str) -> String {
         match (self, path) {
             (Self::Missing, "/remote") => String::new(),
+            (Self::DirectoryPrefix, "/remote") => {
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 area\r\n".into()
+            }
+            (Self::DirectoryPrefix, "/remote/area") => String::new(),
             (Self::TypeConflict, "/remote") => {
                 "drwxr-xr-x 1 owner group 0 Aug 10 12:00 type.c\r\n".into()
             }
@@ -451,6 +456,57 @@ fn scoped_sync_missing_path_is_exact_and_creates_no_state() {
     assert!(
         !project.path().join(ferry::names::STATE_DIR).exists(),
         "missing explicit path must not create state"
+    );
+}
+
+#[test]
+fn scoped_sync_missing_leaf_below_local_directory_prefix_is_not_found() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("area")).unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", "area/missing.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("path not found locally or remotely"),
+        "stderr={stderr}"
+    );
+    assert!(project.path().join("area").is_dir());
+    assert!(
+        !project.path().join(ferry::names::STATE_DIR).exists(),
+        "missing descendant must not create state"
+    );
+}
+
+#[test]
+fn scoped_sync_missing_leaf_below_remote_directory_prefix_is_not_found() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::DirectoryPrefix);
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", "area/missing.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("path not found locally or remotely"),
+        "stderr={stderr}"
+    );
+    assert!(!project.path().join("area").exists());
+    assert!(
+        !project.path().join(ferry::names::STATE_DIR).exists(),
+        "missing descendant must not create state"
     );
 }
 

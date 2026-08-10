@@ -192,6 +192,15 @@ impl ProductionRemote {
                     .any(|path| path.starts_with(prefix))
         })
     }
+
+    fn has_mutation(&self) -> bool {
+        self.events.iter().any(|event| {
+            matches!(
+                event.split_ascii_whitespace().next(),
+                Some("upload" | "rename" | "rm" | "mkdir" | "mkdir_strict")
+            )
+        })
+    }
 }
 
 impl Remote for ProductionRemote {
@@ -353,6 +362,27 @@ fn run_production(
         force,
         mode,
         gate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_production_with_patterns(
+    remote: &mut ProductionRemote,
+    root: &Path,
+    state: &mut StateFile,
+    scope: SyncScope,
+    force: bool,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+    patterns: &[&str],
+) -> Result<SyncOutcome> {
+    let patterns = patterns
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect::<Vec<_>>();
+    let matcher = Matcher::new(&patterns, root).unwrap();
+    run_scoped_with(
+        remote, state, root, "/remote", &matcher, scope, force, mode, gate,
     )
 }
 
@@ -1369,4 +1399,247 @@ fn directory_race_missing_remote_destination_file_appears_without_overwrite() {
     assert!(format!("{error:#}").contains("source"));
     assert_eq!(remote.files["/remote/source"].bytes, b"raced file");
     assert!(root.path().join("source").is_dir());
+}
+
+#[test]
+fn selected_missing_leaf_below_local_directory_prefix_is_not_found_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("area")).unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("area/missing.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("path not found locally or remotely"));
+    assert!(root.path().join("area").is_dir());
+    assert_eq!(remote.directories, BTreeSet::from(["/remote".to_string()]));
+    assert!(!remote.has_mutation());
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn selected_missing_leaf_below_remote_directory_prefix_is_not_found_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root().directory("/remote/area");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("area/missing.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("path not found locally or remotely"));
+    assert!(!root.path().join("area").exists());
+    assert!(remote.directories.contains("/remote/area"));
+    assert!(!remote.has_mutation());
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn selected_missing_descendant_does_not_upload_its_local_file_ancestor() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("area"), b"local ancestor").unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("area/missing.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("path not found locally or remotely"));
+    assert_eq!(
+        std::fs::read(root.path().join("area")).unwrap(),
+        b"local ancestor"
+    );
+    assert!(!remote.files.contains_key("/remote/area"));
+    assert!(!remote.has_mutation());
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn selected_missing_descendant_does_not_download_its_remote_file_ancestor() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/area", b"remote ancestor");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("area/missing.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("path not found locally or remotely"));
+    assert!(!root.path().join("area").exists());
+    assert_eq!(remote.files["/remote/area"].bytes, b"remote ancestor");
+    assert!(!remote.has_mutation());
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn remote_selected_leaf_with_local_file_parent_reports_typed_conflict_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("area"), b"local ancestor").unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/area")
+        .file("/remote/area/selected.c", b"remote selected");
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("area/selected.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.issues,
+        vec![SyncIssue::TypeConflict {
+            path: "area".into(),
+            local: EntryKind::File,
+            remote: EntryKind::Directory,
+        }]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("area")).unwrap(),
+        b"local ancestor"
+    );
+    assert_eq!(
+        remote.files["/remote/area/selected.c"].bytes,
+        b"remote selected"
+    );
+    assert!(!remote.has_mutation());
+    assert!(remote.events.iter().all(|event| event.starts_with("list ")));
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn local_selected_leaf_with_remote_file_parent_reports_typed_conflict_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("area")).unwrap();
+    std::fs::write(root.path().join("area/selected.c"), b"local selected").unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/area", b"remote ancestor");
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("area/selected.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.issues,
+        vec![SyncIssue::TypeConflict {
+            path: "area".into(),
+            local: EntryKind::Directory,
+            remote: EntryKind::File,
+        }]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("area/selected.c")).unwrap(),
+        b"local selected"
+    );
+    assert_eq!(remote.files["/remote/area"].bytes, b"remote ancestor");
+    assert!(!remote.has_mutation());
+    assert!(remote.events.iter().all(|event| event.starts_with("list ")));
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn ignored_selected_leaf_under_ignored_ancestor_creates_nothing_and_keeps_state() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("ignored")).unwrap();
+    std::fs::write(root.path().join("ignored/selected.c"), b"ignored local").unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+    state.files.insert(
+        "ignored/selected.c".into(),
+        state_record(b"previous ignored bytes"),
+    );
+    let before = state.files.clone();
+
+    let error = run_production_with_patterns(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("ignored/selected.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+        &["ignored/"],
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("path not found locally or remotely"));
+    assert_eq!(
+        std::fs::read(root.path().join("ignored/selected.c")).unwrap(),
+        b"ignored local"
+    );
+    assert_eq!(state.files, before);
+    assert_eq!(remote.directories, BTreeSet::from(["/remote".to_string()]));
+    assert!(!remote.has_mutation());
+}
+
+#[test]
+fn ignored_directory_near_miss_still_materializes_parent_and_syncs_selected_leaf() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("ignored-old")).unwrap();
+    std::fs::write(root.path().join("ignored-old/selected.c"), b"kept local").unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let outcome = run_production_with_patterns(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("ignored-old/selected.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+        &["ignored/"],
+    )
+    .unwrap();
+
+    assert!(outcome.issues.is_empty());
+    assert_eq!(
+        remote.files["/remote/ignored-old/selected.c"].bytes,
+        b"kept local"
+    );
+    assert!(remote.directories.contains("/remote/ignored-old"));
+    assert!(state.files.contains_key("ignored-old/selected.c"));
 }

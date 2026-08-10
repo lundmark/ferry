@@ -32,6 +32,9 @@ pub(crate) struct InventoryEntry {
 pub(crate) struct ScopedInventory {
     pub(crate) scope: SyncScope,
     pub(crate) entries: BTreeMap<String, InventoryEntry>,
+    pub(crate) implicit_ancestors: BTreeMap<String, InventoryEntry>,
+    pub(crate) selected_local: bool,
+    pub(crate) selected_remote: bool,
 }
 
 /// Collects a read-only, non-authoritative snapshot for planning.
@@ -52,14 +55,22 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
     }
 
     let mut entries = BTreeMap::new();
-    collect_local(local_root, matcher, &scope, &mut entries)?;
-    collect_remote(
+    let mut implicit_ancestors = BTreeMap::new();
+    let selected_local = collect_local(
+        local_root,
+        matcher,
+        &scope,
+        &mut entries,
+        &mut implicit_ancestors,
+    )?;
+    let selected_remote = collect_remote(
         remote,
         local_root,
         remote_root,
         matcher,
         &scope,
         &mut entries,
+        &mut implicit_ancestors,
     )?;
 
     for path in state.files.keys() {
@@ -70,14 +81,23 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
         if is_state_path(path) || is_reserved_remote_transfer_temp(path) {
             continue;
         }
+        if matcher.is_ignored(&local_root.join(path), false) {
+            continue;
+        }
         entries.entry(path.clone()).or_default().in_state = true;
     }
 
-    if matches!(&scope, SyncScope::Path(_)) && entries.is_empty() {
+    if matches!(&scope, SyncScope::Path(_)) && !selected_local && !selected_remote {
         bail!("path not found locally or remotely");
     }
 
-    Ok(ScopedInventory { scope, entries })
+    Ok(ScopedInventory {
+        scope,
+        entries,
+        implicit_ancestors,
+        selected_local,
+        selected_remote,
+    })
 }
 
 struct LocalContext<'a> {
@@ -92,7 +112,8 @@ fn collect_local(
     matcher: &Matcher,
     scope: &SyncScope,
     entries: &mut BTreeMap<String, InventoryEntry>,
-) -> Result<()> {
+    implicit_ancestors: &mut BTreeMap<String, InventoryEntry>,
+) -> Result<bool> {
     let canonical_root = local_root
         .canonicalize()
         .with_context(|| format!("canonicalizing local_root {}", local_root.display()))?;
@@ -118,15 +139,18 @@ fn collect_local(
     match scope {
         SyncScope::LegacyProject => unreachable!("legacy scope rejected by collect"),
         SyncScope::RootDirectory => {
-            collect_local_children(local_root, "", &context, entries, &mut ancestors)
+            collect_local_children(local_root, "", &context, entries, &mut ancestors)?;
+            Ok(true)
         }
         SyncScope::Path(relative) => {
             validate_relative_path(relative)?;
-            let Some((path, metadata)) = resolve_local_selection(&context, relative, entries)?
+            let Some((path, metadata)) =
+                resolve_local_selection(&context, relative, implicit_ancestors)?
             else {
-                return Ok(());
+                return Ok(false);
             };
-            collect_local_node(&path, relative, metadata, &context, entries, &mut ancestors)
+            collect_local_node(&path, relative, metadata, &context, entries, &mut ancestors)?;
+            Ok(true)
         }
     }
 }
@@ -134,7 +158,7 @@ fn collect_local(
 fn resolve_local_selection(
     context: &LocalContext<'_>,
     relative: &str,
-    entries: &mut BTreeMap<String, InventoryEntry>,
+    implicit_ancestors: &mut BTreeMap<String, InventoryEntry>,
 ) -> Result<Option<(PathBuf, Metadata)>> {
     let segments = relative.split('/').collect::<Vec<_>>();
     let mut path = context.local_root.to_path_buf();
@@ -175,16 +199,30 @@ fn resolve_local_selection(
         } else {
             symlink_metadata.clone()
         };
+        let is_dir = metadata.is_dir();
+        if is_reserved_local_transfer_temp(&relative_prefix)
+            || context
+                .matcher
+                .is_ignored(&context.local_root.join(&relative_prefix), is_dir)
+        {
+            return Ok(None);
+        }
         let is_selected = index + 1 == segments.len();
         if is_selected {
             return Ok(Some((path, symlink_metadata)));
         }
-        entries.entry(relative_prefix.clone()).or_default().local = Some(if metadata.is_dir() {
+        let kind = if is_dir {
             EntryKind::Directory
-        } else {
+        } else if metadata.is_file() {
             EntryKind::File
-        });
-        if !metadata.is_dir() {
+        } else {
+            bail!("unsupported local entry type at {}", path.display());
+        };
+        implicit_ancestors
+            .entry(relative_prefix.clone())
+            .or_default()
+            .local = Some(kind);
+        if !is_dir {
             return Ok(None);
         }
     }
@@ -290,22 +328,34 @@ fn collect_remote<R: StrictRemote + ?Sized>(
     matcher: &Matcher,
     scope: &SyncScope,
     entries: &mut BTreeMap<String, InventoryEntry>,
-) -> Result<()> {
+    implicit_ancestors: &mut BTreeMap<String, InventoryEntry>,
+) -> Result<bool> {
     let remote_root = normalize_remote_root(remote_root)?;
     match scope {
         SyncScope::LegacyProject => unreachable!("legacy scope rejected by collect"),
-        SyncScope::RootDirectory => collect_remote_children(
-            remote,
-            local_root,
-            &remote_root,
-            &remote_root,
-            "",
-            matcher,
-            entries,
-        ),
+        SyncScope::RootDirectory => {
+            collect_remote_children(
+                remote,
+                local_root,
+                &remote_root,
+                &remote_root,
+                "",
+                matcher,
+                entries,
+            )?;
+            Ok(true)
+        }
         SyncScope::Path(relative) => {
             validate_relative_path(relative)?;
-            collect_remote_path(remote, local_root, &remote_root, matcher, relative, entries)
+            collect_remote_path(
+                remote,
+                local_root,
+                &remote_root,
+                matcher,
+                relative,
+                entries,
+                implicit_ancestors,
+            )
         }
     }
 }
@@ -317,7 +367,8 @@ fn collect_remote_path<R: StrictRemote + ?Sized>(
     matcher: &Matcher,
     selected: &str,
     entries: &mut BTreeMap<String, InventoryEntry>,
-) -> Result<()> {
+    implicit_ancestors: &mut BTreeMap<String, InventoryEntry>,
+) -> Result<bool> {
     let segments = selected.split('/').collect::<Vec<_>>();
     let mut directory = remote_root.to_string();
     let mut relative_directory = String::new();
@@ -332,7 +383,7 @@ fn collect_remote_path<R: StrictRemote + ?Sized>(
             matcher,
         )?;
         let Some(child) = children.into_iter().find(|child| child.name == *expected) else {
-            return Ok(());
+            return Ok(false);
         };
         let child_relative = join_relative(&relative_directory, &child.name);
         let is_selected = index + 1 == segments.len();
@@ -350,16 +401,16 @@ fn collect_remote_path<R: StrictRemote + ?Sized>(
                     entries,
                 )?;
             }
-            return Ok(());
+            return Ok(true);
         }
-        record_remote(entries, &child_relative, child.is_dir);
+        record_remote(implicit_ancestors, &child_relative, child.is_dir);
         if !child.is_dir {
-            return Ok(());
+            return Ok(false);
         }
         directory = remote_join(&directory, &child.name);
         relative_directory = child_relative;
     }
-    Ok(())
+    Ok(false)
 }
 
 fn collect_remote_children<R: StrictRemote + ?Sized>(
@@ -1068,22 +1119,19 @@ mod tests {
     }
 
     #[test]
-    fn retains_a_stale_state_only_exact_path() {
+    fn stale_state_only_exact_path_does_not_count_as_selected_presence() {
         let root = tempfile::tempdir().unwrap();
         let mut remote = FakeRemote::default().directory("/remote", vec![]);
 
-        let actual = inventory(
+        let error = inventory(
             &mut remote,
             root.path(),
             &state_with(&["gone.c"]),
             SyncScope::Path("gone.c".into()),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(
-            actual.entries,
-            BTreeMap::from([("gone.c".into(), presence(None, None, true))])
-        );
+        assert!(format!("{error:#}").contains("path not found locally or remotely"));
     }
 
     #[test]
@@ -1583,5 +1631,184 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("unsupported local entry type"));
+    }
+
+    #[test]
+    fn local_directory_prefix_does_not_make_a_missing_selected_leaf_exist() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("area")).unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("area/missing.c".into()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("path not found locally or remotely"));
+        assert_eq!(remote.listed, vec!["/remote"]);
+    }
+
+    #[test]
+    fn remote_directory_prefix_does_not_make_a_missing_selected_leaf_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote = FakeRemote::default()
+            .directory("/remote", vec![directory("area")])
+            .directory("/remote/area", vec![]);
+
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("area/missing.c".into()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("path not found locally or remotely"));
+        assert_eq!(remote.listed, vec!["/remote", "/remote/area"]);
+    }
+
+    #[test]
+    fn local_file_prefix_is_not_classified_as_the_missing_selected_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("area"), "ancestor bytes").unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("area/missing.c".into()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("path not found locally or remotely"));
+        assert_eq!(
+            std::fs::read(root.path().join("area")).unwrap(),
+            b"ancestor bytes"
+        );
+        assert_eq!(remote.size_calls, 0);
+    }
+
+    #[test]
+    fn remote_file_prefix_is_not_classified_as_the_missing_selected_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![file("area")]);
+
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("area/missing.c".into()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("path not found locally or remotely"));
+        assert_eq!(remote.listed, vec!["/remote"]);
+        assert_eq!(remote.size_calls, 0);
+    }
+
+    #[test]
+    fn ignored_selected_path_and_state_under_ignored_ancestor_leave_no_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("ignored")).unwrap();
+        std::fs::write(root.path().join("ignored/selected.c"), "ignored local").unwrap();
+        let mut remote = FakeRemote::default()
+            .directory("/remote", vec![directory("ignored")])
+            .directory("/remote/ignored", vec![file("selected.c")]);
+        let ignored = matcher(root.path(), &["ignored/"]);
+
+        let error = collect(
+            &mut remote,
+            root.path(),
+            "/remote",
+            &ignored,
+            &state_with(&["ignored/selected.c"]),
+            SyncScope::Path("ignored/selected.c".into()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("path not found locally or remotely"));
+        assert_eq!(remote.listed, vec!["/remote"]);
+        assert_eq!(remote.size_calls, 0);
+    }
+
+    #[test]
+    fn ignored_directory_name_near_miss_remains_selectable_without_ancestor_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("ignored-old")).unwrap();
+        std::fs::write(root.path().join("ignored-old/selected.c"), "kept").unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+        let ignored = matcher(root.path(), &["ignored/"]);
+
+        let actual = collect(
+            &mut remote,
+            root.path(),
+            "/remote",
+            &ignored,
+            &StateFile::default(),
+            SyncScope::Path("ignored-old/selected.c".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.entries,
+            BTreeMap::from([(
+                "ignored-old/selected.c".into(),
+                presence(Some(EntryKind::File), None, false),
+            )])
+        );
+    }
+
+    #[test]
+    fn remote_selected_leaf_with_local_file_prefix_keeps_only_the_leaf_entry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("area"), "local ancestor").unwrap();
+        let mut remote = FakeRemote::default()
+            .directory("/remote", vec![directory("area")])
+            .directory("/remote/area", vec![file("selected.c")]);
+
+        let actual = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("area/selected.c".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.entries,
+            BTreeMap::from([(
+                "area/selected.c".into(),
+                presence(None, Some(EntryKind::File), false),
+            )])
+        );
+    }
+
+    #[test]
+    fn local_selected_leaf_with_remote_file_prefix_keeps_only_the_leaf_entry() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("area")).unwrap();
+        std::fs::write(root.path().join("area/selected.c"), "local selected").unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![file("area")]);
+
+        let actual = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("area/selected.c".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.entries,
+            BTreeMap::from([(
+                "area/selected.c".into(),
+                presence(Some(EntryKind::File), None, false),
+            )])
+        );
+        assert_eq!(remote.size_calls, 0);
     }
 }

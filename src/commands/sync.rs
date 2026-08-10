@@ -116,26 +116,37 @@ fn type_conflict_prefixes(entries: &BTreeMap<String, inventory::InventoryEntry>)
     prefixes
 }
 
+fn type_conflict_issues(
+    entries: &BTreeMap<String, inventory::InventoryEntry>,
+    prefixes: &[String],
+) -> Vec<SyncIssue> {
+    prefixes
+        .iter()
+        .map(|prefix| {
+            let entry = entries
+                .get(prefix)
+                .expect("type-conflict prefix came from inventory");
+            let (Some(local), Some(remote)) = (entry.local, entry.remote) else {
+                unreachable!("type conflicts require entries on both sides");
+            };
+            SyncIssue::TypeConflict {
+                path: prefix.clone(),
+                local,
+                remote,
+            }
+        })
+        .collect()
+}
+
 fn classify_inventory_shapes(
     entries: BTreeMap<String, inventory::InventoryEntry>,
 ) -> (Vec<String>, SyncOutcome) {
     let conflict_prefixes = type_conflict_prefixes(&entries);
     let mut files = Vec::new();
-    let mut outcome = SyncOutcome::default();
-
-    for prefix in &conflict_prefixes {
-        let entry = entries
-            .get(prefix)
-            .expect("type-conflict prefix came from inventory");
-        let (Some(local), Some(remote)) = (entry.local, entry.remote) else {
-            unreachable!("type conflicts require entries on both sides");
-        };
-        outcome.issues.push(SyncIssue::TypeConflict {
-            path: prefix.clone(),
-            local,
-            remote,
-        });
-    }
+    let mut outcome = SyncOutcome {
+        issues: type_conflict_issues(&entries, &conflict_prefixes),
+        ..SyncOutcome::default()
+    };
 
     for (path, entry) in entries {
         if conflict_prefixes
@@ -402,8 +413,17 @@ where
     R: StrictRemote + RemoteFileRetrieval + RemoteWrite,
 {
     let inventory = inventory::collect(remote, local_root, remote_root, matcher, state, scope)?;
-    let entries = inventory.entries;
+    let ancestor_conflict_prefixes = type_conflict_prefixes(&inventory.implicit_ancestors);
+    let ancestor_conflicts =
+        type_conflict_issues(&inventory.implicit_ancestors, &ancestor_conflict_prefixes);
+    let mut entries = inventory.entries;
+    entries.retain(|path, _| {
+        !ancestor_conflict_prefixes
+            .iter()
+            .any(|prefix| is_at_or_below_conflict(path, prefix))
+    });
     let (file_paths, mut outcome) = classify_inventory_shapes(entries.clone());
+    outcome.issues.extend(ancestor_conflicts);
     let mut directories = capture_directory_snapshots(remote, local_root, remote_root, &entries)?;
     if execute_directory_plan(
         remote,
