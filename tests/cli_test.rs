@@ -1,6 +1,9 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 fn bin() -> Command {
@@ -24,6 +27,11 @@ enum FakeFtpScenario {
     TypeConflict,
     TypeConflictWithClean(Vec<u8>, Vec<u8>),
     FileConflict(Vec<u8>),
+    TwoFiles(Vec<u8>, Vec<u8>),
+    SharedDirectory {
+        current: Arc<AtomicBool>,
+        root_lists: Arc<AtomicUsize>,
+    },
     BareLegacy(Vec<u8>),
     HostileHashReply(HostileHashOperation),
 }
@@ -48,6 +56,24 @@ impl FakeFtpScenario {
                 "-rw-r--r-- 1 owner group {} Aug 10 12:00 conflict.c\r\n",
                 bytes.len()
             ),
+            (Self::TwoFiles(first, second), "/remote") => format!(
+                "-rw-r--r-- 1 owner group {} Aug 10 12:00 a.c\r\n-rw-r--r-- 1 owner group {} Aug 10 12:00 b.c\r\n",
+                first.len(),
+                second.len()
+            ),
+            (
+                Self::SharedDirectory {
+                    current,
+                    root_lists,
+                },
+                "/remote",
+            ) => {
+                if root_lists.fetch_add(1, Ordering::SeqCst) > 0 {
+                    current.store(false, Ordering::SeqCst);
+                }
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 shared\r\n".into()
+            }
+            (Self::SharedDirectory { .. }, "/remote/shared") => String::new(),
             (Self::BareLegacy(_), "/remote") => {
                 "drwxr-xr-x 1 owner group 0 Aug 10 12:00 legacy\r\n".into()
             }
@@ -66,6 +92,8 @@ impl FakeFtpScenario {
     fn file(&self, path: &str) -> Option<&[u8]> {
         match (self, path) {
             (Self::FileConflict(bytes), "/remote/conflict.c") => Some(bytes),
+            (Self::TwoFiles(first, _), "/remote/a.c") => Some(first),
+            (Self::TwoFiles(_, second), "/remote/b.c") => Some(second),
             (Self::BareLegacy(bytes), "/remote/legacy/nested.c") => Some(bytes),
             (Self::TypeConflictWithClean(clean, _), "/remote/clean.c") => Some(clean),
             (Self::TypeConflictWithClean(_, child), "/remote/type.c/child.c") => Some(child),
@@ -269,6 +297,92 @@ ignore = [".ferry.toml"]
     path
 }
 
+fn scoped_state_path(project: &std::path::Path) -> std::path::PathBuf {
+    project.join(ferry::names::STATE_DIR).join("state.json")
+}
+
+fn write_compact_scoped_state(
+    project: &std::path::Path,
+    state: &ferry::state::StateFile,
+) -> Vec<u8> {
+    let path = scoped_state_path(project);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = serde_json::to_vec(state).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+struct SequenceGate {
+    current: Mutex<VecDeque<bool>>,
+    claims: AtomicUsize,
+}
+
+impl SequenceGate {
+    fn new(current: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            current: Mutex::new(current.into_iter().collect()),
+            claims: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ferry::commands::sync::CommitGate for SequenceGate {
+    fn is_current(&self) -> bool {
+        self.current.lock().unwrap().pop_front().unwrap_or(false)
+    }
+
+    fn commit(
+        &self,
+        mutation: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<ferry::commands::sync::CommitDecision> {
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        mutation()?;
+        Ok(ferry::commands::sync::CommitDecision::Committed)
+    }
+}
+
+struct ErrorOnSecondClaim {
+    claims: AtomicUsize,
+}
+
+impl ferry::commands::sync::CommitGate for ErrorOnSecondClaim {
+    fn is_current(&self) -> bool {
+        true
+    }
+
+    fn commit(
+        &self,
+        mutation: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<ferry::commands::sync::CommitDecision> {
+        if self.claims.fetch_add(1, Ordering::SeqCst) == 1 {
+            anyhow::bail!("injected second claim failure");
+        }
+        mutation()?;
+        Ok(ferry::commands::sync::CommitDecision::Committed)
+    }
+}
+
+struct LiveGate {
+    current: Arc<AtomicBool>,
+}
+
+impl ferry::commands::sync::CommitGate for LiveGate {
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::SeqCst)
+    }
+
+    fn commit(
+        &self,
+        mutation: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<ferry::commands::sync::CommitDecision> {
+        if !self.is_current() {
+            return Ok(ferry::commands::sync::CommitDecision::Cancelled);
+        }
+        mutation()?;
+        Ok(ferry::commands::sync::CommitDecision::Committed)
+    }
+}
+
 #[test]
 fn sync_cli_executes_bare_legacy_sync_and_rejects_invalid_scope_combinations() {
     let bytes = b"from legacy remote".to_vec();
@@ -341,6 +455,146 @@ fn scoped_sync_missing_path_is_exact_and_creates_no_state() {
 }
 
 #[test]
+fn scoped_sync_empty_root_noop_creates_no_state() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", ".", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join(ferry::names::STATE_DIR).exists(),
+        "empty zero-commit sync must not create state"
+    );
+}
+
+#[test]
+fn scoped_sync_public_cancellation_before_first_claim_creates_no_state() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::TwoFiles(
+        b"first remote".to_vec(),
+        b"second remote".to_vec(),
+    ));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let gate = SequenceGate::new([false]);
+
+    let outcome = ferry::commands::sync::run_scoped(
+        &config,
+        ferry::commands::sync::scope::SyncScope::RootDirectory,
+        false,
+        ferry::commands::ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert_eq!(gate.claims.load(Ordering::SeqCst), 0);
+    assert!(!project.path().join("a.c").exists());
+    assert!(!project.path().join("b.c").exists());
+    assert!(!project.path().join(ferry::names::STATE_DIR).exists());
+}
+
+#[test]
+fn scoped_sync_public_final_validation_cancellation_creates_no_state() {
+    let current = Arc::new(AtomicBool::new(true));
+    let root_lists = Arc::new(AtomicUsize::new(0));
+    let server = FakeFtpServer::spawn(FakeFtpScenario::SharedDirectory {
+        current: Arc::clone(&current),
+        root_lists: Arc::clone(&root_lists),
+    });
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("shared")).unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let gate = LiveGate { current };
+
+    let outcome = ferry::commands::sync::run_scoped(
+        &config,
+        ferry::commands::sync::scope::SyncScope::RootDirectory,
+        false,
+        ferry::commands::ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert!(outcome.issues.is_empty());
+    assert_eq!(root_lists.load(Ordering::SeqCst), 2);
+    assert!(!project.path().join(ferry::names::STATE_DIR).exists());
+}
+
+#[test]
+fn scoped_sync_public_partial_cancellation_saves_first_commit() {
+    let first = b"first remote".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::TwoFiles(
+        first.clone(),
+        b"second remote".to_vec(),
+    ));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let gate = SequenceGate::new([true, true, false]);
+
+    let outcome = ferry::commands::sync::run_scoped(
+        &config,
+        ferry::commands::sync::scope::SyncScope::RootDirectory,
+        false,
+        ferry::commands::ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(project.path().join("a.c")).unwrap(), first);
+    assert!(!project.path().join("b.c").exists());
+    let state =
+        ferry::state::StateFile::load_or_default(&scoped_state_path(project.path())).unwrap();
+    assert!(state.files.contains_key("a.c"));
+    assert!(!state.files.contains_key("b.c"));
+}
+
+#[test]
+fn scoped_sync_public_partial_error_saves_first_commit() {
+    let first = b"first remote".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::TwoFiles(
+        first.clone(),
+        b"second remote".to_vec(),
+    ));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let gate = ErrorOnSecondClaim {
+        claims: AtomicUsize::new(0),
+    };
+
+    let error = ferry::commands::sync::run_scoped(
+        &config,
+        ferry::commands::sync::scope::SyncScope::RootDirectory,
+        false,
+        ferry::commands::ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("injected second claim failure"));
+    assert_eq!(gate.claims.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(project.path().join("a.c")).unwrap(), first);
+    assert!(!project.path().join("b.c").exists());
+    let state =
+        ferry::state::StateFile::load_or_default(&scoped_state_path(project.path())).unwrap();
+    assert!(state.files.contains_key("a.c"));
+    assert!(!state.files.contains_key("b.c"));
+}
+
+#[test]
 fn scoped_sync_type_conflict_exits_one() {
     let server = FakeFtpServer::spawn(FakeFtpScenario::TypeConflict);
     let project = tempfile::tempdir().unwrap();
@@ -359,6 +613,10 @@ fn scoped_sync_type_conflict_exits_one() {
     assert_eq!(
         std::fs::read(project.path().join("type.c")).unwrap(),
         b"local file"
+    );
+    assert!(
+        !project.path().join(ferry::names::STATE_DIR).exists(),
+        "type-only conflict must not create state"
     );
 }
 
@@ -449,6 +707,122 @@ fn scoped_sync_file_conflict_exits_two() {
 }
 
 #[test]
+fn scoped_sync_untracked_conflict_does_not_persist_capability_probe() {
+    let remote_bytes = b"remote bytes".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::FileConflict(remote_bytes));
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("conflict.c"), b"local bytes").unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", "conflict.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        !project.path().join(ferry::names::STATE_DIR).exists(),
+        "capability-only probe must not create state"
+    );
+}
+
+#[test]
+fn scoped_sync_unchanged_file_does_not_rewrite_state_or_capability() {
+    let bytes = b"same bytes".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::FileConflict(bytes.clone()));
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("conflict.c"), &bytes).unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        "conflict.c".into(),
+        ferry::state::FileRecord {
+            sha256: ferry::hash::hash_bytes(&bytes),
+            size: bytes.len() as u64,
+            remote_mtime: "2026-08-10T12:00:00Z".parse().unwrap(),
+            last_synced: "2026-08-10T12:01:00Z".parse().unwrap(),
+        },
+    );
+    let before = write_compact_scoped_state(project.path(), &state);
+
+    let output = bin()
+        .args(["sync", "conflict.c", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(scoped_state_path(project.path())).unwrap(),
+        before
+    );
+    let after =
+        ferry::state::StateFile::load_or_default(&scoped_state_path(project.path())).unwrap();
+    assert_eq!(after.server_supports_mdtm, None);
+}
+
+#[test]
+fn scoped_sync_stale_state_only_noop_does_not_rewrite_state() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        "stale.c".into(),
+        ferry::state::FileRecord {
+            sha256: ferry::hash::hash_bytes(b"stale"),
+            size: 5,
+            remote_mtime: "2026-08-10T12:00:00Z".parse().unwrap(),
+            last_synced: "2026-08-10T12:01:00Z".parse().unwrap(),
+        },
+    );
+    let before = write_compact_scoped_state(project.path(), &state);
+
+    let output = bin()
+        .args(["sync", ".", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(scoped_state_path(project.path())).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn scoped_sync_dry_run_does_not_create_state_or_local_file() {
+    let remote_bytes = b"dry remote".to_vec();
+    let server = FakeFtpServer::spawn(FakeFtpScenario::FileConflict(remote_bytes));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+
+    let output = bin()
+        .args(["sync", "conflict.c", "--dry-run", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!project.path().join("conflict.c").exists());
+    assert!(!project.path().join(ferry::names::STATE_DIR).exists());
+}
+
+#[test]
 fn scoped_sync_hostile_hash_replies_are_not_rendered() {
     for operation in [
         HostileHashOperation::Mdtm,
@@ -485,6 +859,10 @@ fn scoped_sync_hostile_hash_replies_are_not_rendered() {
         if operation == HostileHashOperation::Retr {
             assert_eq!(output.status.code(), Some(1), "rendered={rendered:?}");
             assert!(rendered.contains("ftp scoped download /remote/hostile.c"));
+            assert!(
+                !project.path().join(ferry::names::STATE_DIR).exists(),
+                "zero-commit retrieval error must not create state"
+            );
         } else {
             assert!(output.status.success(), "rendered={rendered:?}");
         }

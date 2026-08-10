@@ -17,7 +17,7 @@
 //! user says "just sync it already," last-write-wins from the local side
 //! since that's the side the user is actively editing.
 
-use self::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
+pub use self::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use self::scope::SyncScope;
 use crate::commands::file_transfer::{RemoteDestinationSnapshot, RemoteWrite};
 use crate::commands::pull::{ExpectedLocalDestination, download_one, download_one_guarded};
@@ -345,7 +345,7 @@ pub fn run_scoped(
         mode,
         gate,
     );
-    let should_save = execution.is_ok() || state.files != initial_files;
+    let should_save = state.files != initial_files;
     let save = if mode.should_apply() && should_save {
         state.save(&state_path)
     } else {
