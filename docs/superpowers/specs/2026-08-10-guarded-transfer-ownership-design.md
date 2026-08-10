@@ -28,6 +28,10 @@ candidate to be strictly absent; an occupied candidate is discarded, and only
 a fresh candidate is uploaded. The candidate source is injectable in tests so
 collision and retry behavior is deterministic.
 
+The historical `TARGET.tmp.zedftp` name is not part of this reserved grammar.
+It remains ordinary user-visible content and is not broadly hidden by scoped
+inventory; operators may remove known stale historical temps manually.
+
 Scoped inventory reserves only the exact protocol grammar above. Local and
 remote scoped traversal skip an exact match, including a crash-stale temp, but
 ordinary near-miss names remain user content. This does not change Matcher
@@ -41,6 +45,10 @@ file type, size, modification time, and content hash. Inside the final
 Cleanup removes the path only while its identity is still the file this
 transfer created.
 
+Capturing local file identity is the point at which cleanup ownership becomes
+proven. If identity capture fails after exclusive creation, Ferry closes the
+descriptor and returns the error but does not unlink the now-unproven pathname.
+
 After remote staging, Ferry captures a strict temp snapshot containing size,
 modification time, and content hash. Inside the claim, it strictly re-snapshots
 the temp and requires exact equality immediately before rename. Cleanup first
@@ -52,6 +60,13 @@ only when that snapshot proves a regular file with the intended size and hash;
 the server-provided modification time is captured only after that match. A
 successful first snapshot that has the wrong type or payload is not owned and
 is never removed.
+
+The strict snapshot remains the ownership record even when its LIST timestamp
+is coarse. After ownership is established, Ferry obtains the temp's exact MDTM
+through the sanitized scoped adapter. MDTM failure cleans only through exact
+strict-snapshot equality. Inside the commit claim, Ferry revalidates both the
+full strict snapshot and exact MDTM before rename. State records that exact
+MDTM, and no snapshot or MDTM probe occurs after rename.
 
 Destination and source checks stay in the claim. Successful rename is followed
 immediately by state insertion; upload computes `last_synced` at that point.
@@ -71,7 +86,8 @@ Strict LIST and MKD retain their existing sanitized behavior.
 ## Verification
 
 Tests cover exact and near-miss inventory names, local and remote temp
-mutation/replacement, interleaved writers and cleanup ownership, rename/state
-ordering, upload timestamp placement, and attacker-controlled FTP replies.
+mutation/replacement, local identity-capture failure, interleaved writers,
+cleanup ownership, coarse LIST versus exact MDTM, rename/state ordering, upload
+timestamp placement, and attacker-controlled FTP replies.
 Formatting, focused suites, strict Clippy, the full test suite, diff checks,
 and artifact checks are required before completion.
