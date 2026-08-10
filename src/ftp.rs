@@ -38,6 +38,10 @@ pub trait Remote {
     }
 }
 
+pub trait StrictRemote: Remote {
+    fn list_dir_strict(&mut self, dir: &str) -> Result<Vec<Entry>>;
+}
+
 impl Remote for Ftp {
     fn list_dir(&mut self, dir: &str) -> Result<Vec<Entry>> {
         self.list(dir)
@@ -47,6 +51,12 @@ impl Remote for Ftp {
     }
     fn exact_file_presence(&mut self, path: &str) -> Result<ExactFilePresence> {
         self.exact_file_presence(path)
+    }
+}
+
+impl StrictRemote for Ftp {
+    fn list_dir_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list_strict(dir)
     }
 }
 
@@ -74,18 +84,16 @@ impl Ftp {
             .inner
             .list(Some(dir))
             .with_context(|| format!("ftp list {dir}"))?;
-        Ok(lines
-            .iter()
-            .filter_map(|line| {
-                let f = suppaftp::list::File::from_posix_line(line).ok()?;
-                Some(Entry {
-                    name: f.name().to_string(),
-                    is_dir: f.is_directory(),
-                    size: u64::try_from(f.size()).unwrap_or(0),
-                    modified: DateTime::<Utc>::from(f.modified()),
-                })
-            })
-            .collect())
+        Ok(parse_listing_tolerant(&lines))
+    }
+
+    pub fn list_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        let lines = self
+            .inner
+            .list(Some(dir))
+            .with_context(|| format!("ftp list {}", sanitize_for_message(dir)))?;
+
+        parse_listing_strict(dir, &lines)
     }
 
     /// Probe exactly one remote pathname through `NLST`. Unlike [`Self::list`]
@@ -99,6 +107,46 @@ impl Ftp {
             .with_context(|| format!("ftp nlst {path}"))?;
         exact_nlst_presence(path, &lines)
     }
+}
+
+fn parse_listing_tolerant(lines: &[String]) -> Vec<Entry> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let file = suppaftp::list::File::from_posix_line(line).ok()?;
+            Some(entry_from_posix_file(&file))
+        })
+        .collect()
+}
+
+fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let file = suppaftp::list::File::from_posix_line(line).map_err(|_| {
+            anyhow::anyhow!(
+                "ftp list {}: malformed record {index}",
+                sanitize_for_message(dir)
+            )
+        })?;
+        entries.push(entry_from_posix_file(&file));
+    }
+    Ok(entries)
+}
+
+fn entry_from_posix_file(file: &suppaftp::list::File) -> Entry {
+    Entry {
+        name: file.name().to_string(),
+        is_dir: file.is_directory(),
+        size: u64::try_from(file.size()).unwrap_or(0),
+        modified: DateTime::<Utc>::from(file.modified()),
+    }
+}
+
+fn sanitize_for_message(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 fn exact_nlst_presence(path: &str, lines: &[String]) -> Result<ExactFilePresence> {
@@ -217,7 +265,68 @@ impl Ftp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExactFilePresence, exact_nlst_presence};
+    use super::{
+        ExactFilePresence, exact_nlst_presence, parse_listing_strict, parse_listing_tolerant,
+    };
+
+    const VALID_POSIX_FILE: &str = "-rw-r--r-- 1 owner group 42 Jan 1 2000 file.txt";
+    const VALID_POSIX_DIRECTORY: &str = "drwxr-xr-x 2 owner group 4096 Jan 1 2000 subdir";
+
+    #[test]
+    fn strict_listing_rejects_one_malformed_line_among_valid_entries() {
+        let lines = vec![
+            VALID_POSIX_FILE.to_string(),
+            "\u{1b}[31mmalformed".to_string(),
+            VALID_POSIX_DIRECTORY.to_string(),
+        ];
+
+        let error = parse_listing_strict("/root", &lines).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ftp list /root"));
+        assert!(message.contains("record 1"));
+        assert!(!message.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn strict_listing_accounts_for_blank_dot_and_dotdot_records() {
+        let lines = vec![
+            String::new(),
+            " \t".to_string(),
+            "drwxr-xr-x 2 owner group 4096 Jan 1 2000 .".to_string(),
+            "drwxr-xr-x 2 owner group 4096 Jan 1 2000 ..".to_string(),
+            VALID_POSIX_FILE.to_string(),
+        ];
+
+        let entries = parse_listing_strict("/root", &lines).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![".", "..", "file.txt"]
+        );
+    }
+
+    #[test]
+    fn tolerant_listing_drops_malformed_records_for_legacy_callers() {
+        let lines = vec![
+            VALID_POSIX_FILE.to_string(),
+            "\u{1b}[31mmalformed".to_string(),
+            VALID_POSIX_DIRECTORY.to_string(),
+        ];
+
+        let entries = parse_listing_tolerant(&lines);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file.txt", "subdir"]
+        );
+    }
 
     #[test]
     fn exact_nlst_recognizes_a_hidden_requested_name() {
