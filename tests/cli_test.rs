@@ -7,6 +7,17 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ferry"))
 }
 
+const HOSTILE_FILE_BYTES: &[u8] = b"hostile remote bytes";
+const HOSTILE_REPLY_MARKER: &str = "ATTACKER_MARKER";
+const HOSTILE_REPLY_SECOND_LINE: &str = "attacker-second-line";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostileHashOperation {
+    Mdtm,
+    Size,
+    Retr,
+}
+
 #[derive(Clone)]
 enum FakeFtpScenario {
     Missing,
@@ -14,6 +25,7 @@ enum FakeFtpScenario {
     TypeConflictWithClean(Vec<u8>, Vec<u8>),
     FileConflict(Vec<u8>),
     BareLegacy(Vec<u8>),
+    HostileHashReply(HostileHashOperation),
 }
 
 impl FakeFtpScenario {
@@ -43,6 +55,10 @@ impl FakeFtpScenario {
                 "-rw-r--r-- 1 owner group {} Aug 10 12:00 nested.c\r\n",
                 bytes.len()
             ),
+            (Self::HostileHashReply(_), "/remote") => format!(
+                "-rw-r--r-- 1 owner group {} Aug 10 12:00 hostile.c\r\n",
+                HOSTILE_FILE_BYTES.len()
+            ),
             _ => String::new(),
         }
     }
@@ -53,6 +69,7 @@ impl FakeFtpScenario {
             (Self::BareLegacy(bytes), "/remote/legacy/nested.c") => Some(bytes),
             (Self::TypeConflictWithClean(clean, _), "/remote/clean.c") => Some(clean),
             (Self::TypeConflictWithClean(_, child), "/remote/type.c/child.c") => Some(child),
+            (Self::HostileHashReply(_), "/remote/hostile.c") => Some(HOSTILE_FILE_BYTES),
             _ => None,
         }
     }
@@ -76,9 +93,19 @@ impl FakeFtpServer {
 
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    break;
-                }
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("reading fake FTP command: {error}"),
+                };
                 let command = line.trim_end_matches(['\r', '\n']);
                 let verb = command
                     .split_ascii_whitespace()
@@ -125,14 +152,28 @@ impl FakeFtpServer {
                         );
                     }
                     "MDTM" => {
-                        if scenario.file(command.split_once(' ').unwrap().1).is_some() {
+                        let path = command.split_once(' ').unwrap().1;
+                        if matches!(
+                            scenario,
+                            FakeFtpScenario::HostileHashReply(HostileHashOperation::Mdtm)
+                        ) && path == "/remote/hostile.c"
+                        {
+                            write_hostile_control(&mut control);
+                        } else if scenario.file(path).is_some() {
                             write_control(&mut control, "213 20260810120000");
                         } else {
                             write_control(&mut control, "550 Missing");
                         }
                     }
                     "SIZE" => {
-                        if let Some(bytes) = scenario.file(command.split_once(' ').unwrap().1) {
+                        let path = command.split_once(' ').unwrap().1;
+                        if matches!(
+                            scenario,
+                            FakeFtpScenario::HostileHashReply(HostileHashOperation::Size)
+                        ) && path == "/remote/hostile.c"
+                        {
+                            write_hostile_control(&mut control);
+                        } else if let Some(bytes) = scenario.file(path) {
                             write_control(&mut control, &format!("213 {}", bytes.len()));
                         } else {
                             write_control(&mut control, "550 Missing");
@@ -140,11 +181,24 @@ impl FakeFtpServer {
                     }
                     "RETR" => {
                         let path = command.split_once(' ').unwrap().1;
-                        transfer_data(
-                            &mut control,
-                            data_listener.take().expect("RETR after passive command"),
-                            scenario.file(path).expect("known RETR path"),
-                        );
+                        if matches!(
+                            scenario,
+                            FakeFtpScenario::HostileHashReply(HostileHashOperation::Retr)
+                        ) && path == "/remote/hostile.c"
+                        {
+                            let listener =
+                                data_listener.take().expect("RETR after passive command");
+                            let (data, _) = listener.accept().unwrap();
+                            drop(data);
+                            drop(listener);
+                            write_hostile_control(&mut control);
+                        } else {
+                            transfer_data(
+                                &mut control,
+                                data_listener.take().expect("RETR after passive command"),
+                                scenario.file(path).expect("known RETR path"),
+                            );
+                        }
                     }
                     "QUIT" => {
                         write_control(&mut control, "221 Goodbye");
@@ -171,6 +225,15 @@ impl Drop for FakeFtpServer {
 
 fn write_control(stream: &mut TcpStream, line: &str) {
     write!(stream, "{line}\r\n").unwrap();
+    stream.flush().unwrap();
+}
+
+fn write_hostile_control(stream: &mut TcpStream) {
+    write!(
+        stream,
+        "550-\x1b[31m{HOSTILE_REPLY_MARKER}\r\n550 {HOSTILE_REPLY_SECOND_LINE}\r\n"
+    )
+    .unwrap();
     stream.flush().unwrap();
 }
 
@@ -383,6 +446,49 @@ fn scoped_sync_file_conflict_exits_two() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("conflict"), "stderr={stderr}");
+}
+
+#[test]
+fn scoped_sync_hostile_hash_replies_are_not_rendered() {
+    for operation in [
+        HostileHashOperation::Mdtm,
+        HostileHashOperation::Size,
+        HostileHashOperation::Retr,
+    ] {
+        let server = FakeFtpServer::spawn(FakeFtpScenario::HostileHashReply(operation));
+        let project = tempfile::tempdir().unwrap();
+        let config = scoped_config(project.path(), server.port);
+
+        let output = bin()
+            .args(["sync", "hostile.c", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !rendered.contains(HOSTILE_REPLY_MARKER),
+            "operation={operation:?}, rendered={rendered:?}"
+        );
+        assert!(
+            !rendered.contains(HOSTILE_REPLY_SECOND_LINE),
+            "operation={operation:?}, rendered={rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "operation={operation:?}, rendered={rendered:?}"
+        );
+        if operation == HostileHashOperation::Retr {
+            assert_eq!(output.status.code(), Some(1), "rendered={rendered:?}");
+            assert!(rendered.contains("ftp scoped download /remote/hostile.c"));
+        } else {
+            assert!(output.status.success(), "rendered={rendered:?}");
+        }
+    }
 }
 
 #[test]

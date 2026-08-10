@@ -28,7 +28,7 @@ use crate::commands::remote_hash::{self, RemoteFileRetrieval, RemoteHash};
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
-use crate::ftp::{Ftp, StrictRemote};
+use crate::ftp::{Entry, Ftp, Remote, StrictRemote};
 use crate::hash::{hash_bytes, hash_file};
 use crate::ignored::Matcher;
 use crate::state::{FileState, StateFile, classify};
@@ -235,6 +235,79 @@ enum PreparedOperation {
     },
 }
 
+/// Scoped sync transport adapter.
+///
+/// The legacy route intentionally keeps its historical `Ftp` implementations.
+/// Scoped sync instead delegates every reachable FTP operation to a strict,
+/// source-dropping method so hostile server replies cannot become user output.
+struct ScopedFtp<'a> {
+    inner: &'a mut Ftp,
+}
+
+impl Remote for ScopedFtp<'_> {
+    fn list_dir(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.inner.list_strict(dir)
+    }
+
+    fn file_size(&mut self, path: &str) -> Result<u64> {
+        self.inner.size_scoped(path)
+    }
+}
+
+impl StrictRemote for ScopedFtp<'_> {
+    fn list_dir_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.inner.list_strict(dir)
+    }
+}
+
+impl RemoteFileRetrieval for ScopedFtp<'_> {
+    fn mtime(&mut self, remote_path: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+        self.inner.mtime_scoped(remote_path)
+    }
+
+    fn size(&mut self, remote_path: &str) -> Result<u64> {
+        self.inner.size_scoped(remote_path)
+    }
+
+    fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
+        self.inner.download_scoped(remote_path)
+    }
+}
+
+impl RemoteWrite for ScopedFtp<'_> {
+    fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.upload_bytes_scoped(path, bytes)
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.inner.rename_scoped(from, to)
+    }
+
+    fn rm(&mut self, path: &str) -> Result<()> {
+        self.inner.rm_scoped(path)
+    }
+
+    fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.inner.mkdir_scoped_strict(path)
+    }
+
+    fn mkdir_scoped_strict(&mut self, path: &str) -> Result<()> {
+        self.inner.mkdir_scoped_strict(path)
+    }
+
+    fn mtime(&mut self, path: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+        self.inner.mtime_scoped(path)
+    }
+
+    fn destination_snapshot(
+        &mut self,
+        remote_root: &str,
+        path: &str,
+    ) -> Result<RemoteDestinationSnapshot> {
+        <Ftp as RemoteWrite>::destination_snapshot(self.inner, remote_root, path)
+    }
+}
+
 pub fn run_scoped(
     config_path: &Path,
     scope: SyncScope,
@@ -252,13 +325,14 @@ pub fn run_scoped(
     let mut state = StateFile::load_or_default(&state_path)?;
     let initial_files = state.files.clone();
     let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
-    let mut remote = Ftp::connect(
+    let mut ftp = Ftp::connect(
         &cfg.connection.host,
         cfg.connection.port,
         &cfg.connection.user,
         &cfg.connection.password,
         cfg.connection.passive,
     )?;
+    let mut remote = ScopedFtp { inner: &mut ftp };
 
     let execution = run_scoped_with(
         &mut remote,

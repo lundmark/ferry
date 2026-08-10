@@ -145,6 +145,13 @@ fn scoped_mtime_transport_error(path: &str, _error: suppaftp::FtpError) -> anyho
     )
 }
 
+fn scoped_size_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped size {}: remote metadata read failed",
+        sanitize_for_message(path)
+    )
+}
+
 fn scoped_rename_transport_error(
     from: &str,
     to: &str,
@@ -278,6 +285,14 @@ impl Ftp {
         Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
     }
 
+    pub(crate) fn size_scoped(&mut self, remote_path: &str) -> Result<u64> {
+        let size = self
+            .inner
+            .size(remote_path)
+            .map_err(|error| scoped_size_transport_error(remote_path, error))?;
+        Ok(size as u64)
+    }
+
     pub(crate) fn rename_scoped(&mut self, from: &str, to: &str) -> Result<()> {
         self.inner
             .rename(from, to)
@@ -381,8 +396,8 @@ mod tests {
     use super::{
         ExactFilePresence, exact_nlst_presence, parse_listing_strict, parse_listing_tolerant,
         scoped_download_transport_error, scoped_mtime_transport_error,
-        scoped_rename_transport_error, scoped_rm_transport_error, scoped_upload_transport_error,
-        strict_list_transport_error, strict_mkdir_transport_error,
+        scoped_rename_transport_error, scoped_rm_transport_error, scoped_size_transport_error,
+        scoped_upload_transport_error, strict_list_transport_error, strict_mkdir_transport_error,
     };
 
     const VALID_POSIX_FILE: &str = "-rw-r--r-- 1 owner group 42 Jan 1 2000 file.txt";
@@ -438,6 +453,7 @@ mod tests {
             scoped_download_transport_error("/root/unsafe\nname", attacker_reply()),
             scoped_upload_transport_error("/root/unsafe\nname", attacker_reply()),
             scoped_mtime_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_size_transport_error("/root/unsafe\nname", attacker_reply()),
             scoped_rename_transport_error("/root/from\nname", "/root/to\nname", attacker_reply()),
             scoped_rm_transport_error("/root/unsafe\nname", attacker_reply()),
         ];
