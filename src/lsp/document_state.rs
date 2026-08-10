@@ -10,9 +10,16 @@ use std::sync::{Arc, Weak};
 
 use anyhow::{Context, ensure};
 
+use crate::commands::sync::{CommitDecision, CommitGate};
+
 const PENDING: u8 = 0;
 const CANCELLED: u8 = 1;
 const CLAIMED: u8 = 2;
+
+const ACTIVE: u8 = 0;
+const COMMITTING: u8 = 1;
+const INVALIDATED: u8 = 2;
+const INVALIDATED_DURING_COMMIT: u8 = COMMITTING | INVALIDATED;
 
 #[derive(Clone)]
 pub(crate) struct OperationGuard {
@@ -35,6 +42,74 @@ impl OperationGuard {
         let _ =
             self.state
                 .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DocumentScope {
+    Exact(PathBuf),
+    Directory(PathBuf),
+}
+
+impl DocumentScope {
+    fn contains(&self, path: &Path) -> bool {
+        match self {
+            Self::Exact(exact) => path == exact,
+            Self::Directory(directory) => path.starts_with(directory),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ScopeOperationGuard {
+    state: Arc<AtomicU8>,
+}
+
+struct ScopeCommitClaim {
+    state: Arc<AtomicU8>,
+}
+
+impl Drop for ScopeCommitClaim {
+    fn drop(&mut self) {
+        match self
+            .state
+            .compare_exchange(COMMITTING, ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(INVALIDATED_DURING_COMMIT) => {
+                self.state.store(INVALIDATED, Ordering::Release);
+            }
+            Err(current) => {
+                debug_assert_eq!(current, INVALIDATED);
+            }
+        }
+    }
+}
+
+impl CommitGate for ScopeOperationGuard {
+    fn is_current(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ACTIVE
+    }
+
+    fn commit(
+        &self,
+        mutation: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<CommitDecision> {
+        if self
+            .state
+            .compare_exchange(ACTIVE, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(CommitDecision::Cancelled);
+        }
+
+        let claim = ScopeCommitClaim {
+            state: Arc::clone(&self.state),
+        };
+        let result = mutation();
+        drop(claim);
+        result?;
+        Ok(CommitDecision::Committed)
     }
 }
 
@@ -63,9 +138,15 @@ impl fmt::Display for DocumentStateError {
 
 impl Error for DocumentStateError {}
 
+struct ScopeRegistration {
+    scope: DocumentScope,
+    state: Weak<AtomicU8>,
+}
+
 #[derive(Default)]
 pub(crate) struct DocumentTracker {
     entries: HashMap<PathBuf, DocumentEntry>,
+    scopes: Vec<ScopeRegistration>,
 }
 
 struct DocumentEntry {
@@ -94,7 +175,42 @@ impl DocumentEntry {
 }
 
 impl DocumentTracker {
+    fn prune_scope_registrations(&mut self) {
+        self.scopes.retain(|registration| {
+            registration
+                .state
+                .upgrade()
+                .is_some_and(|state| state.load(Ordering::Acquire) & INVALIDATED == 0)
+        });
+    }
+
+    fn invalidate_matching_scopes(&mut self, path: &Path) {
+        self.scopes.retain(|registration| {
+            let Some(state) = registration.state.upgrade() else {
+                return false;
+            };
+            if state.load(Ordering::Acquire) & INVALIDATED != 0 {
+                return false;
+            }
+            if registration.scope.contains(path) {
+                state.fetch_or(INVALIDATED, Ordering::AcqRel);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn invalidate_all_scopes(&mut self) {
+        for registration in self.scopes.drain(..) {
+            if let Some(state) = registration.state.upgrade() {
+                state.fetch_or(INVALIDATED, Ordering::AcqRel);
+            }
+        }
+    }
+
     pub(crate) fn open(&mut self, path: PathBuf, text: &str) -> anyhow::Result<()> {
+        self.invalidate_matching_scopes(&path);
         let metadata = fs::metadata(&path)
             .with_context(|| format!("failed to inspect document {}", path.display()))?;
         ensure!(
@@ -118,6 +234,7 @@ impl DocumentTracker {
     }
 
     pub(crate) fn change(&mut self, path: &Path) {
+        self.invalidate_matching_scopes(path);
         if let Some(entry) = self.entries.get_mut(path) {
             entry.revision += 1;
             entry.dirty = true;
@@ -126,6 +243,7 @@ impl DocumentTracker {
     }
 
     pub(crate) fn save(&mut self, path: &Path) {
+        self.invalidate_matching_scopes(path);
         if let Some(entry) = self.entries.get_mut(path) {
             entry.revision += 1;
             entry.dirty = false;
@@ -134,6 +252,7 @@ impl DocumentTracker {
     }
 
     pub(crate) fn close(&mut self, path: &Path) {
+        self.invalidate_matching_scopes(path);
         if let Some(mut entry) = self.entries.remove(path) {
             entry.cancel_pending_guards();
         }
@@ -143,6 +262,28 @@ impl DocumentTracker {
         for entry in self.entries.values_mut() {
             entry.cancel_pending_guards();
         }
+        self.invalidate_all_scopes();
+    }
+
+    pub(crate) fn begin_clean_scope(
+        &mut self,
+        scope: DocumentScope,
+    ) -> Result<ScopeOperationGuard, DocumentStateError> {
+        self.prune_scope_registrations();
+        if let Some(path) = self
+            .entries
+            .iter()
+            .find_map(|(path, entry)| (entry.dirty && scope.contains(path)).then(|| path.clone()))
+        {
+            return Err(DocumentStateError::Dirty { path });
+        }
+
+        let state = Arc::new(AtomicU8::new(ACTIVE));
+        self.scopes.push(ScopeRegistration {
+            scope,
+            state: Arc::downgrade(&state),
+        });
+        Ok(ScopeOperationGuard { state })
     }
 
     pub(crate) fn begin_clean_operation(
@@ -181,11 +322,18 @@ impl Drop for DocumentTracker {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
-    use super::{CANCELLED, CLAIMED, DocumentStateError, DocumentTracker};
+    use crate::commands::sync::{CommitDecision, CommitGate};
+
+    use super::{
+        CANCELLED, CLAIMED, DocumentScope, DocumentStateError, DocumentTracker, ScopeOperationGuard,
+    };
 
     fn write_file(directory: &Path, name: &str, contents: &[u8]) -> PathBuf {
         let path = directory.join(name);
@@ -447,5 +595,262 @@ mod tests {
 
         assert!(!old_guard.try_claim());
         assert_dirty(tracker.begin_clean_operation(&path), &path);
+    }
+
+    fn assert_scope_dirty(result: Result<ScopeOperationGuard, DocumentStateError>, path: &Path) {
+        assert!(matches!(
+            result,
+            Err(DocumentStateError::Dirty { path: error_path }) if error_path == path
+        ));
+    }
+
+    #[test]
+    fn scope_exact_and_directory_reject_dirty_documents_on_segment_boundaries() {
+        let root = tempdir().unwrap();
+        let area = root.path().join("area");
+        let area_old = root.path().join("area-old");
+        fs::create_dir(&area).unwrap();
+        fs::create_dir(&area_old).unwrap();
+        let exact = write_file(&area, "exact.c", b"disk");
+        let nested = write_file(&area, "nested.c", b"disk");
+        let near = write_file(&area_old, "near.c", b"disk");
+        let mut tracker = DocumentTracker::default();
+        tracker.open(exact.clone(), "editor").unwrap();
+
+        assert_scope_dirty(
+            tracker.begin_clean_scope(DocumentScope::Exact(exact.clone())),
+            &exact,
+        );
+        tracker.save(&exact);
+        tracker.open(nested.clone(), "editor").unwrap();
+        assert_scope_dirty(
+            tracker.begin_clean_scope(DocumentScope::Directory(area.clone())),
+            &nested,
+        );
+
+        tracker.save(&nested);
+        tracker.open(near.clone(), "editor").unwrap();
+        let guard = tracker
+            .begin_clean_scope(DocumentScope::Directory(area))
+            .unwrap();
+        assert!(guard.is_current());
+    }
+
+    #[test]
+    fn scope_matching_lifecycle_events_invalidate_but_outside_events_do_not() {
+        let root = tempdir().unwrap();
+        let area = root.path().join("area");
+        let outside = root.path().join("outside");
+        fs::create_dir(&area).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let inside = write_file(&area, "inside.c", b"inside");
+        let outside_file = write_file(&outside, "outside.c", b"outside");
+
+        for event in ["open", "change", "save", "close"] {
+            let mut tracker = DocumentTracker::default();
+            if event != "open" {
+                tracker.open(inside.clone(), "inside").unwrap();
+            }
+            let guard = tracker
+                .begin_clean_scope(DocumentScope::Directory(area.clone()))
+                .unwrap();
+            match event {
+                "open" => tracker.open(inside.clone(), "inside").unwrap(),
+                "change" => tracker.change(&inside),
+                "save" => tracker.save(&inside),
+                "close" => tracker.close(&inside),
+                _ => unreachable!(),
+            }
+            assert!(!guard.is_current(), "{event} must invalidate the scope");
+        }
+
+        for event in ["open", "change", "save", "close"] {
+            let mut tracker = DocumentTracker::default();
+            if event != "open" {
+                tracker.open(outside_file.clone(), "outside").unwrap();
+            }
+            let guard = tracker
+                .begin_clean_scope(DocumentScope::Directory(area.clone()))
+                .unwrap();
+            match event {
+                "open" => tracker.open(outside_file.clone(), "outside").unwrap(),
+                "change" => tracker.change(&outside_file),
+                "save" => tracker.save(&outside_file),
+                "close" => tracker.close(&outside_file),
+                _ => unreachable!(),
+            }
+            assert!(
+                guard.is_current(),
+                "outside {event} must not invalidate the scope"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_cancel_all_and_tracker_drop_invalidate_registrations() {
+        let root = tempdir().unwrap();
+        let area = root.path().join("area");
+        fs::create_dir(&area).unwrap();
+        let mut tracker = DocumentTracker::default();
+        let cancelled = tracker
+            .begin_clean_scope(DocumentScope::Directory(area.clone()))
+            .unwrap();
+        tracker.cancel_all();
+        assert!(!cancelled.is_current());
+
+        let dropped = {
+            let mut tracker = DocumentTracker::default();
+            tracker
+                .begin_clean_scope(DocumentScope::Directory(area))
+                .unwrap()
+        };
+        assert!(!dropped.is_current());
+    }
+
+    #[test]
+    fn scope_dead_weak_registrations_are_pruned_before_the_next_registration() {
+        let root = tempdir().unwrap();
+        let mut tracker = DocumentTracker::default();
+        let dropped = tracker
+            .begin_clean_scope(DocumentScope::Directory(root.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(tracker.scopes.len(), 1);
+        drop(dropped);
+        assert_eq!(
+            tracker.scopes.len(),
+            1,
+            "registration stores only a dead weak ref"
+        );
+
+        let live = tracker
+            .begin_clean_scope(DocumentScope::Directory(root.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(tracker.scopes.len(), 1, "dead registration must be pruned");
+
+        tracker.cancel_all();
+        assert!(tracker.scopes.is_empty());
+        assert!(!live.is_current());
+    }
+
+    #[test]
+    fn commit_clean_claim_is_reusable_and_invokes_each_mutation_once() {
+        let root = tempdir().unwrap();
+        let mut tracker = DocumentTracker::default();
+        let guard = tracker
+            .begin_clean_scope(DocumentScope::Directory(root.path().to_path_buf()))
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+
+        for expected in 1..=2 {
+            let decision = guard
+                .commit(&mut || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(decision, CommitDecision::Committed);
+            assert_eq!(calls.load(Ordering::SeqCst), expected);
+            assert!(guard.is_current());
+        }
+    }
+
+    #[test]
+    fn commit_invalidation_from_active_denies_mutation() {
+        let root = tempdir().unwrap();
+        let path = write_file(root.path(), "active.c", b"clean");
+        let mut tracker = DocumentTracker::default();
+        tracker.open(path.clone(), "clean").unwrap();
+        let guard = tracker
+            .begin_clean_scope(DocumentScope::Exact(path.clone()))
+            .unwrap();
+        tracker.change(&path);
+        let mut called = false;
+
+        let decision = guard
+            .commit(&mut || {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(decision, CommitDecision::Cancelled);
+        assert!(!called);
+    }
+
+    #[test]
+    fn commit_invalidation_while_claimed_is_nonblocking_and_permanent() {
+        let root = tempdir().unwrap();
+        let path = write_file(root.path(), "claimed.c", b"clean");
+        let mut tracker = DocumentTracker::default();
+        tracker.open(path.clone(), "clean").unwrap();
+        let guard = tracker
+            .begin_clean_scope(DocumentScope::Exact(path.clone()))
+            .unwrap();
+        let worker_guard = guard.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            worker_guard.commit(&mut || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release claimed mutation");
+                Ok(())
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mutation claimed");
+
+        tracker.save(&path);
+        release_tx.send(()).unwrap();
+
+        assert_eq!(worker.join().unwrap().unwrap(), CommitDecision::Committed);
+        assert!(!guard.is_current());
+        assert_eq!(
+            guard
+                .commit(&mut || panic!("late mutation must be denied"))
+                .unwrap(),
+            CommitDecision::Cancelled
+        );
+    }
+
+    #[test]
+    fn commit_concurrent_claims_are_exclusive_then_clean_release_reopens_gate() {
+        let root = tempdir().unwrap();
+        let mut tracker = DocumentTracker::default();
+        let guard = tracker
+            .begin_clean_scope(DocumentScope::Directory(root.path().to_path_buf()))
+            .unwrap();
+        let worker_guard = guard.clone();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            worker_guard.commit(&mut || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release first claim");
+                Ok(())
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first claim entered");
+
+        assert_eq!(
+            guard
+                .commit(&mut || panic!("concurrent mutation must not run"))
+                .unwrap(),
+            CommitDecision::Cancelled
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), CommitDecision::Committed);
+        assert_eq!(
+            guard.commit(&mut || Ok(())).unwrap(),
+            CommitDecision::Committed
+        );
     }
 }

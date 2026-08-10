@@ -1532,6 +1532,13 @@ fn info_message(message: String) -> Message {
     Message::Notification(notification)
 }
 
+#[allow(dead_code)] // Task 9 will route scoped-sync worker outcomes through this mapper.
+fn scope_cancellation_feedback(outcome: &crate::commands::sync::SyncOutcome) -> Option<Message> {
+    outcome.cancelled.then(|| {
+        warning_message("ferry: folder changed in Zed; save all files and retry".to_string())
+    })
+}
+
 fn transfer_feedback(relative_path: &str, result: Result<TransferOutcome>) -> Message {
     match result {
         Ok(outcome) => {
@@ -4889,11 +4896,18 @@ mod tests {
             .documents
             .begin_clean_operation(&fixture.file_path)
             .unwrap();
+        let scope_guard = coordinator
+            .documents
+            .begin_clean_scope(document_state::DocumentScope::Exact(
+                fixture.file_path.clone(),
+            ))
+            .unwrap();
 
         coordinator.begin_shutdown();
 
         assert!(!running.load(Ordering::Acquire));
         assert!(!guard.try_claim());
+        assert!(!crate::commands::sync::CommitGate::is_current(&scope_guard));
         assert!(!coordinator.shutdown_complete);
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
 
@@ -6888,6 +6902,587 @@ mod tests {
         assert_eq!(
             uri_to_path("file://localhost/home/user/foo.c"),
             Some(PathBuf::from("/home/user/foo.c"))
+        );
+    }
+
+    struct ScopeFinalValidationRemote {
+        list_calls: usize,
+        reached: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+        events: Vec<String>,
+    }
+
+    impl crate::ftp::Remote for ScopeFinalValidationRemote {
+        fn list_dir(&mut self, _dir: &str) -> anyhow::Result<Vec<crate::ftp::Entry>> {
+            anyhow::bail!("tolerant LIST must not be used")
+        }
+
+        fn file_size(&mut self, path: &str) -> anyhow::Result<u64> {
+            anyhow::bail!("unexpected file size probe for {path}")
+        }
+
+        fn exact_file_presence(
+            &mut self,
+            _path: &str,
+        ) -> anyhow::Result<crate::ftp::ExactFilePresence> {
+            Ok(crate::ftp::ExactFilePresence::Missing)
+        }
+    }
+
+    impl crate::ftp::StrictRemote for ScopeFinalValidationRemote {
+        fn list_dir_strict(&mut self, dir: &str) -> anyhow::Result<Vec<crate::ftp::Entry>> {
+            self.events.push(format!("list {dir}"));
+            self.list_calls += 1;
+            if self.list_calls == 3 {
+                self.reached
+                    .send(())
+                    .map_err(|_| anyhow!("final-validation receiver disappeared"))?;
+                self.release
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| anyhow!("timed out releasing final validation"))?;
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::commands::remote_hash::RemoteFileRetrieval for ScopeFinalValidationRemote {
+        fn mtime(&mut self, path: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+            anyhow::bail!("unexpected remote mtime probe for {path}")
+        }
+
+        fn size(&mut self, path: &str) -> anyhow::Result<u64> {
+            anyhow::bail!("unexpected remote size probe for {path}")
+        }
+
+        fn download(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unexpected remote download for {path}")
+        }
+    }
+
+    impl crate::commands::file_transfer::RemoteWrite for ScopeFinalValidationRemote {
+        fn upload_bytes(&mut self, path: &str, _bytes: &[u8]) -> anyhow::Result<()> {
+            self.events.push(format!("upload {path}"));
+            Ok(())
+        }
+
+        fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+            self.events.push(format!("rename {from} {to}"));
+            Ok(())
+        }
+
+        fn rm(&mut self, path: &str) -> anyhow::Result<()> {
+            self.events.push(format!("rm {path}"));
+            Ok(())
+        }
+
+        fn mkdir(&mut self, path: &str) -> anyhow::Result<()> {
+            self.events.push(format!("mkdir {path}"));
+            Ok(())
+        }
+
+        fn mkdir_scoped_strict(&mut self, path: &str) -> anyhow::Result<()> {
+            self.events.push(format!("mkdir_strict {path}"));
+            Ok(())
+        }
+
+        fn mtime(&mut self, path: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+            anyhow::bail!("unexpected exact remote mtime probe for {path}")
+        }
+
+        fn destination_snapshot(
+            &mut self,
+            _remote_root: &str,
+            path: &str,
+        ) -> anyhow::Result<crate::commands::file_transfer::RemoteDestinationSnapshot> {
+            self.events.push(format!("snapshot {path}"));
+            Ok(crate::commands::file_transfer::RemoteDestinationSnapshot::Missing)
+        }
+    }
+
+    #[test]
+    fn scope_commit_empty_final_validation_invalidation_emits_retry_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tracker = document_state::DocumentTracker::default();
+        let guard = tracker
+            .begin_clean_scope(document_state::DocumentScope::Directory(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker_root = root.path().to_path_buf();
+
+        let worker = thread::spawn(move || {
+            let mut remote = ScopeFinalValidationRemote {
+                list_calls: 0,
+                reached: reached_tx,
+                release: release_rx,
+                events: Vec::new(),
+            };
+            let mut state = crate::state::StateFile::default();
+            let matcher = crate::ignored::Matcher::new(&[], &worker_root).unwrap();
+            let outcome = crate::commands::sync::run_scoped_with_for_test(
+                &mut remote,
+                &mut state,
+                &worker_root,
+                "/remote",
+                &matcher,
+                crate::commands::sync::scope::SyncScope::RootDirectory,
+                false,
+                crate::commands::ExecutionMode::Apply,
+                &guard,
+            )
+            .unwrap();
+            (outcome, state, remote)
+        });
+
+        reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("empty scope reached final validation");
+        tracker.cancel_all();
+        release_tx.send(()).unwrap();
+
+        let (outcome, state, remote) = worker.join().unwrap();
+        assert!(outcome.cancelled);
+        assert!(outcome.events.is_empty());
+        assert!(outcome.issues.is_empty());
+        assert_eq!(state, crate::state::StateFile::default());
+        assert!(scope_local_transfer_temps(root.path()).is_empty());
+        assert_eq!(
+            remote.events,
+            vec![
+                "list /remote".to_string(),
+                "list /remote".to_string(),
+                "list /remote".to_string(),
+            ],
+            "final validation must remain read-only"
+        );
+
+        let message =
+            scope_cancellation_feedback(&outcome).expect("cancelled scopes must emit feedback");
+        let feedback = match message {
+            Message::Notification(notification) if notification.method == "window/showMessage" => {
+                serde_json::from_value::<ShowMessageParams>(notification.params).unwrap()
+            }
+            other => panic!("expected cancellation warning, got {other:?}"),
+        };
+        assert_eq!(feedback.typ, MessageType::WARNING);
+        assert_eq!(
+            feedback.message,
+            "ferry: folder changed in Zed; save all files and retry"
+        );
+        assert!(
+            scope_cancellation_feedback(&crate::commands::sync::SyncOutcome::default()).is_none()
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ScopeInvalidation {
+        Change,
+        Save,
+        CancelAll,
+    }
+
+    impl ScopeInvalidation {
+        fn apply(self, tracker: &mut document_state::DocumentTracker, path: &Path) {
+            match self {
+                Self::Change => tracker.change(path),
+                Self::Save => tracker.save(path),
+                Self::CancelAll => tracker.cancel_all(),
+            }
+        }
+    }
+
+    struct ScopePauseGate {
+        inner: document_state::ScopeOperationGuard,
+        staged: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl crate::commands::sync::CommitGate for ScopePauseGate {
+        fn is_current(&self) -> bool {
+            crate::commands::sync::CommitGate::is_current(&self.inner)
+        }
+
+        fn commit(
+            &self,
+            mutation: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<crate::commands::sync::CommitDecision> {
+            self.staged
+                .send(())
+                .map_err(|_| anyhow!("staging probe receiver disappeared"))?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| anyhow!("timed out releasing staged transfer"))?;
+            crate::commands::sync::CommitGate::commit(&self.inner, mutation)
+        }
+    }
+
+    fn scope_remote_hash(bytes: &[u8]) -> crate::commands::remote_hash::RemoteHash {
+        crate::commands::remote_hash::RemoteHash {
+            sha256: crate::hash::hash_bytes(bytes),
+            size: bytes.len() as u64,
+            mtime: chrono::Utc::now(),
+            from_cache: false,
+            metadata_stable: true,
+            bytes: Some(bytes.to_vec()),
+            pre_download: None,
+        }
+    }
+
+    fn scope_local_transfer_temps(directory: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(crate::commands::transfer_temp::is_reserved_local_transfer_temp)
+                    .then_some(path)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scope_commit_local_post_staging_change_save_and_shutdown_deny_install() {
+        for invalidation in [
+            ScopeInvalidation::Change,
+            ScopeInvalidation::Save,
+            ScopeInvalidation::CancelAll,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("file.c");
+            std::fs::write(&destination, b"old local").unwrap();
+            let expected =
+                crate::commands::pull::ExpectedLocalDestination::capture(root.path(), &destination)
+                    .unwrap();
+            let remote = scope_remote_hash(b"new remote");
+            let mut tracker = document_state::DocumentTracker::default();
+            tracker.open(destination.clone(), "old local").unwrap();
+            let guard = tracker
+                .begin_clean_scope(document_state::DocumentScope::Exact(destination.clone()))
+                .unwrap();
+            let (staged_tx, staged_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let gate = ScopePauseGate {
+                inner: guard,
+                staged: staged_tx,
+                release: Mutex::new(release_rx),
+            };
+            let worker_path = destination.clone();
+
+            let worker = thread::spawn(move || {
+                let mut state = crate::state::StateFile::default();
+                let decision = crate::commands::pull::download_one_guarded(
+                    &mut state,
+                    &worker_path,
+                    "file.c",
+                    &remote,
+                    &expected,
+                    crate::commands::ExecutionMode::Apply,
+                    &gate,
+                )
+                .unwrap();
+                (decision, state)
+            });
+
+            staged_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("local replacement staged");
+            assert_eq!(scope_local_transfer_temps(root.path()).len(), 1);
+            invalidation.apply(&mut tracker, &destination);
+            release_tx.send(()).unwrap();
+
+            let (decision, state) = worker.join().unwrap();
+            assert_eq!(
+                decision,
+                crate::commands::sync::CommitDecision::Cancelled,
+                "{invalidation:?}"
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"old local");
+            assert!(state.files.is_empty());
+            assert!(scope_local_transfer_temps(root.path()).is_empty());
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScopeRemoteFile {
+        bytes: Vec<u8>,
+        modified: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(Default)]
+    struct ScopeTestRemote {
+        files: std::collections::BTreeMap<String, ScopeRemoteFile>,
+        events: Vec<String>,
+    }
+
+    impl crate::commands::file_transfer::RemoteWrite for ScopeTestRemote {
+        fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+            self.events.push(format!("upload {path}"));
+            self.files.insert(
+                path.to_string(),
+                ScopeRemoteFile {
+                    bytes: bytes.to_vec(),
+                    modified: chrono::Utc::now(),
+                },
+            );
+            Ok(())
+        }
+
+        fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+            self.events.push(format!("rename {from} {to}"));
+            let file = self
+                .files
+                .remove(from)
+                .ok_or_else(|| anyhow!("missing remote rename source"))?;
+            self.files.insert(to.to_string(), file);
+            Ok(())
+        }
+
+        fn rm(&mut self, path: &str) -> anyhow::Result<()> {
+            self.events.push(format!("rm {path}"));
+            self.files.remove(path);
+            Ok(())
+        }
+
+        fn mkdir(&mut self, _path: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn mkdir_scoped_strict(&mut self, _path: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn mtime(&mut self, path: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+            self.files
+                .get(path)
+                .map(|file| file.modified)
+                .ok_or_else(|| anyhow!("missing remote mtime target"))
+        }
+
+        fn destination_snapshot(
+            &mut self,
+            _remote_root: &str,
+            path: &str,
+        ) -> anyhow::Result<crate::commands::file_transfer::RemoteDestinationSnapshot> {
+            Ok(self.files.get(path).map_or(
+                crate::commands::file_transfer::RemoteDestinationSnapshot::Missing,
+                |file| crate::commands::file_transfer::RemoteDestinationSnapshot::File {
+                    size: file.bytes.len() as u64,
+                    modified: file.modified,
+                    sha256: crate::hash::hash_bytes(&file.bytes),
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn scope_commit_remote_post_staging_change_save_and_shutdown_deny_rename() {
+        for invalidation in [
+            ScopeInvalidation::Change,
+            ScopeInvalidation::Save,
+            ScopeInvalidation::CancelAll,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let source_path = root.path().join("file.c");
+            let bytes = b"new local";
+            std::fs::write(&source_path, bytes).unwrap();
+            let source =
+                crate::commands::push::ExpectedLocalSource::capture(root.path(), &source_path)
+                    .unwrap();
+            let destination = crate::commands::push::ExpectedRemoteDestination {
+                snapshot: crate::commands::file_transfer::RemoteDestinationSnapshot::Missing,
+            };
+            let mut tracker = document_state::DocumentTracker::default();
+            tracker.open(source_path.clone(), "new local").unwrap();
+            let guard = tracker
+                .begin_clean_scope(document_state::DocumentScope::Exact(source_path.clone()))
+                .unwrap();
+            let (staged_tx, staged_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let gate = ScopePauseGate {
+                inner: guard,
+                staged: staged_tx,
+                release: Mutex::new(release_rx),
+            };
+            let hash = crate::hash::hash_bytes(bytes);
+
+            let worker = thread::spawn(move || {
+                let mut state = crate::state::StateFile::default();
+                let mut remote = ScopeTestRemote::default();
+                let decision = crate::commands::push::upload_one_guarded(
+                    &mut remote,
+                    &mut state,
+                    "file.c",
+                    "/remote",
+                    "/remote/file.c",
+                    bytes,
+                    &hash,
+                    &source,
+                    &destination,
+                    crate::commands::ExecutionMode::Apply,
+                    &gate,
+                )
+                .unwrap();
+                (decision, state, remote)
+            });
+
+            staged_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("remote replacement staged");
+            invalidation.apply(&mut tracker, &source_path);
+            release_tx.send(()).unwrap();
+
+            let (decision, state, remote) = worker.join().unwrap();
+            assert_eq!(
+                decision,
+                crate::commands::sync::CommitDecision::Cancelled,
+                "{invalidation:?}"
+            );
+            assert!(state.files.is_empty());
+            assert!(!remote.files.contains_key("/remote/file.c"));
+            assert!(remote.files.keys().all(|path| {
+                !crate::commands::transfer_temp::is_reserved_remote_transfer_temp(path)
+            }));
+            assert!(
+                remote.events.iter().any(|event| event.starts_with("rm ")),
+                "owned temp cleanup must be attempted"
+            );
+            assert!(
+                remote
+                    .events
+                    .iter()
+                    .all(|event| !event.starts_with("rename ")),
+                "destination rename must not begin"
+            );
+        }
+    }
+
+    struct PauseAfterFirstCommitGate {
+        inner: document_state::ScopeOperationGuard,
+        committed: mpsc::SyncSender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        commits: AtomicUsize,
+    }
+
+    impl crate::commands::sync::CommitGate for PauseAfterFirstCommitGate {
+        fn is_current(&self) -> bool {
+            crate::commands::sync::CommitGate::is_current(&self.inner)
+        }
+
+        fn commit(
+            &self,
+            mutation: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<crate::commands::sync::CommitDecision> {
+            let decision = crate::commands::sync::CommitGate::commit(&self.inner, mutation)?;
+            if decision == crate::commands::sync::CommitDecision::Committed
+                && self.commits.fetch_add(1, AtomicOrdering::SeqCst) == 0
+            {
+                self.committed
+                    .send(())
+                    .map_err(|_| anyhow!("first-commit receiver disappeared"))?;
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| anyhow!("timed out releasing first commit"))?;
+            }
+            Ok(decision)
+        }
+    }
+
+    #[test]
+    fn scope_commit_two_entries_keep_first_progress_and_never_stage_second() {
+        let root = tempfile::tempdir().unwrap();
+        let first_path = root.path().join("a.c");
+        let second_path = root.path().join("b.c");
+        std::fs::write(&first_path, b"first").unwrap();
+        std::fs::write(&second_path, b"second").unwrap();
+        let first_source =
+            crate::commands::push::ExpectedLocalSource::capture(root.path(), &first_path).unwrap();
+        let second_source =
+            crate::commands::push::ExpectedLocalSource::capture(root.path(), &second_path).unwrap();
+        let missing = crate::commands::file_transfer::RemoteDestinationSnapshot::Missing;
+        let first_destination = crate::commands::push::ExpectedRemoteDestination {
+            snapshot: missing.clone(),
+        };
+        let second_destination =
+            crate::commands::push::ExpectedRemoteDestination { snapshot: missing };
+        let mut tracker = document_state::DocumentTracker::default();
+        tracker.open(first_path.clone(), "first").unwrap();
+        tracker.open(second_path.clone(), "second").unwrap();
+        let guard = tracker
+            .begin_clean_scope(document_state::DocumentScope::Directory(
+                root.path().to_path_buf(),
+            ))
+            .unwrap();
+        let (committed_tx, committed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let gate = PauseAfterFirstCommitGate {
+            inner: guard,
+            committed: committed_tx,
+            release: Mutex::new(release_rx),
+            commits: AtomicUsize::new(0),
+        };
+
+        let worker = thread::spawn(move || {
+            let mut state = crate::state::StateFile::default();
+            let mut remote = ScopeTestRemote::default();
+            let first = crate::commands::push::upload_one_guarded(
+                &mut remote,
+                &mut state,
+                "a.c",
+                "/remote",
+                "/remote/a.c",
+                b"first",
+                &crate::hash::hash_bytes(b"first"),
+                &first_source,
+                &first_destination,
+                crate::commands::ExecutionMode::Apply,
+                &gate,
+            )
+            .unwrap();
+            let second = crate::commands::push::upload_one_guarded(
+                &mut remote,
+                &mut state,
+                "b.c",
+                "/remote",
+                "/remote/b.c",
+                b"second",
+                &crate::hash::hash_bytes(b"second"),
+                &second_source,
+                &second_destination,
+                crate::commands::ExecutionMode::Apply,
+                &gate,
+            )
+            .unwrap();
+            (first, second, state, remote)
+        });
+
+        committed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first entry committed");
+        tracker.save(&first_path);
+        release_tx.send(()).unwrap();
+
+        let (first, second, state, remote) = worker.join().unwrap();
+        assert_eq!(first, crate::commands::sync::CommitDecision::Committed);
+        assert_eq!(second, crate::commands::sync::CommitDecision::Cancelled);
+        assert!(state.files.contains_key("a.c"));
+        assert!(!state.files.contains_key("b.c"));
+        assert!(remote.files.contains_key("/remote/a.c"));
+        assert!(!remote.files.contains_key("/remote/b.c"));
+        assert_eq!(
+            remote
+                .events
+                .iter()
+                .filter(|event| event.starts_with("upload "))
+                .count(),
+            1,
+            "second transfer must not stage"
         );
     }
 }

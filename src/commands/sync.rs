@@ -446,6 +446,35 @@ fn run_scoped_from_config(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_scoped_with_for_test<R>(
+    remote: &mut R,
+    state: &mut StateFile,
+    local_root: &Path,
+    remote_root: &str,
+    matcher: &Matcher,
+    scope: SyncScope,
+    force: bool,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<SyncOutcome>
+where
+    R: StrictRemote + RemoteFileRetrieval + RemoteWrite,
+{
+    run_scoped_with(
+        remote,
+        state,
+        local_root,
+        remote_root,
+        matcher,
+        scope,
+        force,
+        mode,
+        gate,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scoped_with<R>(
     remote: &mut R,
