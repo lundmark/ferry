@@ -33,7 +33,9 @@ use crate::hash::{hash_bytes, hash_file};
 use crate::ignored::Matcher;
 use crate::state::{FileState, StateFile, classify};
 use anyhow::{Context, Result};
+use same_file::Handle;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 // The scoped sync engine wires this collector in Task 5.
@@ -194,17 +196,38 @@ fn execute_structured_plan(
     Ok(outcome)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ExpectedLocalDirectory {
+#[derive(Debug)]
+enum ExpectedLocalDirectory {
+    Root(LocalDirectoryIdentity),
     Missing,
-    Directory { canonical_in_root: PathBuf },
+    Directory(LocalDirectoryIdentity),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ExpectedDirectorySnapshots {
-    pub relative: String,
-    pub local: ExpectedLocalDirectory,
-    pub remote: RemoteDestinationSnapshot,
+#[derive(Debug)]
+struct ExpectedDirectorySnapshots {
+    relative: String,
+    local: ExpectedLocalDirectory,
+    remote: ExpectedRemoteDirectory,
+}
+
+#[derive(Debug)]
+struct LocalDirectoryIdentity {
+    canonical: PathBuf,
+    identity: Handle,
+    is_symlink: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedRemoteDirectory {
+    Root,
+    Missing,
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryAction {
+    CreateLocal,
+    CreateRemote,
 }
 
 #[derive(Debug)]
@@ -233,6 +256,7 @@ enum PreparedOperation {
         remote: RemoteHash,
         destination: ExpectedLocalDestination,
     },
+    Preview,
 }
 
 /// Scoped sync transport adapter.
@@ -380,7 +404,20 @@ where
     let inventory = inventory::collect(remote, local_root, remote_root, matcher, state, scope)?;
     let entries = inventory.entries;
     let (file_paths, mut outcome) = classify_inventory_shapes(entries.clone());
-    let directories = capture_directory_snapshots(local_root, &entries)?;
+    let mut directories = capture_directory_snapshots(remote, local_root, remote_root, &entries)?;
+    if execute_directory_plan(
+        remote,
+        local_root,
+        remote_root,
+        &mut directories,
+        &mut outcome,
+        mode,
+        gate,
+    )? {
+        outcome.cancelled = true;
+        sort_outcome(&mut outcome);
+        return Ok(outcome);
+    }
 
     let mut transfers = Vec::new();
     for relative in file_paths {
@@ -426,9 +463,14 @@ where
                 FileState::BothChanged | FileState::Untracked
             ) {
             Some(capture_authoritative_upload_candidate(
-                remote,
-                remote_root,
-                &remote_path,
+                capture_remote_file_destination(
+                    remote,
+                    remote_root,
+                    &remote_path,
+                    &relative,
+                    &directories,
+                    mode,
+                )?,
                 &relative,
                 entry.remote,
                 local_hash
@@ -453,41 +495,56 @@ where
                     .take()
                     .expect("final upload state has an authoritative candidate")
                     .destination;
-                transfers.push(prepare_upload(
-                    local_root,
-                    &local_path,
-                    relative,
-                    remote_path,
-                    local_hash.expect("upload state has a local hash"),
-                    destination,
-                    SyncEventKind::Uploaded,
-                )?);
+                if mode.is_dry_run() {
+                    transfers.push(preview_transfer(relative, SyncEventKind::Uploaded));
+                } else {
+                    transfers.push(prepare_upload(
+                        local_root,
+                        &local_path,
+                        relative,
+                        remote_path,
+                        local_hash.expect("upload state has a local hash"),
+                        destination,
+                        SyncEventKind::Uploaded,
+                    )?);
+                }
             }
             FileState::RemoteChanged | FileState::RemoteOnly => {
-                transfers.push(prepare_download(
-                    remote,
-                    local_root,
-                    &local_path,
-                    local_hash.as_deref(),
-                    relative,
-                    remote_path,
-                    remote_hash.expect("download state has a remote hash"),
-                )?);
+                if mode.is_dry_run() {
+                    transfers.push(preview_transfer(relative, SyncEventKind::Downloaded));
+                } else {
+                    transfers.push(prepare_download(
+                        remote,
+                        local_root,
+                        &local_path,
+                        local_hash.as_deref(),
+                        relative,
+                        remote_path,
+                        remote_hash.expect("download state has a remote hash"),
+                    )?);
+                }
             }
             FileState::BothChanged | FileState::Untracked if force => {
                 let destination = upload_candidate
                     .take()
                     .expect("final forced upload state has an authoritative candidate")
                     .destination;
-                transfers.push(prepare_upload(
-                    local_root,
-                    &local_path,
-                    relative,
-                    remote_path,
-                    local_hash.expect("forced upload has a local hash"),
-                    destination,
-                    SyncEventKind::ForcedRemoteOverwrite,
-                )?);
+                if mode.is_dry_run() {
+                    transfers.push(preview_transfer(
+                        relative,
+                        SyncEventKind::ForcedRemoteOverwrite,
+                    ));
+                } else {
+                    transfers.push(prepare_upload(
+                        local_root,
+                        &local_path,
+                        relative,
+                        remote_path,
+                        local_hash.expect("forced upload has a local hash"),
+                        destination,
+                        SyncEventKind::ForcedRemoteOverwrite,
+                    )?);
+                }
             }
             FileState::BothChanged | FileState::Untracked => {
                 outcome.issues.push(SyncIssue::FileConflict {
@@ -543,6 +600,7 @@ where
                 mode,
                 gate,
             ),
+            PreparedOperation::Preview => Ok(CommitDecision::Committed),
         }
     })?;
     if outcome.cancelled {
@@ -555,19 +613,29 @@ where
         sort_outcome(&mut outcome);
         return Ok(outcome);
     }
-    for expected in &directories {
+    for (index, _expected) in directories.iter().enumerate() {
         if !gate.is_current() {
             outcome.cancelled = true;
             sort_outcome(&mut outcome);
             return Ok(outcome);
         }
-        validate_directory_snapshot(remote, local_root, remote_root, expected)?;
+        validate_directory_snapshot(remote, local_root, remote_root, &directories, index)?;
     }
     if !gate.is_current() {
         outcome.cancelled = true;
     }
     sort_outcome(&mut outcome);
     Ok(outcome)
+}
+
+fn preview_transfer(relative: String, kind: SyncEventKind) -> PreparedTransfer {
+    PreparedTransfer {
+        event: ScheduledAction {
+            path: relative,
+            kind,
+        },
+        operation: PreparedOperation::Preview,
+    }
 }
 
 fn prepare_upload(
@@ -600,16 +668,13 @@ fn prepare_upload(
     })
 }
 
-fn capture_authoritative_upload_candidate<R: RemoteWrite>(
-    remote: &mut R,
-    remote_root: &str,
-    remote_path: &str,
+fn capture_authoritative_upload_candidate(
+    snapshot: RemoteDestinationSnapshot,
     relative: &str,
     inventory_remote: Option<EntryKind>,
     local_hash: &str,
     known: Option<&str>,
 ) -> Result<AuthoritativeUploadCandidate> {
-    let snapshot = remote.destination_snapshot(remote_root, remote_path)?;
     let state = match (inventory_remote, &snapshot) {
         (
             Some(EntryKind::File),
@@ -640,6 +705,30 @@ fn capture_authoritative_upload_candidate<R: RemoteWrite>(
         state,
         destination: ExpectedRemoteDestination { snapshot },
     })
+}
+
+fn capture_remote_file_destination<R: RemoteWrite>(
+    remote: &mut R,
+    remote_root: &str,
+    remote_path: &str,
+    relative: &str,
+    directories: &[ExpectedDirectorySnapshots],
+    mode: ExecutionMode,
+) -> Result<RemoteDestinationSnapshot> {
+    if mode.is_dry_run()
+        && directories.iter().any(|directory| {
+            directory.remote == ExpectedRemoteDirectory::Missing
+                && !directory.relative.is_empty()
+                && relative
+                    .strip_prefix(&directory.relative)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    {
+        return Ok(RemoteDestinationSnapshot::Missing);
+    }
+    remote
+        .destination_snapshot(remote_root, remote_path)
+        .with_context(|| format!("capturing remote destination for {relative}"))
 }
 
 fn prepare_download<R: RemoteFileRetrieval>(
@@ -707,15 +796,17 @@ fn remote_snapshot(hash: &RemoteHash) -> RemoteDestinationSnapshot {
     }
 }
 
-fn capture_directory_snapshots(
+fn capture_directory_snapshots<R: StrictRemote + RemoteWrite>(
+    remote: &mut R,
     local_root: &Path,
+    remote_root: &str,
     entries: &BTreeMap<String, inventory::InventoryEntry>,
 ) -> Result<Vec<ExpectedDirectorySnapshots>> {
     let canonical_root = local_root
         .canonicalize()
         .with_context(|| format!("canonicalizing local_root {}", local_root.display()))?;
-    let mut snapshots = Vec::new();
     let conflict_prefixes = type_conflict_prefixes(entries);
+    let mut paths = BTreeSet::from([String::new()]);
     for (relative, entry) in entries {
         if conflict_prefixes
             .iter()
@@ -723,38 +814,94 @@ fn capture_directory_snapshots(
         {
             continue;
         }
-        let is_directory = matches!(
-            (entry.local, entry.remote),
-            (Some(EntryKind::Directory), Some(EntryKind::Directory))
-                | (Some(EntryKind::Directory), None)
-                | (None, Some(EntryKind::Directory))
-        );
-        if !is_directory {
-            continue;
+        if matches!(entry.local, Some(EntryKind::Directory))
+            || matches!(entry.remote, Some(EntryKind::Directory))
+        {
+            paths.insert(relative.clone());
         }
-        let local = if entry.local == Some(EntryKind::Directory) {
-            let path = local_root.join(relative);
-            let canonical_in_root = path
-                .canonicalize()
-                .with_context(|| format!("canonicalizing local directory {}", path.display()))?;
-            if !canonical_in_root.starts_with(&canonical_root) {
-                anyhow::bail!(
-                    "local directory {} resolves outside local_root {}",
-                    path.display(),
-                    local_root.display()
-                );
+        if entry.local.is_some() || entry.remote.is_some() {
+            let mut parent = relative.rsplit_once('/').map(|(parent, _)| parent);
+            while let Some(relative_parent) = parent {
+                if !relative_parent.is_empty()
+                    && !conflict_prefixes
+                        .iter()
+                        .any(|prefix| is_at_or_below_conflict(relative_parent, prefix))
+                {
+                    paths.insert(relative_parent.to_string());
+                }
+                parent = relative_parent.rsplit_once('/').map(|(next, _)| next);
             }
-            ExpectedLocalDirectory::Directory { canonical_in_root }
+        }
+    }
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        directory_depth(left)
+            .cmp(&directory_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut snapshots = Vec::new();
+    for relative in paths {
+        let local_identity =
+            capture_local_directory_identity(local_root, &canonical_root, &relative)?;
+        let local = if relative.is_empty() {
+            ExpectedLocalDirectory::Root(local_identity.ok_or_else(|| {
+                anyhow::anyhow!("local root disappeared while planning directories")
+            })?)
+        } else if let Some(identity) = local_identity {
+            ExpectedLocalDirectory::Directory(identity)
         } else {
             ExpectedLocalDirectory::Missing
         };
-        let remote = if entry.remote == Some(EntryKind::Directory) {
-            RemoteDestinationSnapshot::Directory
+        if let Some(entry) = entries.get(&relative) {
+            match (entry.local, &local) {
+                (Some(EntryKind::Directory), ExpectedLocalDirectory::Directory(_))
+                | (None, ExpectedLocalDirectory::Missing) => {}
+                (Some(EntryKind::File), _) => {
+                    anyhow::bail!("local file became a directory while planning {relative}")
+                }
+                _ => anyhow::bail!("local directory changed while planning {relative}"),
+            }
+        }
+
+        let remote = if relative.is_empty() {
+            remote
+                .list_dir_strict(remote_root)
+                .with_context(|| format!("validating remote root {remote_root:?}"))?;
+            ExpectedRemoteDirectory::Root
+        } else if snapshots
+            .iter()
+            .any(|ancestor: &ExpectedDirectorySnapshots| {
+                ancestor.remote == ExpectedRemoteDirectory::Missing
+                    && !ancestor.relative.is_empty()
+                    && relative
+                        .strip_prefix(&ancestor.relative)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        {
+            ExpectedRemoteDirectory::Missing
         } else {
-            RemoteDestinationSnapshot::Missing
+            let remote_path = remote_join(remote_root, &relative);
+            match remote.destination_snapshot(remote_root, &remote_path)? {
+                RemoteDestinationSnapshot::Missing => ExpectedRemoteDirectory::Missing,
+                RemoteDestinationSnapshot::Directory => ExpectedRemoteDirectory::Directory,
+                RemoteDestinationSnapshot::File { .. } => {
+                    anyhow::bail!("remote file appeared while planning directory {relative}")
+                }
+            }
         };
+        if let Some(entry) = entries.get(&relative) {
+            match (entry.remote, remote) {
+                (Some(EntryKind::Directory), ExpectedRemoteDirectory::Directory)
+                | (None, ExpectedRemoteDirectory::Missing) => {}
+                (Some(EntryKind::File), _) => {
+                    anyhow::bail!("remote file became a directory while planning {relative}")
+                }
+                _ => anyhow::bail!("remote directory changed while planning {relative}"),
+            }
+        }
         snapshots.push(ExpectedDirectorySnapshots {
-            relative: relative.clone(),
+            relative,
             local,
             remote,
         });
@@ -762,40 +909,263 @@ fn capture_directory_snapshots(
     Ok(snapshots)
 }
 
-fn validate_directory_snapshot<R: RemoteWrite>(
+fn directory_depth(relative: &str) -> usize {
+    if relative.is_empty() {
+        0
+    } else {
+        relative.split('/').count()
+    }
+}
+
+fn capture_local_directory_identity(
+    local_root: &Path,
+    canonical_root: &Path,
+    relative: &str,
+) -> Result<Option<LocalDirectoryIdentity>> {
+    let path = if relative.is_empty() {
+        local_root.to_path_buf()
+    } else {
+        local_root.join(relative)
+    };
+    let symlink_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading local directory {}", path.display()));
+        }
+    };
+    let is_symlink = symlink_metadata.file_type().is_symlink();
+    let metadata = if is_symlink {
+        fs::metadata(&path)
+            .with_context(|| format!("following local directory {}", path.display()))?
+    } else {
+        symlink_metadata
+    };
+    if !metadata.is_dir() {
+        anyhow::bail!("local directory changed at {}", path.display());
+    }
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing local directory {}", path.display()))?;
+    if !canonical.starts_with(canonical_root) {
+        anyhow::bail!(
+            "local directory {} resolves outside local_root {}",
+            path.display(),
+            local_root.display()
+        );
+    }
+    let identity = Handle::from_path(&path)
+        .with_context(|| format!("opening local directory {}", path.display()))?;
+    Ok(Some(LocalDirectoryIdentity {
+        canonical,
+        identity,
+        is_symlink,
+    }))
+}
+
+fn directory_action(expected: &ExpectedDirectorySnapshots) -> Result<Option<DirectoryAction>> {
+    match (&expected.local, expected.remote) {
+        (ExpectedLocalDirectory::Root(_), ExpectedRemoteDirectory::Root)
+        | (ExpectedLocalDirectory::Directory(_), ExpectedRemoteDirectory::Directory) => Ok(None),
+        (ExpectedLocalDirectory::Missing, ExpectedRemoteDirectory::Directory) => {
+            Ok(Some(DirectoryAction::CreateLocal))
+        }
+        (ExpectedLocalDirectory::Directory(_), ExpectedRemoteDirectory::Missing) => {
+            Ok(Some(DirectoryAction::CreateRemote))
+        }
+        (ExpectedLocalDirectory::Missing, ExpectedRemoteDirectory::Missing) => Ok(None),
+        _ => anyhow::bail!("invalid directory plan at {:?}", expected.relative),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_directory_plan<R: StrictRemote + RemoteWrite>(
     remote: &mut R,
     local_root: &Path,
     remote_root: &str,
+    directories: &mut [ExpectedDirectorySnapshots],
+    outcome: &mut SyncOutcome,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<bool> {
+    for index in 0..directories.len() {
+        let Some(action) = directory_action(&directories[index])? else {
+            continue;
+        };
+        if !gate.is_current() {
+            return Ok(true);
+        }
+        let event_kind = match action {
+            DirectoryAction::CreateLocal => SyncEventKind::CreatedLocalDirectory,
+            DirectoryAction::CreateRemote => SyncEventKind::CreatedRemoteDirectory,
+        };
+        if mode.is_dry_run() {
+            outcome.events.push(SyncEvent {
+                path: directories[index].relative.clone(),
+                kind: event_kind,
+            });
+            continue;
+        }
+        let relative = directories[index].relative.clone();
+        let local_path = local_root.join(&relative);
+        let remote_path = remote_join(remote_root, &relative);
+        let decision = {
+            let mut mutation = || {
+                validate_directory_prefix(remote, local_root, remote_root, directories, index)?;
+                match action {
+                    DirectoryAction::CreateLocal => {
+                        fs::create_dir(&local_path).with_context(|| {
+                            format!("creating local directory {}", local_path.display())
+                        })?
+                    }
+                    DirectoryAction::CreateRemote => remote
+                        .mkdir_scoped_strict(&remote_path)
+                        .with_context(|| format!("creating remote directory {relative:?}"))?,
+                }
+                Ok(())
+            };
+            gate.commit(&mut mutation)?
+        };
+        if decision == CommitDecision::Cancelled {
+            return Ok(true);
+        }
+        match action {
+            DirectoryAction::CreateLocal => {
+                let canonical_root = local_root.canonicalize().with_context(|| {
+                    format!("canonicalizing local_root {}", local_root.display())
+                })?;
+                let identity =
+                    capture_local_directory_identity(local_root, &canonical_root, &relative)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("created local directory disappeared at {relative}")
+                        })?;
+                directories[index].local = ExpectedLocalDirectory::Directory(identity);
+            }
+            DirectoryAction::CreateRemote => {
+                directories[index].remote = ExpectedRemoteDirectory::Directory;
+            }
+        }
+        outcome.events.push(SyncEvent {
+            path: relative,
+            kind: event_kind,
+        });
+    }
+    Ok(false)
+}
+
+fn validate_directory_prefix<R: StrictRemote + RemoteWrite>(
+    remote: &mut R,
+    local_root: &Path,
+    remote_root: &str,
+    directories: &[ExpectedDirectorySnapshots],
+    through: usize,
+) -> Result<()> {
+    for index in 0..=through {
+        validate_directory_snapshot(remote, local_root, remote_root, directories, index)?;
+    }
+    Ok(())
+}
+
+fn validate_directory_snapshot<R: StrictRemote + RemoteWrite>(
+    remote: &mut R,
+    local_root: &Path,
+    remote_root: &str,
+    directories: &[ExpectedDirectorySnapshots],
+    index: usize,
+) -> Result<()> {
+    if index > 0 {
+        validate_local_directory(local_root, &directories[0])?;
+        validate_remote_directory(remote, remote_root, directories, 0)?;
+    }
+    let expected = &directories[index];
+    validate_local_directory(local_root, expected)?;
+    validate_remote_directory(remote, remote_root, directories, index)
+}
+
+fn validate_local_directory(
+    local_root: &Path,
     expected: &ExpectedDirectorySnapshots,
 ) -> Result<()> {
-    let local_path = local_root.join(&expected.relative);
+    let local_path = if expected.relative.is_empty() {
+        local_root.to_path_buf()
+    } else {
+        local_root.join(&expected.relative)
+    };
     match &expected.local {
-        ExpectedLocalDirectory::Missing => match std::fs::symlink_metadata(&local_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => anyhow::bail!(
-                "local directory destination appeared at {}",
-                local_path.display()
-            ),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("reading local directory {}", local_path.display()));
-            }
+        ExpectedLocalDirectory::Missing => match fs::symlink_metadata(&local_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => anyhow::bail!("local directory appeared at {}", local_path.display()),
+            Err(error) => Err(error)
+                .with_context(|| format!("reading local directory {}", local_path.display())),
         },
-        ExpectedLocalDirectory::Directory { canonical_in_root } => {
-            let metadata = std::fs::metadata(&local_path)
+        ExpectedLocalDirectory::Root(identity) | ExpectedLocalDirectory::Directory(identity) => {
+            let symlink_metadata = fs::symlink_metadata(&local_path)
                 .with_context(|| format!("reading local directory {}", local_path.display()))?;
+            let is_symlink = symlink_metadata.file_type().is_symlink();
+            let metadata = if is_symlink {
+                fs::metadata(&local_path).with_context(|| {
+                    format!("following local directory {}", local_path.display())
+                })?
+            } else {
+                symlink_metadata
+            };
             let canonical = local_path.canonicalize().with_context(|| {
                 format!("canonicalizing local directory {}", local_path.display())
             })?;
-            if !metadata.is_dir() || canonical != *canonical_in_root {
+            let current_identity = Handle::from_path(&local_path)
+                .with_context(|| format!("opening local directory {}", local_path.display()))?;
+            if !metadata.is_dir()
+                || is_symlink != identity.is_symlink
+                || canonical != identity.canonical
+                || current_identity != identity.identity
+            {
                 anyhow::bail!("local directory changed at {}", local_path.display());
             }
+            Ok(())
         }
+    }
+}
+
+fn validate_remote_directory<R: StrictRemote + RemoteWrite>(
+    remote: &mut R,
+    remote_root: &str,
+    directories: &[ExpectedDirectorySnapshots],
+    index: usize,
+) -> Result<()> {
+    let expected = &directories[index];
+    if expected.remote == ExpectedRemoteDirectory::Root {
+        remote
+            .list_dir_strict(remote_root)
+            .with_context(|| format!("validating remote root {remote_root:?}"))?;
+        return Ok(());
+    }
+    if expected.remote == ExpectedRemoteDirectory::Missing
+        && directories[..index].iter().any(|ancestor| {
+            ancestor.remote == ExpectedRemoteDirectory::Missing
+                && !ancestor.relative.is_empty()
+                && expected
+                    .relative
+                    .strip_prefix(&ancestor.relative)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    {
+        return Ok(());
     }
 
     let remote_path = remote_join(remote_root, &expected.relative);
     let current = remote.destination_snapshot(remote_root, &remote_path)?;
-    if current != expected.remote {
+    let matches = matches!(
+        (expected.remote, current),
+        (
+            ExpectedRemoteDirectory::Missing,
+            RemoteDestinationSnapshot::Missing
+        ) | (
+            ExpectedRemoteDirectory::Directory,
+            RemoteDestinationSnapshot::Directory
+        )
+    );
+    if !matches {
         anyhow::bail!(
             "remote directory changed during scoped sync at {:?}",
             expected.relative

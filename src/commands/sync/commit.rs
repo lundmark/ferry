@@ -41,17 +41,17 @@ mod tests {
         let snapshots = crate::commands::sync::ExpectedDirectorySnapshots {
             relative: "nested".to_string(),
             local: crate::commands::sync::ExpectedLocalDirectory::Missing,
-            remote: crate::commands::file_transfer::RemoteDestinationSnapshot::Missing,
+            remote: crate::commands::sync::ExpectedRemoteDirectory::Missing,
         };
 
         assert_eq!(snapshots.relative, "nested");
-        assert_eq!(
+        assert!(matches!(
             snapshots.local,
             crate::commands::sync::ExpectedLocalDirectory::Missing
-        );
+        ));
         assert_eq!(
             snapshots.remote,
-            crate::commands::file_transfer::RemoteDestinationSnapshot::Missing
+            crate::commands::sync::ExpectedRemoteDirectory::Missing
         );
     }
 

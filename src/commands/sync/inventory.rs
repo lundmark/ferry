@@ -1,5 +1,7 @@
 use super::scope::SyncScope;
-use crate::commands::transfer_temp::is_reserved_transfer_temp;
+use crate::commands::transfer_temp::{
+    is_reserved_local_transfer_temp, is_reserved_remote_transfer_temp,
+};
 use crate::ftp::{Entry, StrictRemote};
 use crate::ignored::Matcher;
 use crate::state::StateFile;
@@ -65,7 +67,7 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
             continue;
         }
         validate_state_path_key(path)?;
-        if is_state_path(path) || is_reserved_transfer_temp(path) {
+        if is_state_path(path) || is_reserved_remote_transfer_temp(path) {
             continue;
         }
         entries.entry(path.clone()).or_default().in_state = true;
@@ -120,7 +122,8 @@ fn collect_local(
         }
         SyncScope::Path(relative) => {
             validate_relative_path(relative)?;
-            let Some((path, metadata)) = resolve_local_selection(&context, relative)? else {
+            let Some((path, metadata)) = resolve_local_selection(&context, relative, entries)?
+            else {
                 return Ok(());
             };
             collect_local_node(&path, relative, metadata, &context, entries, &mut ancestors)
@@ -131,6 +134,7 @@ fn collect_local(
 fn resolve_local_selection(
     context: &LocalContext<'_>,
     relative: &str,
+    entries: &mut BTreeMap<String, InventoryEntry>,
 ) -> Result<Option<(PathBuf, Metadata)>> {
     let segments = relative.split('/').collect::<Vec<_>>();
     let mut path = context.local_root.to_path_buf();
@@ -175,6 +179,11 @@ fn resolve_local_selection(
         if is_selected {
             return Ok(Some((path, symlink_metadata)));
         }
+        entries.entry(relative_prefix.clone()).or_default().local = Some(if metadata.is_dir() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        });
         if !metadata.is_dir() {
             return Ok(None);
         }
@@ -217,7 +226,7 @@ fn collect_local_node(
     entries: &mut BTreeMap<String, InventoryEntry>,
     ancestors: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    if is_state_path(relative) || is_reserved_transfer_temp(relative) {
+    if is_state_path(relative) || is_reserved_local_transfer_temp(relative) {
         return Ok(());
     }
 
@@ -343,6 +352,7 @@ fn collect_remote_path<R: StrictRemote + ?Sized>(
             }
             return Ok(());
         }
+        record_remote(entries, &child_relative, child.is_dir);
         if !child.is_dir {
             return Ok(());
         }
@@ -409,7 +419,7 @@ fn list_remote_children<R: StrictRemote + ?Sized>(
             bail!("duplicate remote entry {name:?} in {directory:?}");
         }
         let relative = join_relative(relative_directory, &name);
-        if is_state_path(&relative) || is_reserved_transfer_temp(&relative) {
+        if is_state_path(&relative) || is_reserved_remote_transfer_temp(&relative) {
             continue;
         }
         if matcher.is_ignored(&local_root.join(&relative), entry.is_dir) {

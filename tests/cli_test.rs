@@ -68,7 +68,7 @@ impl FakeFtpScenario {
                 },
                 "/remote",
             ) => {
-                if root_lists.fetch_add(1, Ordering::SeqCst) > 0 {
+                if root_lists.fetch_add(1, Ordering::SeqCst) > 3 {
                     current.store(false, Ordering::SeqCst);
                 }
                 "drwxr-xr-x 1 owner group 0 Aug 10 12:00 shared\r\n".into()
@@ -528,7 +528,7 @@ fn scoped_sync_public_final_validation_cancellation_creates_no_state() {
     assert!(outcome.cancelled);
     assert!(outcome.events.is_empty());
     assert!(outcome.issues.is_empty());
-    assert_eq!(root_lists.load(Ordering::SeqCst), 2);
+    assert_eq!(root_lists.load(Ordering::SeqCst), 6);
     assert!(!project.path().join(ferry::names::STATE_DIR).exists());
 }
 

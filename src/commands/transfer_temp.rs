@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 const NONCE_BYTES: usize = 16;
 const NONCE_HEX_LEN: usize = NONCE_BYTES * 2;
 const MARKER: &str = ".ferry-tmp.";
+const REMOTE_MARKER: &str = "ferry-tmp.";
 
 pub(crate) fn fresh_nonce() -> Result<String> {
     let mut bytes = [0_u8; NONCE_BYTES];
@@ -57,7 +58,7 @@ pub(crate) fn remote_candidate(target: &str, nonce: &str) -> Result<String> {
     if leaf.is_empty() {
         anyhow::bail!("remote transfer target has no file name");
     }
-    let temp_leaf = format!(".{leaf}{MARKER}{nonce}");
+    let temp_leaf = format!("{REMOTE_MARKER}{nonce}");
     Ok(match parent {
         Some("") => format!("/{temp_leaf}"),
         Some(parent) => format!("{parent}/{temp_leaf}"),
@@ -65,7 +66,7 @@ pub(crate) fn remote_candidate(target: &str, nonce: &str) -> Result<String> {
     })
 }
 
-pub(crate) fn is_reserved_transfer_temp(relative: &str) -> bool {
+pub(crate) fn is_reserved_local_transfer_temp(relative: &str) -> bool {
     let Some(leaf) = relative.rsplit('/').next() else {
         return false;
     };
@@ -76,6 +77,19 @@ pub(crate) fn is_reserved_transfer_temp(relative: &str) -> bool {
         return false;
     };
     !target.is_empty() && valid_nonce(nonce)
+}
+
+pub(crate) fn is_reserved_remote_transfer_temp(relative: &str) -> bool {
+    let Some(leaf) = relative.rsplit('/').next() else {
+        return false;
+    };
+    leaf.strip_prefix(REMOTE_MARKER).is_some_and(valid_nonce)
+        || is_reserved_local_transfer_temp(relative)
+}
+
+#[cfg(test)]
+pub(crate) fn is_reserved_transfer_temp(relative: &str) -> bool {
+    is_reserved_local_transfer_temp(relative) || is_reserved_remote_transfer_temp(relative)
 }
 
 fn validate_nonce(nonce: &str) -> Result<()> {
@@ -94,7 +108,10 @@ fn valid_nonce(nonce: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_reserved_transfer_temp, local_candidate, remote_candidate};
+    use super::{
+        is_reserved_local_transfer_temp, is_reserved_remote_transfer_temp,
+        is_reserved_transfer_temp, local_candidate, remote_candidate,
+    };
     use std::path::Path;
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -110,10 +127,30 @@ mod tests {
         );
         assert_eq!(
             remote,
-            "/remote/area/.page.txt.ferry-tmp.0123456789abcdef0123456789abcdef"
+            "/remote/area/ferry-tmp.0123456789abcdef0123456789abcdef"
         );
         assert!(is_reserved_transfer_temp(local.to_str().unwrap()));
         assert!(is_reserved_transfer_temp(&remote));
+        assert!(is_reserved_local_transfer_temp(local.to_str().unwrap()));
+        assert!(!is_reserved_local_transfer_temp(&remote));
+        assert!(is_reserved_remote_transfer_temp(&remote));
+        assert!(is_reserved_remote_transfer_temp(
+            "/remote/area/.page.txt.ferry-tmp.0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn remote_candidate_is_visible_fixed_length_for_dotfiles_and_long_targets() {
+        let dotfile = remote_candidate("/remote/.env", NONCE).unwrap();
+        let long_target = format!("/remote/{}", "x".repeat(255));
+        let long = remote_candidate(&long_target, NONCE).unwrap();
+
+        assert_eq!(
+            dotfile,
+            "/remote/ferry-tmp.0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(long, dotfile);
+        assert_eq!(long.rsplit('/').next().unwrap().len(), 42);
     }
 
     #[test]
@@ -123,6 +160,9 @@ mod tests {
             ".page.txt.ferry-tmp.0123456789abcdef0123456789abcdeF",
             "page.txt.ferry-tmp.0123456789abcdef0123456789abcdef",
             "..ferry-tmp.0123456789abcdef0123456789abcdef",
+            "ferry-tmp.0123456789abcdef0123456789abcde",
+            "ferry-tmp.0123456789abcdef0123456789abcdeF",
+            "xferry-tmp.0123456789abcdef0123456789abcdef",
         ] {
             assert!(!is_reserved_transfer_temp(name), "{name}");
         }

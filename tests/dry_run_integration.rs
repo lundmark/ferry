@@ -638,3 +638,198 @@ fn status_dry_run_does_not_persist_mdtm_cache() {
 
     let _fixture_guard = &fixture.container;
 }
+
+fn seed_scoped_dry_run_state(root: &std::path::Path) -> (std::path::PathBuf, Vec<u8>) {
+    let state_path = root.join(ferry::names::STATE_DIR).join("state.json");
+    let now = chrono::Utc::now();
+    let mut state = ferry::state::StateFile::default();
+    state.files.insert(
+        "sentinel.txt".into(),
+        ferry::state::FileRecord {
+            sha256: hash_bytes(b"sentinel"),
+            size: 8,
+            remote_mtime: now,
+            last_synced: now,
+        },
+    );
+    state.save(&state_path).unwrap();
+    let before = std::fs::read(&state_path).unwrap();
+    (state_path, before)
+}
+
+fn scoped_dry_run(config: &std::path::Path, selected: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ferry"))
+        .arg("--config")
+        .arg(config)
+        .args(["sync", selected, "--dry-run"])
+        .output()
+        .unwrap()
+}
+
+fn remote_has_child(ftp: &mut Ftp, parent: &str, child: &str) -> bool {
+    ftp.list(parent).unwrap().iter().any(|entry| {
+        entry.is_dir && entry.name.trim_end_matches('/').rsplit('/').next() == Some(child)
+    })
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn scoped_exact_file_dry_run_preserves_bytes_structure_and_state() {
+    let fixture = support::start_ftp();
+    let root = tempfile::tempdir().unwrap();
+    let local_bytes = b"arbitrary local bytes";
+    std::fs::write(root.path().join("file.bin"), local_bytes).unwrap();
+    let (state_path, state_before) = seed_scoped_dry_run_state(root.path());
+    let config = support::write_config(root.path(), &fixture);
+
+    let output = scoped_dry_run(&config, "file.bin");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("file.bin")).unwrap(),
+        local_bytes
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+    let mut remote =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    assert!(remote.size(&support::remote_path("file.bin")).is_err());
+
+    let _fixture_guard = &fixture.container;
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn scoped_directory_dry_run_preserves_recursive_structure_bytes_and_state() {
+    let fixture = support::start_ftp();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("area/local/empty")).unwrap();
+    std::fs::write(root.path().join("area/local/file.bin"), b"local bytes").unwrap();
+    let (state_path, state_before) = seed_scoped_dry_run_state(root.path());
+    let mut remote =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    remote.mkdir(&support::remote_path("area")).unwrap();
+    remote.mkdir(&support::remote_path("area/remote")).unwrap();
+    remote
+        .mkdir(&support::remote_path("area/remote/empty"))
+        .unwrap();
+    remote
+        .upload_bytes(
+            &support::remote_path("area/remote/file.bin"),
+            b"remote bytes",
+        )
+        .unwrap();
+    let config = support::write_config(root.path(), &fixture);
+
+    let output = scoped_dry_run(&config, "area");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("area/local/file.bin")).unwrap(),
+        b"local bytes"
+    );
+    assert!(!root.path().join("area/remote").exists());
+    assert_eq!(
+        remote
+            .download(&support::remote_path("area/remote/file.bin"))
+            .unwrap(),
+        b"remote bytes"
+    );
+    assert!(!remote_has_child(
+        &mut remote,
+        &support::remote_path("area"),
+        "local"
+    ));
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+
+    let _fixture_guard = &fixture.container;
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn scoped_root_directory_dry_run_preserves_both_trees_and_state() {
+    let fixture = support::start_ftp();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().join("mirror");
+    std::fs::create_dir_all(root.join("local-root/empty")).unwrap();
+    std::fs::write(root.join("local-root/file.bin"), b"root local").unwrap();
+    let (state_path, state_before) = seed_scoped_dry_run_state(&root);
+    let mut remote =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    remote.mkdir(&support::remote_path("remote-root")).unwrap();
+    remote
+        .mkdir(&support::remote_path("remote-root/empty"))
+        .unwrap();
+    remote
+        .upload_bytes(
+            &support::remote_path("remote-root/file.bin"),
+            b"root remote",
+        )
+        .unwrap();
+    let generated = support::write_config(&root, &fixture);
+    let config = project.path().join("root-dry-run.toml");
+    std::fs::rename(generated, &config).unwrap();
+
+    let output = scoped_dry_run(&config, root.to_str().unwrap());
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.join("remote-root").exists());
+    assert_eq!(
+        std::fs::read(root.join("local-root/file.bin")).unwrap(),
+        b"root local"
+    );
+    assert!(!remote_has_child(
+        &mut remote,
+        support::REMOTE_ROOT,
+        "local-root"
+    ));
+    assert_eq!(
+        remote
+            .download(&support::remote_path("remote-root/file.bin"))
+            .unwrap(),
+        b"root remote"
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+
+    let _fixture_guard = &fixture.container;
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn scoped_empty_directory_dry_run_creates_neither_counterpart_nor_state_change() {
+    let fixture = support::start_ftp();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("empty")).unwrap();
+    let (state_path, state_before) = seed_scoped_dry_run_state(root.path());
+    let config = support::write_config(root.path(), &fixture);
+
+    let output = scoped_dry_run(&config, "empty");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.path().join("empty").is_dir());
+    assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+    let mut remote =
+        Ftp::connect(&fixture.host, fixture.control_port, "test", "testpw", true).unwrap();
+    assert!(!remote_has_child(
+        &mut remote,
+        support::REMOTE_ROOT,
+        "empty"
+    ));
+
+    let _fixture_guard = &fixture.container;
+}

@@ -26,7 +26,24 @@ struct ProductionRemote {
     directories: BTreeSet<String>,
     files: BTreeMap<String, TestRemoteFile>,
     events: Vec<String>,
-    invalidate_on_snapshot: Option<(String, Arc<AtomicBool>)>,
+    invalidate_on_snapshot: Option<(String, usize, usize, Arc<AtomicBool>)>,
+    snapshot_mutation: Option<SnapshotMutation>,
+    strict_mkdir_error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotMutationKind {
+    RemoveDirectory,
+    ReplaceDirectoryWithFile,
+    AddDirectory,
+    AddFile,
+}
+
+struct SnapshotMutation {
+    path: String,
+    on_call: usize,
+    calls: usize,
+    kind: SnapshotMutationKind,
 }
 
 impl ProductionRemote {
@@ -51,6 +68,59 @@ impl ProductionRemote {
             },
         );
         self
+    }
+
+    fn mutate_snapshot(mut self, path: &str, on_call: usize, kind: SnapshotMutationKind) -> Self {
+        self.snapshot_mutation = Some(SnapshotMutation {
+            path: path.to_string(),
+            on_call,
+            calls: 0,
+            kind,
+        });
+        self
+    }
+
+    fn fail_strict_mkdir(mut self, message: &str) -> Self {
+        self.strict_mkdir_error = Some(message.to_string());
+        self
+    }
+
+    fn apply_snapshot_mutation(&mut self, path: &str) {
+        let kind = self.snapshot_mutation.as_mut().and_then(|mutation| {
+            if mutation.path != path {
+                return None;
+            }
+            mutation.calls += 1;
+            (mutation.calls == mutation.on_call).then_some(mutation.kind)
+        });
+        match kind {
+            Some(SnapshotMutationKind::RemoveDirectory) => {
+                self.directories.remove(path);
+            }
+            Some(SnapshotMutationKind::ReplaceDirectoryWithFile) => {
+                self.directories.remove(path);
+                self.files.insert(
+                    path.to_string(),
+                    TestRemoteFile {
+                        bytes: b"raced file".to_vec(),
+                        modified: test_mtime(40),
+                    },
+                );
+            }
+            Some(SnapshotMutationKind::AddDirectory) => {
+                self.directories.insert(path.to_string());
+            }
+            Some(SnapshotMutationKind::AddFile) => {
+                self.files.insert(
+                    path.to_string(),
+                    TestRemoteFile {
+                        bytes: b"raced file".to_vec(),
+                        modified: test_mtime(40),
+                    },
+                );
+            }
+            None => {}
+        }
     }
 
     fn parent(path: &str) -> &str {
@@ -221,6 +291,9 @@ impl RemoteWrite for ProductionRemote {
 
     fn mkdir_scoped_strict(&mut self, path: &str) -> Result<()> {
         self.events.push(format!("mkdir_strict {path}"));
+        if let Some(message) = &self.strict_mkdir_error {
+            anyhow::bail!(message.clone());
+        }
         self.directories.insert(path.to_string());
         Ok(())
     }
@@ -239,11 +312,15 @@ impl RemoteWrite for ProductionRemote {
         path: &str,
     ) -> Result<RemoteDestinationSnapshot> {
         self.events.push(format!("snapshot {path}"));
+        self.apply_snapshot_mutation(path);
         let result = self.snapshot(path);
-        if let Some((expected, current)) = &self.invalidate_on_snapshot
+        if let Some((expected, on_call, calls, current)) = &mut self.invalidate_on_snapshot
             && path == expected
         {
-            current.store(false, Ordering::SeqCst);
+            *calls += 1;
+            if *calls == *on_call {
+                current.store(false, Ordering::SeqCst);
+            }
         }
         result
     }
@@ -898,7 +975,7 @@ fn structured_production_final_directory_validation_invalidation_cancels_unchang
     std::fs::create_dir(root.path().join("shared")).unwrap();
     let current = Arc::new(AtomicBool::new(true));
     let mut remote = ProductionRemote::with_root().directory("/remote/shared");
-    remote.invalidate_on_snapshot = Some(("/remote/shared".into(), Arc::clone(&current)));
+    remote.invalidate_on_snapshot = Some(("/remote/shared".into(), 2, 0, Arc::clone(&current)));
     let mut state = StateFile::default();
     let gate = LiveGate { current };
 
@@ -923,4 +1000,373 @@ fn structured_production_final_directory_validation_invalidation_cancels_unchang
             .any(|event| event == "snapshot /remote/shared")
     );
     assert!(state.files.is_empty());
+}
+
+struct MutatingCommitGate {
+    mutation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl MutatingCommitGate {
+    fn new(mutation: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            mutation: Mutex::new(Some(Box::new(mutation))),
+        }
+    }
+}
+
+impl CommitGate for MutatingCommitGate {
+    fn is_current(&self) -> bool {
+        true
+    }
+
+    fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+        if let Some(race) = self.mutation.lock().unwrap().take() {
+            race();
+        }
+        mutation()?;
+        Ok(CommitDecision::Committed)
+    }
+}
+
+struct MutatingCurrentGate {
+    calls: AtomicUsize,
+    on_call: usize,
+    mutation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl MutatingCurrentGate {
+    fn new(on_call: usize, mutation: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            on_call,
+            mutation: Mutex::new(Some(Box::new(mutation))),
+        }
+    }
+}
+
+impl CommitGate for MutatingCurrentGate {
+    fn is_current(&self) -> bool {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.on_call
+            && let Some(race) = self.mutation.lock().unwrap().take()
+        {
+            race();
+        }
+        true
+    }
+
+    fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+        mutation()?;
+        Ok(CommitDecision::Committed)
+    }
+}
+
+#[test]
+fn directory_race_local_only_source_disappears_before_remote_create() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let raced = source.clone();
+    let gate = MutatingCommitGate::new(move || std::fs::remove_dir(raced).unwrap());
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert!(!remote.directories.contains("/remote/source"));
+    assert!(!remote.events.iter().any(|event| event.starts_with("mkdir")));
+}
+
+#[test]
+fn directory_race_local_only_source_becomes_file_before_remote_create() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let raced = source.clone();
+    let gate = MutatingCommitGate::new(move || {
+        std::fs::remove_dir(&raced).unwrap();
+        std::fs::write(raced, b"raced local file").unwrap();
+    });
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert_eq!(std::fs::read(source).unwrap(), b"raced local file");
+    assert!(!remote.directories.contains("/remote/source"));
+}
+
+#[test]
+fn directory_race_remote_only_source_disappears_before_local_create() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/source")
+        .mutate_snapshot("/remote/source", 2, SnapshotMutationKind::RemoveDirectory);
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert!(!root.path().join("source").exists());
+}
+
+#[test]
+fn directory_race_remote_only_source_becomes_file_before_local_create() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/source")
+        .mutate_snapshot(
+            "/remote/source",
+            2,
+            SnapshotMutationKind::ReplaceDirectoryWithFile,
+        );
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert!(!root.path().join("source").exists());
+    assert_eq!(remote.files["/remote/source"].bytes, b"raced file");
+}
+
+#[test]
+fn directory_race_missing_local_destination_appears_before_create() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("source");
+    let raced = destination.clone();
+    let gate = MutatingCommitGate::new(move || std::fs::create_dir(raced).unwrap());
+    let mut remote = ProductionRemote::with_root().directory("/remote/source");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert!(destination.is_dir());
+    assert!(remote.directories.contains("/remote/source"));
+}
+
+#[test]
+fn directory_race_missing_remote_destination_appears_before_create() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("source")).unwrap();
+    let mut remote = ProductionRemote::with_root().mutate_snapshot(
+        "/remote/source",
+        2,
+        SnapshotMutationKind::AddDirectory,
+    );
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert!(root.path().join("source").is_dir());
+    assert!(remote.directories.contains("/remote/source"));
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event == "mkdir_strict /remote/source")
+    );
+}
+
+#[test]
+fn directory_race_shared_local_directory_changes_type_before_final_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let shared = root.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let raced = shared.clone();
+    let gate = MutatingCurrentGate::new(2, move || {
+        std::fs::remove_dir(&raced).unwrap();
+        std::fs::write(raced, b"raced local file").unwrap();
+    });
+    let mut remote = ProductionRemote::with_root().directory("/remote/shared");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("shared".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("shared"));
+    assert_eq!(std::fs::read(shared).unwrap(), b"raced local file");
+    assert!(remote.directories.contains("/remote/shared"));
+}
+
+#[test]
+fn directory_race_shared_remote_directory_changes_type_before_final_validation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("shared")).unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/shared")
+        .mutate_snapshot(
+            "/remote/shared",
+            2,
+            SnapshotMutationKind::ReplaceDirectoryWithFile,
+        );
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("shared".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("shared"));
+    assert!(root.path().join("shared").is_dir());
+    assert_eq!(remote.files["/remote/shared"].bytes, b"raced file");
+}
+
+#[test]
+fn directory_race_unchanged_empty_scope_final_invalidation_cancels() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("empty")).unwrap();
+    let current = Arc::new(AtomicBool::new(true));
+    let mut remote = ProductionRemote::with_root().directory("/remote/empty");
+    remote.invalidate_on_snapshot = Some(("/remote/empty".into(), 2, 0, Arc::clone(&current)));
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("empty".into()),
+        false,
+        ExecutionMode::Apply,
+        &LiveGate { current },
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert!(root.path().join("empty").is_dir());
+    assert!(remote.directories.contains("/remote/empty"));
+}
+
+#[test]
+fn directory_race_strict_mkd_550_propagates_without_tolerant_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("source")).unwrap();
+    let mut remote = ProductionRemote::with_root().fail_strict_mkdir("550 denied");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("550 denied"));
+    assert!(root.path().join("source").is_dir());
+    assert!(!remote.directories.contains("/remote/source"));
+    assert!(
+        remote
+            .events
+            .iter()
+            .any(|event| event == "mkdir_strict /remote/source")
+    );
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event == "mkdir /remote/source")
+    );
+}
+
+#[test]
+fn directory_race_missing_remote_destination_file_appears_without_overwrite() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("source")).unwrap();
+    let mut remote = ProductionRemote::with_root().mutate_snapshot(
+        "/remote/source",
+        2,
+        SnapshotMutationKind::AddFile,
+    );
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("source".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("source"));
+    assert_eq!(remote.files["/remote/source"].bytes, b"raced file");
+    assert!(root.path().join("source").is_dir());
 }
