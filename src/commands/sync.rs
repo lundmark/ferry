@@ -389,18 +389,32 @@ pub fn run_scoped(
         anyhow::bail!("scoped sync requires an explicit path");
     }
 
-    let cfg = Config::load(config_path)?;
-    let local_root = cfg.paths.local_root.clone();
+    let config = Config::load(config_path)?;
+    run_scoped_from_config(&config, scope, force, mode, gate)
+}
+
+fn run_scoped_from_config(
+    config: &Config,
+    scope: SyncScope,
+    force: bool,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<SyncOutcome> {
+    if scope == SyncScope::LegacyProject {
+        anyhow::bail!("scoped sync requires an explicit path");
+    }
+
+    let local_root = config.paths.local_root.clone();
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
     let initial_files = state.files.clone();
-    let matcher = Matcher::new(&cfg.sync.ignore, &local_root)?;
+    let matcher = Matcher::new(&config.sync.ignore, &local_root)?;
     let mut ftp = Ftp::connect(
-        &cfg.connection.host,
-        cfg.connection.port,
-        &cfg.connection.user,
-        &cfg.connection.password,
-        cfg.connection.passive,
+        &config.connection.host,
+        config.connection.port,
+        &config.connection.user,
+        &config.connection.password,
+        config.connection.passive,
     )?;
     let mut remote = ScopedFtp { inner: &mut ftp };
 
@@ -408,7 +422,7 @@ pub fn run_scoped(
         &mut remote,
         &mut state,
         &local_root,
-        &cfg.paths.remote_root,
+        &config.paths.remote_root,
         &matcher,
         scope,
         force,
@@ -1553,6 +1567,22 @@ fn select_from_terminal(config: &Config) -> Result<Option<SyncScope>> {
     picker::select(&mut source, &mut io)
 }
 
+fn prepare_selected_sync(config_path: &Path, config: &Config, mode: ExecutionMode) {
+    if !mode.should_apply() {
+        return;
+    }
+
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Err(error) = crate::names::migrate_legacy(config_dir) {
+        eprintln!("warning: {error:#}");
+    }
+    if let Err(error) = crate::names::migrate_legacy(&config.paths.local_root) {
+        eprintln!("warning: {error:#}");
+    }
+}
+
 fn run_selected_with<Select, Run>(
     config_path: &Path,
     force: bool,
@@ -1562,7 +1592,7 @@ fn run_selected_with<Select, Run>(
 ) -> Result<()>
 where
     Select: FnOnce(&Config) -> Result<Option<SyncScope>>,
-    Run: FnOnce(&Path, SyncScope, bool, ExecutionMode) -> Result<SyncOutcome>,
+    Run: FnOnce(&Config, SyncScope, bool, ExecutionMode) -> Result<SyncOutcome>,
 {
     let config = Config::load(config_path)?;
     let Some(scope) = select_scope(&config)? else {
@@ -1571,7 +1601,8 @@ where
     if scope == SyncScope::LegacyProject {
         anyhow::bail!("interactive selection cannot use legacy project scope");
     }
-    let outcome = run_scope(config_path, scope, force, mode)?;
+    prepare_selected_sync(config_path, &config, mode);
+    let outcome = run_scope(&config, scope, force, mode)?;
     render_outcome(&outcome, mode)
 }
 
@@ -1592,8 +1623,8 @@ pub fn run_cli(
             force,
             mode,
             select_from_terminal,
-            |config_path, scope, force, mode| {
-                run_scoped(config_path, scope, force, mode, &UnconditionalCommitGate)
+            |config, scope, force, mode| {
+                run_scoped_from_config(config, scope, force, mode, &UnconditionalCommitGate)
             },
         );
     }
@@ -1918,9 +1949,11 @@ remote_root = "/chosen-root"
                 assert_eq!(loaded.paths.remote_root, "/chosen-root");
                 Ok(Some(SyncScope::Path("areas/smoke.c".into())))
             },
-            |path, scope, force, mode| {
+            |loaded, scope, force, mode| {
                 calls.set(calls.get() + 1);
-                assert_eq!(path, config_path);
+                assert_eq!(loaded.connection.host, "example.invalid");
+                assert_eq!(loaded.paths.local_root, project.path().join("mirror"));
+                assert_eq!(loaded.paths.remote_root, "/chosen-root");
                 assert_eq!(scope, SyncScope::Path("areas/smoke.c".into()));
                 assert!(force);
                 assert_eq!(mode, ExecutionMode::DryRun);
@@ -1930,6 +1963,159 @@ remote_root = "/chosen-root"
         .unwrap();
 
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn selected_cli_uses_the_browsed_config_snapshot_after_config_replacement() {
+        let project = tempfile::tempdir().unwrap();
+        let config_path = config(project.path());
+        let replacement_root = project.path().join("replacement");
+        std::fs::create_dir(&replacement_root).unwrap();
+        let calls = Cell::new(0);
+
+        super::run_selected_with(
+            &config_path,
+            true,
+            ExecutionMode::DryRun,
+            |loaded| {
+                assert_eq!(loaded.connection.host, "example.invalid");
+                assert_eq!(loaded.paths.local_root, project.path().join("mirror"));
+                assert_eq!(loaded.paths.remote_root, "/chosen-root");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        r#"
+[connection]
+host = "replacement.invalid"
+user = "replacement"
+password = "replacement"
+[paths]
+local_root = "{}"
+remote_root = "/replacement-root"
+"#,
+                        replacement_root.display()
+                    ),
+                )
+                .unwrap();
+                Ok(Some(SyncScope::Path("areas/smoke.c".into())))
+            },
+            |loaded, scope, force, mode| {
+                calls.set(calls.get() + 1);
+                assert_eq!(loaded.connection.host, "example.invalid");
+                assert_eq!(loaded.paths.local_root, project.path().join("mirror"));
+                assert_eq!(loaded.paths.remote_root, "/chosen-root");
+                assert_eq!(scope, SyncScope::Path("areas/smoke.c".into()));
+                assert!(force);
+                assert_eq!(mode, ExecutionMode::DryRun);
+
+                let replaced = crate::config::Config::load(&config_path).unwrap();
+                assert_eq!(replaced.connection.host, "replacement.invalid");
+                assert_eq!(replaced.paths.local_root, replacement_root);
+                assert_eq!(replaced.paths.remote_root, "/replacement-root");
+                Ok(super::SyncOutcome::default())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn selected_cli_apply_prepares_legacy_names_after_selection() {
+        let project = tempfile::tempdir().unwrap();
+        let mirror = project.path().join("mirror");
+        std::fs::create_dir(&mirror).unwrap();
+        let config_path = project.path().join(crate::names::LEGACY_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+[connection]
+host = "example.invalid"
+user = "u"
+password = "p"
+[paths]
+local_root = "mirror"
+remote_root = "/chosen-root"
+"#,
+        )
+        .unwrap();
+        let legacy_state = mirror.join(crate::names::LEGACY_STATE_DIR);
+        std::fs::create_dir(&legacy_state).unwrap();
+        std::fs::write(legacy_state.join("marker"), b"legacy").unwrap();
+        let calls = Cell::new(0);
+
+        super::run_selected_with(
+            &config_path,
+            false,
+            ExecutionMode::Apply,
+            |_| Ok(Some(SyncScope::RootDirectory)),
+            |loaded, scope, _, _| {
+                calls.set(calls.get() + 1);
+                assert_eq!(loaded.paths.local_root, mirror);
+                assert_eq!(scope, SyncScope::RootDirectory);
+                assert!(
+                    project.path().join(crate::names::CONFIG_FILE).exists(),
+                    "accepted selection should migrate the legacy config"
+                );
+                assert!(!config_path.exists());
+                assert!(
+                    loaded
+                        .paths
+                        .local_root
+                        .join(crate::names::STATE_DIR)
+                        .join("marker")
+                        .exists(),
+                    "accepted selection should migrate legacy local-root state"
+                );
+                assert!(!legacy_state.exists());
+                Ok(super::SyncOutcome::default())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn selected_cli_cancel_keeps_legacy_names_untouched() {
+        let project = tempfile::tempdir().unwrap();
+        let mirror = project.path().join("mirror");
+        std::fs::create_dir(&mirror).unwrap();
+        let config_path = project.path().join(crate::names::LEGACY_CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            r#"
+[connection]
+host = "example.invalid"
+user = "u"
+password = "p"
+[paths]
+local_root = "mirror"
+remote_root = "/chosen-root"
+"#,
+        )
+        .unwrap();
+        let config_before = std::fs::read(&config_path).unwrap();
+        let legacy_state = mirror.join(crate::names::LEGACY_STATE_DIR);
+        std::fs::create_dir(&legacy_state).unwrap();
+        std::fs::write(legacy_state.join("marker"), b"legacy").unwrap();
+
+        super::run_selected_with(
+            &config_path,
+            false,
+            ExecutionMode::Apply,
+            |_| Ok(None),
+            |_, _, _, _| unreachable!("cancelled selection must not execute"),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+        assert_eq!(
+            std::fs::read(legacy_state.join("marker")).unwrap(),
+            b"legacy"
+        );
+        assert!(!project.path().join(crate::names::CONFIG_FILE).exists());
+        assert!(!mirror.join(crate::names::STATE_DIR).exists());
     }
 
     #[test]
