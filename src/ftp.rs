@@ -91,7 +91,7 @@ impl Ftp {
         let lines = self
             .inner
             .list(Some(dir))
-            .with_context(|| format!("ftp list {}", sanitize_for_message(dir)))?;
+            .map_err(|error| strict_list_transport_error(dir, error))?;
 
         parse_listing_strict(dir, &lines)
     }
@@ -107,6 +107,13 @@ impl Ftp {
             .with_context(|| format!("ftp nlst {path}"))?;
         exact_nlst_presence(path, &lines)
     }
+}
+
+fn strict_list_transport_error(dir: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp list {}: remote listing failed",
+        sanitize_for_message(dir)
+    )
 }
 
 fn parse_listing_tolerant(lines: &[String]) -> Vec<Entry> {
@@ -267,10 +274,29 @@ impl Ftp {
 mod tests {
     use super::{
         ExactFilePresence, exact_nlst_presence, parse_listing_strict, parse_listing_tolerant,
+        strict_list_transport_error,
     };
 
     const VALID_POSIX_FILE: &str = "-rw-r--r-- 1 owner group 42 Jan 1 2000 file.txt";
     const VALID_POSIX_DIRECTORY: &str = "drwxr-xr-x 2 owner group 4096 Jan 1 2000 subdir";
+
+    #[test]
+    fn strict_listing_transport_error_omits_server_response() {
+        const ATTACKER_REPLY: &str = "\u{1b}[31mattacker-reply";
+        let transport_error =
+            suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+                suppaftp::Status::FileUnavailable,
+                ATTACKER_REPLY.as_bytes().to_vec(),
+            ));
+
+        let error = strict_list_transport_error("/root", transport_error);
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ftp list /root"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("attacker-reply"));
+        assert!(message.contains("remote listing failed"));
+    }
 
     #[test]
     fn strict_listing_rejects_one_malformed_line_among_valid_entries() {
