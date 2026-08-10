@@ -31,7 +31,22 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub fn run(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
+pub mod scope;
+
+pub fn run_cli(
+    config_path: &Path,
+    path: Option<&str>,
+    select: bool,
+    force: bool,
+    mode: ExecutionMode,
+) -> Result<()> {
+    if path.is_none() && !select {
+        return run_legacy(config_path, force, mode);
+    }
+    anyhow::bail!("scoped sync is not implemented yet")
+}
+
+fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let state_path = state_path_for(&local_root, mode);

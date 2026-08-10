@@ -52,6 +52,9 @@ enum Cmd {
     },
     /// Pull then push; refuses on conflict unless --force.
     Sync {
+        path: Option<String>,
+        #[arg(long, conflicts_with = "path")]
+        select: bool,
         #[arg(long)]
         force: bool,
     },
@@ -131,7 +134,11 @@ fn run() -> i32 {
         Cmd::Status => ferry::commands::status::run(&cfg, mode),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
-        Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force, mode),
+        Cmd::Sync {
+            path,
+            select,
+            force,
+        } => ferry::commands::sync::run_cli(&cfg, path.as_deref(), select, force, mode),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
     };
@@ -205,6 +212,64 @@ fn code_for(exit: &ferry::Exit) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_accepts_zero_or_one_path_or_select() {
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync"]).unwrap().cmd,
+            Cmd::Sync {
+                path: None,
+                select: false,
+                force: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "areas"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: Some(path),
+                select: false,
+                force: false
+            } if path == "areas"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "--select"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: None,
+                select: true,
+                force: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "areas", "--force"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: Some(path),
+                select: false,
+                force: true
+            } if path == "areas"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "--select", "--force"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: None,
+                select: true,
+                force: true
+            }
+        ));
+    }
+
+    #[test]
+    fn sync_rejects_multiple_paths_and_path_plus_select() {
+        assert!(Cli::try_parse_from(["ferry", "sync", "one", "two"]).is_err());
+        assert!(Cli::try_parse_from(["ferry", "sync", "one", "--select"]).is_err());
+    }
 
     #[test]
     fn init_default_config_stays_in_cwd() {
