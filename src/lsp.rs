@@ -4919,48 +4919,73 @@ mod tests {
     }
 
     #[test]
-    fn scoped_sync_acknowledges_before_completion_and_keeps_code_actions_responsive() {
-        let fixture = Fixture::new("");
-        let (client, loop_thread, started, release) = start_blocking_sync_loop();
-        client
-            .sender
-            .send(Message::Notification(did_open(fixture.uri())))
-            .unwrap();
-        client
-            .sender
-            .send(Message::Request(execute_command_request(
-                194,
+    fn both_scoped_sync_commands_acknowledge_before_completion_and_keep_actions_responsive() {
+        for (offset, command, expected_scope) in [
+            (
+                0,
+                SYNC_FILE_COMMAND,
+                SyncScope::Path("src/nested/hello world.c".to_string()),
+            ),
+            (
+                1,
                 SYNC_FOLDER_COMMAND,
-                vec![serde_json::to_value(fixture.uri()).unwrap()],
-            )))
-            .unwrap();
-
-        receive_acknowledgement(&client, 194);
-        assert_eq!(
-            started.recv_timeout(Duration::from_secs(2)).unwrap(),
-            SyncScope::Path("src/nested".to_string())
-        );
-        assert!(client.receiver.try_recv().is_err(), "sync is still blocked");
-
-        client
-            .sender
-            .send(Message::Request(code_action_request(195, &fixture.uri())))
-            .unwrap();
-        let response = response_with_id(
+                SyncScope::Path("src/nested".to_string()),
+            ),
+        ] {
+            let fixture = Fixture::new("");
+            let (client, loop_thread, started, release) = start_blocking_sync_loop();
             client
-                .receiver
-                .recv_timeout(Duration::from_secs(2))
-                .expect("responsive Code Action response"),
-            195,
-        );
-        assert!(response.error.is_none());
-        assert_eq!(response.result.unwrap().as_array().unwrap().len(), 7);
+                .sender
+                .send(Message::Notification(did_open(fixture.uri())))
+                .unwrap();
+            let command_id = 194 + offset * 3;
+            client
+                .sender
+                .send(Message::Request(execute_command_request(
+                    command_id,
+                    command,
+                    vec![serde_json::to_value(fixture.uri()).unwrap()],
+                )))
+                .unwrap();
 
-        release.send(()).unwrap();
-        let feedback = receive_show_message(&client, "scoped-sync completion");
-        assert_eq!(feedback.typ, MessageType::INFO);
-        assert!(feedback.message.starts_with("ferry: sync complete:"));
-        finish_loop(&client, loop_thread, 196);
+            receive_acknowledgement(&client, command_id);
+            assert_eq!(
+                started.recv_timeout(Duration::from_secs(2)).unwrap(),
+                expected_scope,
+                "{command}"
+            );
+            assert!(
+                client.receiver.try_recv().is_err(),
+                "{command} is still blocked"
+            );
+
+            let action_id = command_id + 1;
+            client
+                .sender
+                .send(Message::Request(code_action_request(
+                    action_id,
+                    &fixture.uri(),
+                )))
+                .unwrap();
+            let response = response_with_id(
+                client
+                    .receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("responsive Code Action response"),
+                action_id,
+            );
+            assert!(response.error.is_none(), "{command}");
+            assert_eq!(response.result.unwrap().as_array().unwrap().len(), 7);
+
+            release.send(()).unwrap();
+            let feedback = receive_show_message(&client, "scoped-sync completion");
+            assert_eq!(feedback.typ, MessageType::INFO, "{command}");
+            assert!(
+                feedback.message.starts_with("ferry: sync complete:"),
+                "{command}"
+            );
+            finish_loop(&client, loop_thread, command_id + 2);
+        }
     }
 
     #[derive(Clone, Copy, Debug)]
