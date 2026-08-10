@@ -31,6 +31,9 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+// The scoped sync engine wires this collector in Task 5.
+#[allow(dead_code)]
+mod inventory;
 pub mod scope;
 
 pub fn run_cli(
