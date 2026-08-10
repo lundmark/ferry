@@ -127,7 +127,7 @@ fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
         }
         let file = suppaftp::list::File::from_posix_line(line).map_err(|_| {
             anyhow::anyhow!(
-                "ftp list {}: malformed record {index}",
+                "ftp list {}: invalid record {index}",
                 sanitize_for_message(dir)
             )
         })?;
@@ -286,6 +286,7 @@ mod tests {
         assert!(message.contains("ftp list /root"));
         assert!(message.contains("record 1"));
         assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("malformed"));
     }
 
     #[test]
