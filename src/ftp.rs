@@ -124,6 +124,46 @@ fn strict_mkdir_transport_error(path: &str, _error: suppaftp::FtpError) -> anyho
     )
 }
 
+fn scoped_download_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped download {}: remote read failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_upload_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped upload {}: remote write failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_mtime_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped mtime {}: remote metadata read failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_rename_transport_error(
+    from: &str,
+    to: &str,
+    _error: suppaftp::FtpError,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped rename {} -> {}: remote rename failed",
+        sanitize_for_message(from),
+        sanitize_for_message(to)
+    )
+}
+
+fn scoped_rm_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped rm {}: remote remove failed",
+        sanitize_for_message(path)
+    )
+}
+
 fn parse_listing_tolerant(lines: &[String]) -> Vec<Entry> {
     lines
         .iter()
@@ -209,6 +249,47 @@ impl Ftp {
             })
             .with_context(|| format!("ftp download {remote_path}"))?;
         Ok(copied)
+    }
+
+    pub(crate) fn upload_bytes_scoped(&mut self, remote_path: &str, data: &[u8]) -> Result<()> {
+        let mut reader = Cursor::new(data);
+        self.inner
+            .put_file(remote_path, &mut reader)
+            .map_err(|error| scoped_upload_transport_error(remote_path, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn download_scoped(&mut self, remote_path: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.inner
+            .retr(remote_path, |reader| {
+                std::io::copy(reader, &mut bytes).map_err(suppaftp::FtpError::ConnectionError)?;
+                Ok(())
+            })
+            .map_err(|error| scoped_download_transport_error(remote_path, error))?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn mtime_scoped(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
+        let naive = self
+            .inner
+            .mdtm(remote_path)
+            .map_err(|error| scoped_mtime_transport_error(remote_path, error))?;
+        Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+    }
+
+    pub(crate) fn rename_scoped(&mut self, from: &str, to: &str) -> Result<()> {
+        self.inner
+            .rename(from, to)
+            .map_err(|error| scoped_rename_transport_error(from, to, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn rm_scoped(&mut self, path: &str) -> Result<()> {
+        self.inner
+            .rm(path)
+            .map_err(|error| scoped_rm_transport_error(path, error))?;
+        Ok(())
     }
 
     pub fn size(&mut self, remote_path: &str) -> Result<u64> {
@@ -299,6 +380,8 @@ impl Ftp {
 mod tests {
     use super::{
         ExactFilePresence, exact_nlst_presence, parse_listing_strict, parse_listing_tolerant,
+        scoped_download_transport_error, scoped_mtime_transport_error,
+        scoped_rename_transport_error, scoped_rm_transport_error, scoped_upload_transport_error,
         strict_list_transport_error, strict_mkdir_transport_error,
     };
 
@@ -340,6 +423,34 @@ mod tests {
         assert!(!message.contains('\u{1b}'));
         assert!(!message.contains("attacker-reply"));
         assert!(message.contains("remote create failed"));
+    }
+
+    fn attacker_reply() -> suppaftp::FtpError {
+        suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+            suppaftp::Status::FileUnavailable,
+            b"\x1b[31mattacker-reply\nsecond-line".to_vec(),
+        ))
+    }
+
+    #[test]
+    fn scoped_transfer_errors_drop_every_raw_server_reply_and_escape_paths() {
+        let errors = [
+            scoped_download_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_upload_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_mtime_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_rename_transport_error("/root/from\nname", "/root/to\nname", attacker_reply()),
+            scoped_rm_transport_error("/root/unsafe\nname", attacker_reply()),
+        ];
+
+        for error in errors {
+            let message = format!("{error:#}");
+            assert!(message.contains("ftp scoped"), "{message}");
+            assert!(message.contains("\\n"), "{message}");
+            assert!(!message.contains('\n'), "{message}");
+            assert!(!message.contains('\u{1b}'), "{message}");
+            assert!(!message.contains("attacker-reply"), "{message}");
+            assert!(!message.contains("second-line"), "{message}");
+        }
     }
 
     #[test]

@@ -330,21 +330,21 @@ impl StrictDestinationRead for Ftp {
     }
 
     fn download_destination(&mut self, path: &str) -> Result<Vec<u8>> {
-        Ftp::download(self, path)
+        Ftp::download_scoped(self, path)
     }
 }
 
 impl RemoteWrite for Ftp {
     fn upload_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
-        Ftp::upload_bytes(self, path, bytes)
+        Ftp::upload_bytes_scoped(self, path, bytes)
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
-        Ftp::rename(self, from, to)
+        Ftp::rename_scoped(self, from, to)
     }
 
     fn rm(&mut self, path: &str) -> Result<()> {
-        Ftp::rm(self, path)
+        Ftp::rm_scoped(self, path)
     }
 
     fn mkdir(&mut self, path: &str) -> Result<()> {
@@ -356,7 +356,7 @@ impl RemoteWrite for Ftp {
     }
 
     fn mtime(&mut self, path: &str) -> Result<DateTime<Utc>> {
-        Ftp::mtime(self, path)
+        Ftp::mtime_scoped(self, path)
     }
 
     fn destination_snapshot(
