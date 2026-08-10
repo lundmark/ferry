@@ -5,9 +5,6 @@
 //! way an accidentally-empty remote (or an interrupted upload by someone
 //! else) cannot wipe your working tree.
 
-// Task 4 exposes guarded primitives that the scoped engine wires in Task 5.
-#![allow(dead_code)]
-
 mod prepared;
 
 pub use prepared::{
@@ -294,10 +291,12 @@ pub fn download_one(
 }
 
 #[derive(Debug)]
+#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 pub(crate) struct ExpectedLocalDestination {
     snapshot: LocalPathExpectation,
 }
 
+#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 impl ExpectedLocalDestination {
     pub(crate) fn capture(local_root: &Path, local_path: &Path) -> Result<Self> {
         Ok(Self {
@@ -323,6 +322,7 @@ impl ExpectedLocalDestination {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 pub(crate) fn download_one_guarded(
     state: &mut StateFile,
     local_path: &Path,
@@ -401,6 +401,7 @@ pub(crate) fn stage_local_write(path: &Path, bytes: &[u8]) -> Result<StagedLocal
     Ok(staged)
 }
 
+#[allow(dead_code, reason = "wired by scoped transfer commits in Task 5")]
 fn stage_local_write_scoped(
     expected: &ExpectedLocalDestination,
     bytes: &[u8],
