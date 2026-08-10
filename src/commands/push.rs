@@ -413,15 +413,12 @@ struct IntendedRemoteTempPayload<'a> {
 }
 
 impl IntendedRemoteTempPayload<'_> {
-    fn matching_modified(self, snapshot: &RemoteDestinationSnapshot) -> Option<DateTime<Utc>> {
-        match snapshot {
-            RemoteDestinationSnapshot::File {
-                size,
-                modified,
-                sha256,
-            } if *size == self.size && sha256 == self.sha256 => Some(*modified),
-            _ => None,
-        }
+    fn matches_snapshot(self, snapshot: &RemoteDestinationSnapshot) -> bool {
+        matches!(
+            snapshot,
+            RemoteDestinationSnapshot::File { size, sha256, .. }
+                if *size == self.size && sha256 == self.sha256
+        )
     }
 }
 
@@ -518,8 +515,17 @@ fn stage_remote_write_guarded_with_candidates<R: RemoteWrite>(
                 return Err(error).with_context(|| format!("capturing remote temp {temp_path:?}"));
             }
         };
-        let Some(modified) = intended.matching_modified(&temp_snapshot) else {
+        if !intended.matches_snapshot(&temp_snapshot) {
             anyhow::bail!("remote temp changed while staging at {temp_path:?}");
+        }
+        let modified = match remote.mtime(&temp_path) {
+            Ok(modified) => modified,
+            Err(error) => {
+                cleanup_remote_snapshot(remote, remote_root, &temp_path, &temp_snapshot);
+                return Err(error).with_context(|| {
+                    format!("fetching exact mtime for remote temp {temp_path:?}")
+                });
+            }
         };
         return Ok(StagedRemoteWrite {
             temp_path,
@@ -542,7 +548,7 @@ fn cleanup_intended_remote_temp<R: RemoteWrite>(
     let Ok(snapshot) = remote.destination_snapshot(remote_root, temp_path) else {
         return;
     };
-    if intended.matching_modified(&snapshot).is_some() {
+    if intended.matches_snapshot(&snapshot) {
         let _ = remote.rm(temp_path);
     }
 }
@@ -626,6 +632,18 @@ fn verify_remote_temp<R: RemoteWrite>(
     if current != staged.temp_snapshot {
         anyhow::bail!(
             "remote temp changed before commit at {:?}",
+            staged.temp_path
+        );
+    }
+    let current_mtime = remote.mtime(&staged.temp_path).with_context(|| {
+        format!(
+            "fetching exact mtime for remote temp {:?}",
+            staged.temp_path
+        )
+    })?;
+    if current_mtime != staged.modified {
+        anyhow::bail!(
+            "remote temp mtime changed before commit at {:?}",
             staged.temp_path
         );
     }
@@ -756,7 +774,9 @@ mod staging_tests {
         directories: BTreeSet<String>,
         files: BTreeMap<String, Vec<u8>>,
         mtimes: BTreeMap<String, DateTime<Utc>>,
+        list_mtimes: BTreeMap<String, DateTime<Utc>>,
         snapshots: BTreeMap<String, VecDeque<Result<RemoteDestinationSnapshot>>>,
+        temp_mtime_results: VecDeque<Result<DateTime<Utc>>>,
         temp_snapshot_count: usize,
         replace_temp_on_snapshot: Option<(usize, Vec<u8>)>,
         replace_temp_on_upload_error: Option<Vec<u8>>,
@@ -779,6 +799,7 @@ mod staging_tests {
 
         fn put_existing(&mut self, path: &str, bytes: &[u8], modified: DateTime<Utc>) {
             self.files.insert(path.to_string(), bytes.to_vec());
+            self.list_mtimes.insert(path.to_string(), modified);
             self.mtimes.insert(path.to_string(), modified);
         }
 
@@ -811,10 +832,12 @@ mod staging_tests {
                 anyhow::bail!("missing remote parent");
             }
             self.files.insert(path.to_string(), bytes.to_vec());
+            self.list_mtimes.insert(path.to_string(), mtime(40));
             self.mtimes.insert(path.to_string(), mtime(40));
             if self.upload_error {
                 if let Some(replacement) = self.replace_temp_on_upload_error.clone() {
                     self.files.insert(path.to_string(), replacement);
+                    self.list_mtimes.insert(path.to_string(), mtime(58));
                     self.mtimes.insert(path.to_string(), mtime(58));
                 }
                 anyhow::bail!("scripted partial upload failure");
@@ -831,12 +854,17 @@ mod staging_tests {
                 .files
                 .remove(from)
                 .ok_or_else(|| anyhow::anyhow!("missing rename source"))?;
+            let list_modified = self
+                .list_mtimes
+                .remove(from)
+                .ok_or_else(|| anyhow::anyhow!("missing rename source LIST mtime"))?;
             let modified = self
                 .mtimes
                 .remove(from)
                 .ok_or_else(|| anyhow::anyhow!("missing rename source mtime"))?;
             self.files.insert(to.to_string(), bytes);
             self.mtimes.insert(to.to_string(), modified);
+            self.list_mtimes.insert(to.to_string(), list_modified);
             Ok(())
         }
 
@@ -844,6 +872,7 @@ mod staging_tests {
             self.events.push(format!("rm {path}"));
             self.files.remove(path);
             self.mtimes.remove(path);
+            self.list_mtimes.remove(path);
             Ok(())
         }
 
@@ -864,6 +893,11 @@ mod staging_tests {
 
         fn mtime(&mut self, path: &str) -> Result<DateTime<Utc>> {
             self.events.push(format!("mtime {path}"));
+            if crate::commands::transfer_temp::is_reserved_transfer_temp(path)
+                && let Some(result) = self.temp_mtime_results.pop_front()
+            {
+                return result;
+            }
             if self.mtime_error {
                 anyhow::bail!("scripted mtime failure");
             }
@@ -888,6 +922,7 @@ mod staging_tests {
                     .map(|(_, bytes)| bytes.clone());
                 if let Some(bytes) = replacement {
                     self.files.insert(path.to_string(), bytes);
+                    self.list_mtimes.insert(path.to_string(), mtime(59));
                     self.mtimes.insert(path.to_string(), mtime(59));
                 }
             }
@@ -905,7 +940,7 @@ mod staging_tests {
             match self.files.get(path) {
                 Some(bytes) => Ok(file_snapshot(
                     bytes,
-                    *self.mtimes.get(path).expect("file mtime"),
+                    *self.list_mtimes.get(path).expect("file LIST mtime"),
                 )),
                 None => Ok(RemoteDestinationSnapshot::Missing),
             }
@@ -1255,6 +1290,7 @@ mod staging_tests {
             snapshot: RemoteDestinationSnapshot::Missing,
         };
         let mut remote = FakeRemote::with_remote_root();
+        remote.temp_mtime_results = VecDeque::from([Ok(mtime(41)), Ok(mtime(41))]);
         let mut state = StateFile::default();
         let claimed_at = Arc::new(Mutex::new(None));
         let claimed_at_for_gate = Arc::clone(&claimed_at);
@@ -1267,20 +1303,37 @@ mod staging_tests {
 
         assert_eq!(decision, CommitDecision::Committed);
         assert_eq!(remote.files["/remote/page.txt"], bytes);
-        assert_eq!(state.files["page.txt"].remote_mtime, mtime(40));
+        assert_eq!(state.files["page.txt"].remote_mtime, mtime(41));
         assert!(state.files["page.txt"].last_synced >= claimed_at.lock().unwrap().unwrap());
-        assert!(
-            remote
-                .events
-                .iter()
-                .all(|event| !event.starts_with("mtime "))
-        );
-        assert_eq!(transfer_temp_events(&remote.events, "snapshot ").len(), 3);
+        let temp_snapshot_indices: Vec<_> = remote
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event
+                    .strip_prefix("snapshot ")
+                    .is_some_and(crate::commands::transfer_temp::is_reserved_transfer_temp)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let mtime_indices: Vec<_> = remote
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.starts_with("mtime "))
+            .map(|(index, _)| index)
+            .collect();
         let rename_index = remote
             .events
             .iter()
             .position(|event| event.starts_with("rename "))
             .unwrap();
+        assert_eq!(temp_snapshot_indices.len(), 3);
+        assert_eq!(mtime_indices.len(), 2);
+        assert!(temp_snapshot_indices[1] < mtime_indices[0]);
+        assert!(mtime_indices[0] < temp_snapshot_indices[2]);
+        assert!(temp_snapshot_indices[2] < mtime_indices[1]);
+        assert!(mtime_indices[1] < rename_index);
         assert!(
             remote.events[rename_index + 1..]
                 .iter()
@@ -1445,6 +1498,124 @@ mod staging_tests {
         assert_eq!(remote.files[&staged.temp_path], b"new local");
         remote.rm(&staged.temp_path).unwrap();
         assert_eq!(remote.files[&occupied], b"foreign temp");
+    }
+
+    #[test]
+    fn guarded_remote_staging_mdtm_error_cleans_the_exact_staged_snapshot() {
+        let mut remote = FakeRemote::with_remote_root();
+        remote.temp_mtime_results =
+            VecDeque::from([Err(anyhow::anyhow!("scripted staging MDTM failure"))]);
+        let candidate = transfer_candidate("77777777777777777777777777777777");
+
+        let error = stage_remote_write_guarded_with_candidates(
+            &mut remote,
+            "/remote",
+            "/remote/page.txt",
+            b"new local",
+            &hash_bytes(b"new local"),
+            || Ok(candidate.clone()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("exact mtime"));
+        assert!(!remote.files.contains_key(&candidate));
+        assert_eq!(transfer_temp_events(&remote.events, "snapshot ").len(), 3);
+        assert_eq!(transfer_temp_events(&remote.events, "rm "), [candidate]);
+    }
+
+    #[test]
+    fn guarded_remote_staging_mdtm_error_preserves_a_replacement() {
+        let mut remote = FakeRemote::with_remote_root();
+        remote.temp_mtime_results =
+            VecDeque::from([Err(anyhow::anyhow!("scripted staging MDTM failure"))]);
+        let candidate = transfer_candidate("88888888888888888888888888888888");
+        remote.replace_temp_on_snapshot(3, b"foreign replacement");
+
+        let error = stage_remote_write_guarded_with_candidates(
+            &mut remote,
+            "/remote",
+            "/remote/page.txt",
+            b"new local",
+            &hash_bytes(b"new local"),
+            || Ok(candidate.clone()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("exact mtime"));
+        assert_eq!(remote.files[&candidate], b"foreign replacement");
+        assert_eq!(transfer_temp_events(&remote.events, "snapshot ").len(), 3);
+        assert!(transfer_temp_events(&remote.events, "rm ").is_empty());
+    }
+
+    #[test]
+    fn guarded_upload_rejects_claim_time_exact_mtime_change() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"new local";
+        let (_path, source) = source(root.path(), bytes);
+        let destination = ExpectedRemoteDestination {
+            snapshot: RemoteDestinationSnapshot::Missing,
+        };
+        let mut remote = FakeRemote::with_remote_root();
+        remote.temp_mtime_results = VecDeque::from([Ok(mtime(41)), Ok(mtime(42))]);
+        let mut state = StateFile::default();
+
+        let error = upload(
+            &mut remote,
+            &mut state,
+            bytes,
+            &source,
+            &destination,
+            &CommitGateNow,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("remote temp mtime changed"));
+        assert!(!remote.files.contains_key("/remote/page.txt"));
+        assert!(transfer_temp_paths(&remote).is_empty());
+        assert!(state.files.is_empty());
+        assert!(
+            !remote
+                .events
+                .iter()
+                .any(|event| event.starts_with("rename "))
+        );
+    }
+
+    #[test]
+    fn guarded_upload_rejects_claim_time_exact_mtime_error() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"new local";
+        let (_path, source) = source(root.path(), bytes);
+        let destination = ExpectedRemoteDestination {
+            snapshot: RemoteDestinationSnapshot::Missing,
+        };
+        let mut remote = FakeRemote::with_remote_root();
+        remote.temp_mtime_results = VecDeque::from([
+            Ok(mtime(41)),
+            Err(anyhow::anyhow!("scripted claim MDTM failure")),
+        ]);
+        let mut state = StateFile::default();
+
+        let error = upload(
+            &mut remote,
+            &mut state,
+            bytes,
+            &source,
+            &destination,
+            &CommitGateNow,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("exact mtime"));
+        assert!(!remote.files.contains_key("/remote/page.txt"));
+        assert!(transfer_temp_paths(&remote).is_empty());
+        assert!(state.files.is_empty());
+        assert!(
+            !remote
+                .events
+                .iter()
+                .any(|event| event.starts_with("rename "))
+        );
     }
 
     #[test]
