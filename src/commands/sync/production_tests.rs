@@ -385,6 +385,152 @@ fn state_record(bytes: &[u8]) -> FileRecord {
     }
 }
 
+fn stale_cached_state_record(bytes: &[u8]) -> FileRecord {
+    FileRecord {
+        sha256: hash_bytes(bytes),
+        size: bytes.len() as u64,
+        remote_mtime: test_mtime(1),
+        last_synced: test_mtime(2),
+    }
+}
+
+#[test]
+fn stale_cached_remote_hash_reclassifies_actual_both_changed_as_conflict() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.c"), b"loc").unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/file.c", b"rem");
+    let mut state = StateFile::default();
+    state
+        .files
+        .insert("file.c".into(), stale_cached_state_record(b"old"));
+    let original_record = state.files["file.c"].clone();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("file.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert!(outcome.events.is_empty());
+    assert_eq!(
+        outcome.issues,
+        vec![SyncIssue::FileConflict {
+            path: "file.c".into(),
+            state: crate::state::FileState::BothChanged,
+        }]
+    );
+    assert_eq!(remote.files["/remote/file.c"].bytes, b"rem");
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event.starts_with("upload ") || event.starts_with("rename "))
+    );
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "snapshot /remote/file.c")
+            .count(),
+        1
+    );
+    assert_eq!(state.files["file.c"], original_record);
+}
+
+#[test]
+fn stale_cached_remote_hash_force_uses_actual_destination_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.c"), b"loc").unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/file.c", b"rem");
+    let mut state = StateFile::default();
+    state
+        .files
+        .insert("file.c".into(), stale_cached_state_record(b"old"));
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("file.c".into()),
+        true,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.events,
+        vec![SyncEvent {
+            path: "file.c".into(),
+            kind: SyncEventKind::ForcedRemoteOverwrite,
+        }]
+    );
+    assert!(outcome.issues.is_empty());
+    assert_eq!(remote.files["/remote/file.c"].bytes, b"loc");
+    assert_eq!(state.files["file.c"].sha256, hash_bytes(b"loc"));
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "snapshot /remote/file.c")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn stale_cached_remote_hash_matching_local_becomes_unchanged_without_upload() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("file.c"), b"new").unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/file.c", b"new");
+    let mut state = StateFile::default();
+    state
+        .files
+        .insert("file.c".into(), stale_cached_state_record(b"old"));
+    let original_record = state.files["file.c"].clone();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("file.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.events,
+        vec![SyncEvent {
+            path: "file.c".into(),
+            kind: SyncEventKind::Unchanged,
+        }]
+    );
+    assert!(outcome.issues.is_empty());
+    assert_eq!(remote.files["/remote/file.c"].bytes, b"new");
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event.starts_with("upload ") || event.starts_with("rename "))
+    );
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "snapshot /remote/file.c")
+            .count(),
+        1
+    );
+    assert_eq!(state.files["file.c"], original_record);
+}
+
 fn run_hash_case(
     local: Option<&[u8]>,
     remote_bytes: Option<&[u8]>,

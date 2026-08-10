@@ -208,6 +208,12 @@ pub(crate) struct ExpectedDirectorySnapshots {
 }
 
 #[derive(Debug)]
+struct AuthoritativeUploadCandidate {
+    state: FileState,
+    destination: ExpectedRemoteDestination,
+}
+
+#[derive(Debug)]
 struct PreparedTransfer {
     event: ScheduledAction,
     operation: PreparedOperation,
@@ -332,11 +338,36 @@ where
             .files
             .get(&relative)
             .map(|record| record.sha256.as_str());
-        let file_state = classify(
+        let preliminary_state = classify(
             local_hash.as_deref(),
             remote_hash.as_ref().map(|hash| hash.sha256.as_str()),
             known,
         );
+        let mut upload_candidate = if matches!(
+            preliminary_state,
+            FileState::LocalChanged | FileState::LocalOnly
+        ) || force
+            && matches!(
+                preliminary_state,
+                FileState::BothChanged | FileState::Untracked
+            ) {
+            Some(capture_authoritative_upload_candidate(
+                remote,
+                remote_root,
+                &remote_path,
+                &relative,
+                entry.remote,
+                local_hash
+                    .as_deref()
+                    .expect("upload candidate has a local hash"),
+                known,
+            )?)
+        } else {
+            None
+        };
+        let file_state = upload_candidate
+            .as_ref()
+            .map_or(preliminary_state, |candidate| candidate.state);
 
         match file_state {
             FileState::InSync => outcome.events.push(SyncEvent {
@@ -344,7 +375,10 @@ where
                 kind: SyncEventKind::Unchanged,
             }),
             FileState::LocalChanged | FileState::LocalOnly => {
-                let destination = capture_remote_destination(remote, remote_root, &remote_path)?;
+                let destination = upload_candidate
+                    .take()
+                    .expect("final upload state has an authoritative candidate")
+                    .destination;
                 transfers.push(prepare_upload(
                     local_root,
                     &local_path,
@@ -367,7 +401,10 @@ where
                 )?);
             }
             FileState::BothChanged | FileState::Untracked if force => {
-                let destination = capture_remote_destination(remote, remote_root, &remote_path)?;
+                let destination = upload_candidate
+                    .take()
+                    .expect("final forced upload state has an authoritative candidate")
+                    .destination;
                 transfers.push(prepare_upload(
                     local_root,
                     &local_path,
@@ -489,13 +526,45 @@ fn prepare_upload(
     })
 }
 
-fn capture_remote_destination<R: RemoteWrite>(
+fn capture_authoritative_upload_candidate<R: RemoteWrite>(
     remote: &mut R,
     remote_root: &str,
     remote_path: &str,
-) -> Result<ExpectedRemoteDestination> {
-    Ok(ExpectedRemoteDestination {
-        snapshot: remote.destination_snapshot(remote_root, remote_path)?,
+    relative: &str,
+    inventory_remote: Option<EntryKind>,
+    local_hash: &str,
+    known: Option<&str>,
+) -> Result<AuthoritativeUploadCandidate> {
+    let snapshot = remote.destination_snapshot(remote_root, remote_path)?;
+    let state = match (inventory_remote, &snapshot) {
+        (
+            Some(EntryKind::File),
+            RemoteDestinationSnapshot::File {
+                sha256,
+                size: _,
+                modified: _,
+            },
+        ) => classify(Some(local_hash), Some(sha256), known),
+        (Some(EntryKind::File), RemoteDestinationSnapshot::Missing) => {
+            anyhow::bail!("remote file disappeared while planning {relative}")
+        }
+        (Some(EntryKind::File), RemoteDestinationSnapshot::Directory) => {
+            anyhow::bail!("remote file became a directory while planning {relative}")
+        }
+        (None, RemoteDestinationSnapshot::Missing) => classify(Some(local_hash), None, known),
+        (None, RemoteDestinationSnapshot::File { .. }) => {
+            anyhow::bail!("remote file appeared while planning {relative}")
+        }
+        (None, RemoteDestinationSnapshot::Directory) => {
+            anyhow::bail!("remote directory appeared while planning {relative}")
+        }
+        (Some(EntryKind::Directory), _) => {
+            anyhow::bail!("remote directory is not an upload candidate at {relative}")
+        }
+    };
+    Ok(AuthoritativeUploadCandidate {
+        state,
+        destination: ExpectedRemoteDestination { snapshot },
     })
 }
 
