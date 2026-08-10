@@ -417,8 +417,26 @@ fn stage_local_write_with_candidates(
     target: &Path,
     bytes: &[u8],
     created_dirs: Vec<PathBuf>,
+    candidate: impl FnMut() -> Result<PathBuf>,
+    after_create: impl FnOnce() -> Result<()>,
+) -> Result<StagedLocalWrite> {
+    stage_local_write_with_candidates_and_identity(
+        target,
+        bytes,
+        created_dirs,
+        candidate,
+        after_create,
+        |file, _tmp| file.try_clone().and_then(Handle::from_file),
+    )
+}
+
+fn stage_local_write_with_candidates_and_identity(
+    target: &Path,
+    bytes: &[u8],
+    created_dirs: Vec<PathBuf>,
     mut candidate: impl FnMut() -> Result<PathBuf>,
     after_create: impl FnOnce() -> Result<()>,
+    capture_identity: impl FnOnce(&std::fs::File, &Path) -> std::io::Result<Handle>,
 ) -> Result<StagedLocalWrite> {
     let parent = target
         .parent()
@@ -433,11 +451,10 @@ fn stage_local_write_with_candidates(
         .ok_or_else(|| anyhow::anyhow!("local target {} has no file name", target.display()))?;
     let resolved_target = canonical_parent.join(target_leaf);
     let (mut file, tmp) = open_unique_local_temp(&mut candidate)?;
-    let temp_identity = match file.try_clone().and_then(Handle::from_file) {
+    let temp_identity = match capture_identity(&file, &tmp) {
         Ok(identity) => identity,
         Err(error) => {
             drop(file);
-            let _ = std::fs::remove_file(&tmp);
             return Err(error)
                 .with_context(|| format!("capturing temp identity {}", tmp.display()));
         }
@@ -643,7 +660,7 @@ fn record_download(
 mod staging_tests {
     use super::{
         ExpectedLocalDestination, download_one_guarded, stage_local_write,
-        stage_local_write_with_candidates,
+        stage_local_write_with_candidates, stage_local_write_with_candidates_and_identity,
     };
     use crate::commands::ExecutionMode;
     use crate::commands::remote_hash::RemoteHash;
@@ -1085,6 +1102,36 @@ mod staging_tests {
         drop(second);
 
         assert!(!second_tmp.exists());
+    }
+
+    #[test]
+    fn identity_capture_failure_preserves_unproven_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("page.txt");
+        let candidate = crate::commands::transfer_temp::local_candidate(
+            &target,
+            "22222222222222222222222222222222",
+        )
+        .unwrap();
+
+        let error = stage_local_write_with_candidates_and_identity(
+            &target,
+            b"our staged bytes",
+            Vec::new(),
+            || Ok(candidate.clone()),
+            || Ok(()),
+            |_file, temp_path| {
+                std::fs::remove_file(temp_path)?;
+                std::fs::write(temp_path, b"foreign replacement")?;
+                Err(std::io::Error::other("injected identity capture failure"))
+            },
+        )
+        .err()
+        .expect("identity capture must fail");
+
+        assert!(format!("{error:#}").contains("capturing temp identity"));
+        assert_eq!(std::fs::read(&candidate).unwrap(), b"foreign replacement");
+        assert!(!target.exists());
     }
 
     #[test]
