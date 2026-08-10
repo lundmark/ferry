@@ -20,12 +20,22 @@ pub(crate) struct InventoryEntry {
     pub(crate) in_state: bool,
 }
 
+/// A non-authoritative snapshot of the selected local, remote, and state paths.
+///
+/// This inventory can become stale immediately after collection and is never
+/// authorization to mutate a path. Consumers MUST revalidate applicable path
+/// identities and entry types inside the final `CommitGate` claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedInventory {
     pub(crate) scope: SyncScope,
     pub(crate) entries: BTreeMap<String, InventoryEntry>,
 }
 
+/// Collects a read-only, non-authoritative snapshot for planning.
+///
+/// No result from this function authorizes mutation. Consumers MUST revalidate
+/// applicable path identities and entry types inside the final `CommitGate`
+/// claim before making changes.
 pub(crate) fn collect<R: StrictRemote + ?Sized>(
     remote: &mut R,
     local_root: &Path,
@@ -50,9 +60,14 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
     )?;
 
     for path in state.files.keys() {
-        if !path.is_empty() && !is_state_path(path) && scope_contains(&scope, path) {
-            entries.entry(path.clone()).or_default().in_state = true;
+        if !scope_contains(&scope, path) {
+            continue;
         }
+        validate_state_path_key(path)?;
+        if is_state_path(path) {
+            continue;
+        }
+        entries.entry(path.clone()).or_default().in_state = true;
     }
 
     if matches!(&scope, SyncScope::Path(_)) && entries.is_empty() {
@@ -225,7 +240,14 @@ fn collect_local_node(
     } else {
         symlink_metadata
     };
-    let is_dir = metadata.is_dir();
+    let file_type = metadata.file_type();
+    let is_dir = if file_type.is_dir() {
+        true
+    } else if file_type.is_file() {
+        false
+    } else {
+        bail!("unsupported local entry type at {}", path.display());
+    };
     if context
         .matcher
         .is_ignored(&context.local_root.join(relative), is_dir)
@@ -374,7 +396,7 @@ fn list_remote_children<R: StrictRemote + ?Sized>(
 ) -> Result<Vec<RemoteChild>> {
     let listed = remote
         .list_dir_strict(directory)
-        .with_context(|| format!("listing remote directory {directory}"))?;
+        .with_context(|| format!("listing remote directory {directory:?}"))?;
     let mut children = Vec::new();
     let mut names = BTreeSet::new();
     for entry in listed {
@@ -383,7 +405,7 @@ fn list_remote_children<R: StrictRemote + ?Sized>(
         }
         let name = remote_child_name(remote_root, directory, &entry)?;
         if !names.insert(name.clone()) {
-            bail!("duplicate remote entry {name:?} in {directory}");
+            bail!("duplicate remote entry {name:?} in {directory:?}");
         }
         let relative = join_relative(relative_directory, &name);
         if is_state_path(&relative) {
@@ -407,6 +429,9 @@ struct RemoteChild {
 
 fn remote_child_name(remote_root: &str, directory: &str, entry: &Entry) -> Result<String> {
     let supplied = entry.name.as_str();
+    if supplied.chars().any(char::is_control) {
+        bail!("unsafe remote entry in {directory:?}");
+    }
     let name = if !supplied.contains('/') && !supplied.contains('\\') {
         supplied
     } else if supplied.starts_with('/') {
@@ -428,7 +453,7 @@ fn remote_child_name(remote_root: &str, directory: &str, entry: &Entry) -> Resul
         || name.contains('\\')
         || !is_under_remote_root(remote_root, &child_path)
     {
-        bail!("unsafe remote entry in {directory}");
+        bail!("unsafe remote entry in {directory:?}");
     }
     Ok(name.to_string())
 }
@@ -465,6 +490,27 @@ fn scope_contains(scope: &SyncScope, path: &str) -> bool {
                     .is_some_and(|suffix| suffix.starts_with('/'))
         }
     }
+}
+
+fn validate_state_path_key(path: &str) -> Result<()> {
+    let bytes = path.as_bytes();
+    let has_windows_drive_prefix = bytes.get(1) == Some(&b':')
+        && bytes
+            .first()
+            .is_some_and(|first| first.is_ascii_alphabetic());
+    let has_noncanonical_segment = path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || has_windows_drive_prefix
+        || has_noncanonical_segment
+    {
+        bail!("state contains unsafe path key");
+    }
+    Ok(())
 }
 
 fn normalize_remote_root(root: &str) -> Result<String> {
@@ -1310,5 +1356,159 @@ mod tests {
             error.to_string().contains("Ferry state directory"),
             "got: {error:#}"
         );
+    }
+
+    #[test]
+    fn root_scope_rejects_noncanonical_state_keys_without_echoing_controls() {
+        let unsafe_paths = [
+            "",
+            "../escape",
+            "/absolute",
+            "./dot",
+            "area/./file.c",
+            "area/../file.c",
+            "area//file.c",
+            "area/",
+            r"area\file.c",
+            "C:/windows/file.c",
+            "C:drive-relative.c",
+            ".ferry/../escape.c",
+            ".ferry//state.json",
+            "control\u{1b}key",
+            "control\rkey",
+            "control\nkey",
+            "control\0key",
+        ];
+
+        for unsafe_path in unsafe_paths {
+            let root = tempfile::tempdir().unwrap();
+            let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+            let error = inventory(
+                &mut remote,
+                root.path(),
+                &state_with(&[unsafe_path]),
+                SyncScope::RootDirectory,
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+
+            assert!(message.contains("unsafe path key"), "got: {message:?}");
+            assert!(
+                !message.chars().any(char::is_control),
+                "error contains a raw control character: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_scope_rejects_in_scope_noncanonical_state_keys() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("area")).unwrap();
+        let unsafe_paths = [
+            "area/../escape.c",
+            "area/./file.c",
+            "area//file.c",
+            "area/",
+            r"area/\file.c",
+            "area/control\u{1b}key",
+            "area/control\rkey",
+            "area/control\nkey",
+            "area/control\0key",
+        ];
+
+        for unsafe_path in unsafe_paths {
+            let mut remote = FakeRemote::default().directory("/remote", vec![]);
+            let error = inventory(
+                &mut remote,
+                root.path(),
+                &state_with(&[unsafe_path]),
+                SyncScope::Path("area".into()),
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+
+            assert!(message.contains("unsafe path key"), "got: {message:?}");
+            assert!(
+                !message.chars().any(char::is_control),
+                "error contains a raw control character: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_scope_ignores_noncanonical_out_of_scope_state_keys() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("area")).unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let actual = inventory(
+            &mut remote,
+            root.path(),
+            &state_with(&["other/../escape.c"]),
+            SyncScope::Path("area".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.entries,
+            BTreeMap::from([(
+                "area".into(),
+                presence(Some(EntryKind::Directory), None, false)
+            )])
+        );
+    }
+
+    #[test]
+    fn unsafe_remote_names_abort_before_recording_or_listing_children() {
+        let unsafe_names = [
+            "control\u{1b}name",
+            "control\rname",
+            "control\nname",
+            "control\0name",
+            r"protocol\name",
+        ];
+
+        for unsafe_name in unsafe_names {
+            let root = tempfile::tempdir().unwrap();
+            let mut remote =
+                FakeRemote::default().directory("/remote", vec![directory(unsafe_name)]);
+
+            let error = inventory(
+                &mut remote,
+                root.path(),
+                &StateFile::default(),
+                SyncScope::RootDirectory,
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+
+            assert!(message.contains("unsafe remote entry"), "got: {message:?}");
+            assert!(
+                !message.chars().any(char::is_control),
+                "error contains a raw control character: {message:?}"
+            );
+            assert_eq!(remote.listed, vec!["/remote"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_socket_is_rejected_as_an_unsupported_entry_type() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let _listener = UnixListener::bind(root.path().join("special.sock")).unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let error = inventory(
+            &mut remote,
+            root.path(),
+            &StateFile::default(),
+            SyncScope::Path("special.sock".into()),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unsupported local entry type"));
     }
 }
