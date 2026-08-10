@@ -375,7 +375,7 @@ impl ExpectedLocalSource {
         })
     }
 
-    fn verify_unchanged(&self, expected_hash: &str) -> Result<()> {
+    pub(crate) fn verify_unchanged(&self, expected_hash: &str) -> Result<()> {
         if self.path != self.snapshot.resolved_path()
             || self.snapshot.expected_file_hash() != Some(expected_hash)
         {

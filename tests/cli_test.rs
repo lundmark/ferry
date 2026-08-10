@@ -597,7 +597,7 @@ fn scoped_sync_public_partial_cancellation_saves_first_commit() {
     ));
     let project = tempfile::tempdir().unwrap();
     let config = scoped_config(project.path(), server.port);
-    let gate = SequenceGate::new([true, true, false]);
+    let gate = SequenceGate::new([true, true, true, true, true, true, true, true, false]);
 
     let outcome = ferry::commands::sync::run_scoped(
         &config,

@@ -53,6 +53,8 @@ pub struct RemoteHash {
     pub mtime: DateTime<Utc>,
     /// True if we skipped the download because (mtime, size) matched state.
     pub from_cache: bool,
+    /// Whether `mtime` was observed and stable across this retrieval.
+    pub(crate) metadata_stable: bool,
     /// The downloaded bytes — populated only when we actually downloaded AND
     /// the caller asked for them via `want_bytes`. `pull`/`sync` need these
     /// for the local write; `status` doesn't.
@@ -117,6 +119,7 @@ pub(crate) fn compute_with<R: RemoteFileRetrieval>(
             size: known.size,
             mtime: observed.mtime,
             from_cache: true,
+            metadata_stable: true,
             bytes: None,
             pre_download: Some(observed),
         });
@@ -150,6 +153,16 @@ pub(crate) fn retrieve_stable<R: RemoteFileRetrieval>(
     download_after_observation(remote, remote_path, observed, true)
 }
 
+pub(crate) fn retrieve_fresh<R: RemoteFileRetrieval>(
+    remote: &mut R,
+    remote_path: &str,
+) -> Result<RemoteHash> {
+    match observe(remote, remote_path) {
+        Ok(observed) => download_after_observation(remote, remote_path, observed, true),
+        Err(_) => download_unvalidated(remote, remote_path, true),
+    }
+}
+
 fn observe<R: RemoteFileRetrieval>(remote: &mut R, remote_path: &str) -> Result<RemoteMetadata> {
     let mtime = remote
         .mtime(remote_path)
@@ -178,7 +191,7 @@ fn download_after_observation<R: RemoteFileRetrieval>(
         anyhow::bail!("remote changed while downloading {remote_path}");
     }
 
-    Ok(hash_download(bytes, before.mtime, want_bytes))
+    Ok(hash_download(bytes, before.mtime, want_bytes, true))
 }
 
 /// Servers known not to support MDTM retain the historical always-hash
@@ -193,10 +206,15 @@ fn download_unvalidated<R: RemoteFileRetrieval>(
     let bytes = remote
         .download(remote_path)
         .with_context(|| format!("downloading {remote_path}"))?;
-    Ok(hash_download(bytes, Utc::now(), want_bytes))
+    Ok(hash_download(bytes, Utc::now(), want_bytes, false))
 }
 
-fn hash_download(bytes: Vec<u8>, mtime: DateTime<Utc>, want_bytes: bool) -> RemoteHash {
+fn hash_download(
+    bytes: Vec<u8>,
+    mtime: DateTime<Utc>,
+    want_bytes: bool,
+    metadata_stable: bool,
+) -> RemoteHash {
     let sha256 = hash_bytes(&bytes);
     let size = bytes.len() as u64;
     RemoteHash {
@@ -204,6 +222,7 @@ fn hash_download(bytes: Vec<u8>, mtime: DateTime<Utc>, want_bytes: bool) -> Remo
         size,
         mtime,
         from_cache: false,
+        metadata_stable,
         bytes: if want_bytes { Some(bytes) } else { None },
         pre_download: None,
     }

@@ -698,6 +698,7 @@ mod staging_tests {
             size: bytes.len() as u64,
             mtime: Utc.with_ymd_and_hms(2026, 8, 10, 9, 0, 0).unwrap(),
             from_cache: false,
+            metadata_stable: true,
             bytes: Some(bytes.to_vec()),
             pre_download: None,
         }

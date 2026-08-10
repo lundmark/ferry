@@ -675,6 +675,7 @@ remote_root = "/remote"
             size: 9_999,
             mtime,
             from_cache: true,
+            metadata_stable: true,
             bytes: None,
             pre_download: None,
         };

@@ -28,7 +28,17 @@ struct ProductionRemote {
     events: Vec<String>,
     invalidate_on_snapshot: Option<(String, usize, usize, Arc<AtomicBool>)>,
     snapshot_mutation: Option<SnapshotMutation>,
+    invalidate_on_download: Option<(String, Arc<AtomicBool>)>,
+    mutate_on_download: Option<DownloadMutation>,
     strict_mkdir_error: Option<String>,
+    mdtm_error: Option<String>,
+}
+
+struct DownloadMutation {
+    path: String,
+    on_call: usize,
+    calls: usize,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +92,20 @@ impl ProductionRemote {
 
     fn fail_strict_mkdir(mut self, message: &str) -> Self {
         self.strict_mkdir_error = Some(message.to_string());
+        self
+    }
+
+    fn mutate_download(mut self, path: &str, on_call: usize, bytes: &[u8]) -> Self {
+        self.mutate_on_download = Some(DownloadMutation {
+            path: path.to_string(),
+            on_call,
+            calls: 0,
+            bytes: bytes.to_vec(),
+        });
+        self
+    }
+    fn fail_mdtm(mut self, message: &str) -> Self {
+        self.mdtm_error = Some(message.to_string());
         self
     }
 
@@ -236,6 +260,9 @@ impl StrictRemote for ProductionRemote {
 
 impl RemoteFileRetrieval for ProductionRemote {
     fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
+        if let Some(message) = &self.mdtm_error {
+            anyhow::bail!(message.clone());
+        }
         self.events.push(format!("mtime {remote_path}"));
         self.files
             .get(remote_path)
@@ -253,6 +280,27 @@ impl RemoteFileRetrieval for ProductionRemote {
 
     fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
         self.events.push(format!("download {remote_path}"));
+        if let Some((path, current)) = &self.invalidate_on_download
+            && path == remote_path
+        {
+            current.store(false, Ordering::SeqCst);
+        }
+        let mutation = self.mutate_on_download.as_mut().and_then(|mutation| {
+            if mutation.path != remote_path {
+                return None;
+            }
+            mutation.calls += 1;
+            (mutation.calls == mutation.on_call).then(|| mutation.bytes.clone())
+        });
+        if let Some(bytes) = mutation {
+            self.files.insert(
+                remote_path.to_string(),
+                TestRemoteFile {
+                    bytes,
+                    modified: test_mtime(41),
+                },
+            );
+        }
         self.files
             .get(remote_path)
             .map(|file| file.bytes.clone())
@@ -953,7 +1001,11 @@ fn structured_production_between_entries_keeps_the_first_commit_only() {
     std::fs::write(root.path().join("b.c"), b"second").unwrap();
     let mut remote = ProductionRemote::with_root();
     let mut state = StateFile::default();
-    let gate = SequenceGate::new([true, true, false]);
+    // Complete both descriptors, then permit the first transfer through its
+    // final pre-stage poll before cancelling at the second transfer boundary.
+    let gate = SequenceGate::new([
+        true, true, true, true, true, true, true, true, true, true, true, true, false,
+    ]);
 
     let outcome = run_production(
         &mut remote,
@@ -1054,6 +1106,31 @@ impl CommitGate for MutatingCommitGate {
             race();
         }
         mutation()?;
+        Ok(CommitDecision::Committed)
+    }
+}
+struct PostCommitMutatingGate {
+    mutation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl PostCommitMutatingGate {
+    fn new(mutation: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            mutation: Mutex::new(Some(Box::new(mutation))),
+        }
+    }
+}
+
+impl CommitGate for PostCommitMutatingGate {
+    fn is_current(&self) -> bool {
+        true
+    }
+
+    fn commit(&self, mutation: &mut dyn FnMut() -> Result<()>) -> Result<CommitDecision> {
+        mutation()?;
+        if let Some(race) = self.mutation.lock().unwrap().take() {
+            race();
+        }
         Ok(CommitDecision::Committed)
     }
 }
@@ -1642,4 +1719,280 @@ fn ignored_directory_near_miss_still_materializes_parent_and_syncs_selected_leaf
     );
     assert!(remote.directories.contains("/remote/ignored-old"));
     assert!(state.files.contains_key("ignored-old/selected.c"));
+}
+#[test]
+fn planning_cancellation_stops_large_retrievals_before_any_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("pending")).unwrap();
+    let large_a = vec![b'a'; 2 * 1024 * 1024];
+    let large_b = vec![b'b'; 2 * 1024 * 1024];
+    let current = Arc::new(AtomicBool::new(true));
+    let mut remote = ProductionRemote::with_root()
+        .file("/remote/a.bin", &large_a)
+        .file("/remote/b.bin", &large_b);
+    remote.invalidate_on_download = Some(("/remote/a.bin".into(), Arc::clone(&current)));
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &LiveGate { current },
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(outcome.events.is_empty());
+    assert!(!remote.has_mutation());
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| event.starts_with("download "))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["download /remote/a.bin"]
+    );
+    assert!(!remote.directories.contains("/remote/pending"));
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn cancellation_before_materialization_does_not_retrieve_or_stage() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root().file("/remote/file.c", b"remote");
+    let mut state = StateFile::default();
+    state
+        .files
+        .insert("file.c".into(), stale_cached_state_record(b"remote"));
+    let gate = SequenceGate::new([true, true, false]);
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("file.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap();
+
+    assert!(outcome.cancelled);
+    assert!(!root.path().join("file.c").exists());
+    assert!(
+        !remote
+            .events
+            .iter()
+            .any(|event| event.starts_with("download ") || event.starts_with("upload "))
+    );
+    assert!(state.files.contains_key("file.c"));
+}
+
+#[test]
+fn local_upload_change_between_preflight_and_directory_phase_fails_safely() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    let source = root.path().join("nested/file.c");
+    std::fs::write(&source, b"planned").unwrap();
+    let raced = source.clone();
+    let gate = MutatingCommitGate::new(move || std::fs::write(raced, b"changed").unwrap());
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("nested".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("local source changed"));
+    assert!(remote.directories.contains("/remote/nested"));
+    assert!(!remote.files.contains_key("/remote/nested/file.c"));
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn remote_download_change_between_preflight_and_materialization_fails_safely() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/nested")
+        .file("/remote/nested/file.c", b"planned")
+        .mutate_download("/remote/nested/file.c", 2, b"changed");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("nested".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("remote changed"));
+    assert!(root.path().join("nested").is_dir());
+    assert!(!root.path().join("nested/file.c").exists());
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn directory_validation_does_not_revalidate_an_earlier_sibling() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("a")).unwrap();
+    std::fs::create_dir(root.path().join("b")).unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::RootDirectory,
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert!(!outcome.cancelled);
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "snapshot /remote/a")
+            .count(),
+        3
+    );
+    assert!(remote.directories.contains("/remote/a"));
+    assert!(remote.directories.contains("/remote/b"));
+}
+
+#[test]
+fn missing_parent_refresh_rejects_a_file_that_appears_after_directory_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let local_path = root.path().join("nested/file.c");
+    let raced_path = local_path.clone();
+    let gate = PostCommitMutatingGate::new(move || {
+        std::fs::write(raced_path, b"foreign").unwrap();
+    });
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/nested")
+        .file("/remote/nested/file.c", b"planned");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("nested".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("local destination changed"));
+    assert_eq!(std::fs::read(local_path).unwrap(), b"foreign");
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "download /remote/nested/file.c")
+            .count(),
+        1
+    );
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn missing_parent_refresh_rejects_a_replaced_created_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let local_parent = root.path().join("nested");
+    let raced_parent = local_parent.clone();
+    let replacement = root.path().join("replacement");
+    std::fs::create_dir(&replacement).unwrap();
+    let gate = PostCommitMutatingGate::new(move || {
+        std::fs::remove_dir(&raced_parent).unwrap();
+        std::fs::rename(replacement, &raced_parent).unwrap();
+    });
+    let mut remote = ProductionRemote::with_root()
+        .directory("/remote/nested")
+        .file("/remote/nested/file.c", b"planned");
+    let mut state = StateFile::default();
+
+    let error = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("nested".into()),
+        false,
+        ExecutionMode::Apply,
+        &gate,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("local directory changed"));
+    assert!(local_parent.is_dir());
+    assert!(!local_parent.join("file.c").exists());
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "download /remote/nested/file.c")
+            .count(),
+        1
+    );
+    assert!(state.files.is_empty());
+}
+
+#[test]
+fn fresh_download_falls_back_to_hash_and_size_without_mdtm() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root()
+        .file("/remote/file.c", b"remote")
+        .fail_mdtm("500 MDTM unsupported");
+    let mut state = StateFile::default();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("file.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.events,
+        vec![SyncEvent {
+            path: "file.c".into(),
+            kind: SyncEventKind::Downloaded,
+        }]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("file.c")).unwrap(),
+        b"remote"
+    );
+    assert_eq!(
+        remote
+            .events
+            .iter()
+            .filter(|event| *event == "download /remote/file.c")
+            .count(),
+        2
+    );
+    assert_eq!(state.files["file.c"].sha256, hash_bytes(b"remote"));
 }

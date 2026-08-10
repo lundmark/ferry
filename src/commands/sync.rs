@@ -248,26 +248,60 @@ struct AuthoritativeUploadCandidate {
 }
 
 #[derive(Debug)]
-struct PreparedTransfer {
+struct PlannedTransfer {
     event: ScheduledAction,
-    operation: PreparedOperation,
+    operation: PlannedOperation,
 }
 
 #[derive(Debug)]
-enum PreparedOperation {
-    Upload {
-        remote_path: String,
-        bytes: Vec<u8>,
-        hash: String,
-        source: ExpectedLocalSource,
-        destination: ExpectedRemoteDestination,
-    },
-    Download {
-        local_path: PathBuf,
-        remote: RemoteHash,
-        destination: ExpectedLocalDestination,
-    },
+enum PlannedOperation {
+    Upload(Box<PlannedUpload>),
+    Download(Box<PlannedDownload>),
     Preview,
+}
+
+#[derive(Debug)]
+struct PlannedUpload {
+    remote_path: String,
+    hash: String,
+    source: ExpectedLocalSource,
+    destination: ExpectedRemoteDestination,
+}
+
+#[derive(Debug)]
+struct PlannedDownload {
+    local_path: PathBuf,
+    remote_path: String,
+    expected_remote: PlannedRemoteSource,
+    expected_local_hash: Option<String>,
+    destination: Option<ExpectedLocalDestination>,
+    existing_local_source: Option<ExpectedLocalSource>,
+}
+
+#[derive(Debug)]
+struct PlannedRemoteSource {
+    sha256: String,
+    size: u64,
+    stable_mtime: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PlannedRemoteSource {
+    fn capture(hash: &RemoteHash) -> Self {
+        Self {
+            sha256: hash.sha256.clone(),
+            size: hash.size,
+            stable_mtime: hash.metadata_stable.then_some(hash.mtime),
+        }
+    }
+
+    fn matches(&self, hash: &RemoteHash) -> bool {
+        self.sha256 == hash.sha256
+            && self.size == hash.size
+            && match self.stable_mtime {
+                Some(mtime) => hash.metadata_stable && mtime == hash.mtime,
+                None => true,
+            }
+    }
 }
 
 /// Scoped sync transport adapter.
@@ -425,46 +459,50 @@ where
     let (file_paths, mut outcome) = classify_inventory_shapes(entries.clone());
     outcome.issues.extend(ancestor_conflicts);
     let mut directories = capture_directory_snapshots(remote, local_root, remote_root, &entries)?;
-    if execute_directory_plan(
-        remote,
-        local_root,
-        remote_root,
-        &mut directories,
-        &mut outcome,
-        mode,
-        gate,
-    )? {
-        outcome.cancelled = true;
-        sort_outcome(&mut outcome);
-        return Ok(outcome);
-    }
 
     let mut transfers = Vec::new();
     for relative in file_paths {
+        if !gate.is_current() {
+            return Ok(cancelled_sync_outcome(outcome));
+        }
         let entry = entries
             .get(&relative)
             .expect("file path came from scoped inventory");
         let local_path = local_root.join(&relative);
         let remote_path = remote_join(remote_root, &relative);
-        let local_hash = if entry.local == Some(EntryKind::File) {
-            Some(
-                hash_file(&local_path)
-                    .with_context(|| format!("hashing local {}", local_path.display()))?,
-            )
+        let mut local_source = if entry.local == Some(EntryKind::File) {
+            Some(ExpectedLocalSource::capture(local_root, &local_path)?)
         } else {
             None
         };
+        if local_source.is_some() && !gate.is_current() {
+            return Ok(cancelled_sync_outcome(outcome));
+        }
+        let local_hash = if let Some(source) = &local_source {
+            let hash = hash_file(&source.path)
+                .with_context(|| format!("hashing local {}", source.path.display()))?;
+            source.verify_unchanged(&hash)?;
+            Some(hash)
+        } else {
+            None
+        };
+        if local_source.is_some() && !gate.is_current() {
+            return Ok(cancelled_sync_outcome(outcome));
+        }
         let remote_hash = if entry.remote == Some(EntryKind::File) {
             Some(remote_hash::compute_with(
                 remote,
                 state,
                 &relative,
                 &remote_path,
-                true,
+                false,
             )?)
         } else {
             None
         };
+        if remote_hash.is_some() && !gate.is_current() {
+            return Ok(cancelled_sync_outcome(outcome));
+        }
         let known = state
             .files
             .get(&relative)
@@ -489,7 +527,6 @@ where
                     &remote_path,
                     &relative,
                     &directories,
-                    mode,
                 )?,
                 &relative,
                 entry.remote,
@@ -501,6 +538,9 @@ where
         } else {
             None
         };
+        if upload_candidate.is_some() && !gate.is_current() {
+            return Ok(cancelled_sync_outcome(outcome));
+        }
         let file_state = upload_candidate
             .as_ref()
             .map_or(preliminary_state, |candidate| candidate.state);
@@ -518,29 +558,30 @@ where
                 if mode.is_dry_run() {
                     transfers.push(preview_transfer(relative, SyncEventKind::Uploaded));
                 } else {
-                    transfers.push(prepare_upload(
-                        local_root,
-                        &local_path,
+                    transfers.push(plan_upload(
                         relative,
                         remote_path,
                         local_hash.expect("upload state has a local hash"),
+                        local_source
+                            .take()
+                            .expect("upload state has a captured local source"),
                         destination,
                         SyncEventKind::Uploaded,
-                    )?);
+                    ));
                 }
             }
             FileState::RemoteChanged | FileState::RemoteOnly => {
                 if mode.is_dry_run() {
                     transfers.push(preview_transfer(relative, SyncEventKind::Downloaded));
                 } else {
-                    transfers.push(prepare_download(
-                        remote,
+                    transfers.push(plan_download(
                         local_root,
-                        &local_path,
                         local_hash.as_deref(),
                         relative,
                         remote_path,
                         remote_hash.expect("download state has a remote hash"),
+                        &directories,
+                        local_source.take(),
                     )?);
                 }
             }
@@ -555,15 +596,16 @@ where
                         SyncEventKind::ForcedRemoteOverwrite,
                     ));
                 } else {
-                    transfers.push(prepare_upload(
-                        local_root,
-                        &local_path,
+                    transfers.push(plan_upload(
                         relative,
                         remote_path,
                         local_hash.expect("forced upload has a local hash"),
+                        local_source
+                            .take()
+                            .expect("forced upload has a captured local source"),
                         destination,
                         SyncEventKind::ForcedRemoteOverwrite,
-                    )?);
+                    ));
                 }
             }
             FileState::BothChanged | FileState::Untracked => {
@@ -573,6 +615,21 @@ where
                 });
             }
         }
+    }
+
+    if execute_directory_plan(
+        remote,
+        local_root,
+        remote_root,
+        &mut directories,
+        &mut outcome,
+        mode,
+        gate,
+    )? {
+        return Ok(cancelled_sync_outcome(outcome));
+    }
+    if finalize_download_destinations(local_root, &directories, &mut transfers, gate)? {
+        return Ok(cancelled_sync_outcome(outcome));
     }
 
     let scheduled = transfers
@@ -586,41 +643,21 @@ where
     outcome = execute_structured_plan(scheduled, outcome, gate, |_action| {
         let transfer = transfers
             .next()
-            .expect("scheduled action has a prepared transfer");
+            .expect("scheduled action has a planned transfer");
         match transfer.operation {
-            PreparedOperation::Upload {
-                remote_path,
-                bytes,
-                hash,
-                source,
-                destination,
-            } => upload_one_guarded(
+            PlannedOperation::Upload(plan) => materialize_upload(
                 remote,
                 state,
                 &transfer.event.path,
                 remote_root,
-                &remote_path,
-                &bytes,
-                &hash,
-                &source,
-                &destination,
+                &plan,
                 mode,
                 gate,
             ),
-            PreparedOperation::Download {
-                local_path,
-                remote,
-                destination,
-            } => download_one_guarded(
-                state,
-                &local_path,
-                &transfer.event.path,
-                &remote,
-                &destination,
-                mode,
-                gate,
-            ),
-            PreparedOperation::Preview => Ok(CommitDecision::Committed),
+            PlannedOperation::Download(plan) => {
+                materialize_download(remote, state, &transfer.event.path, &plan, mode, gate)
+            }
+            PlannedOperation::Preview => Ok(CommitDecision::Committed),
         }
     })?;
     if outcome.cancelled {
@@ -648,44 +685,42 @@ where
     Ok(outcome)
 }
 
-fn preview_transfer(relative: String, kind: SyncEventKind) -> PreparedTransfer {
-    PreparedTransfer {
+fn cancelled_sync_outcome(mut outcome: SyncOutcome) -> SyncOutcome {
+    outcome.cancelled = true;
+    sort_outcome(&mut outcome);
+    outcome
+}
+
+fn preview_transfer(relative: String, kind: SyncEventKind) -> PlannedTransfer {
+    PlannedTransfer {
         event: ScheduledAction {
             path: relative,
             kind,
         },
-        operation: PreparedOperation::Preview,
+        operation: PlannedOperation::Preview,
     }
 }
 
-fn prepare_upload(
-    local_root: &Path,
-    local_path: &Path,
+fn plan_upload(
     relative: String,
     remote_path: String,
     local_hash: String,
+    source: ExpectedLocalSource,
     destination: ExpectedRemoteDestination,
     kind: SyncEventKind,
-) -> Result<PreparedTransfer> {
-    let source = ExpectedLocalSource::capture(local_root, local_path)?;
-    let bytes = std::fs::read(&source.path)
-        .with_context(|| format!("reading local {}", source.path.display()))?;
-    if hash_bytes(&bytes) != local_hash {
-        anyhow::bail!("local source changed while planning {relative}");
-    }
-    Ok(PreparedTransfer {
+) -> PlannedTransfer {
+    PlannedTransfer {
         event: ScheduledAction {
             path: relative,
             kind,
         },
-        operation: PreparedOperation::Upload {
+        operation: PlannedOperation::Upload(Box::new(PlannedUpload {
             remote_path,
-            bytes,
             hash: local_hash,
             source,
             destination,
-        },
-    })
+        })),
+    }
 }
 
 fn capture_authoritative_upload_candidate(
@@ -733,17 +768,11 @@ fn capture_remote_file_destination<R: RemoteWrite>(
     remote_path: &str,
     relative: &str,
     directories: &[ExpectedDirectorySnapshots],
-    mode: ExecutionMode,
 ) -> Result<RemoteDestinationSnapshot> {
-    if mode.is_dry_run()
-        && directories.iter().any(|directory| {
-            directory.remote == ExpectedRemoteDirectory::Missing
-                && !directory.relative.is_empty()
-                && relative
-                    .strip_prefix(&directory.relative)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
-    {
+    if directories.iter().any(|directory| {
+        directory.remote == ExpectedRemoteDirectory::Missing
+            && is_strict_directory_ancestor(&directory.relative, relative)
+    }) {
         return Ok(RemoteDestinationSnapshot::Missing);
     }
     remote
@@ -751,33 +780,181 @@ fn capture_remote_file_destination<R: RemoteWrite>(
         .with_context(|| format!("capturing remote destination for {relative}"))
 }
 
-fn prepare_download<R: RemoteFileRetrieval>(
-    remote: &mut R,
+fn plan_download(
     local_root: &Path,
-    local_path: &Path,
     expected_local_hash: Option<&str>,
     relative: String,
     remote_path: String,
     remote_hash: RemoteHash,
-) -> Result<PreparedTransfer> {
-    let expected_remote = remote_snapshot(&remote_hash);
-    let remote_hash = remote_hash::complete_for_install(remote, &remote_path, remote_hash)?;
-    if remote_snapshot(&remote_hash) != expected_remote {
-        anyhow::bail!("remote source changed while planning {relative}");
+    directories: &[ExpectedDirectorySnapshots],
+    existing_local_source: Option<ExpectedLocalSource>,
+) -> Result<PlannedTransfer> {
+    let local_path = local_root.join(&relative);
+    verify_planned_local_hash(&local_path, expected_local_hash)?;
+    if let (Some(source), Some(hash)) = (&existing_local_source, expected_local_hash) {
+        source.verify_unchanged(hash)?;
     }
-    let destination = ExpectedLocalDestination::capture(local_root, local_path)?;
-    verify_planned_local_hash(local_path, expected_local_hash)?;
-    Ok(PreparedTransfer {
+    let parent_will_be_created = directories.iter().any(|directory| {
+        matches!(directory.local, ExpectedLocalDirectory::Missing)
+            && is_strict_directory_ancestor(&directory.relative, &relative)
+    });
+    let destination = if parent_will_be_created {
+        None
+    } else {
+        Some(ExpectedLocalDestination::capture(local_root, &local_path)?)
+    };
+    if let (Some(source), Some(hash)) = (&existing_local_source, expected_local_hash) {
+        source.verify_unchanged(hash)?;
+    }
+    Ok(PlannedTransfer {
         event: ScheduledAction {
             path: relative,
             kind: SyncEventKind::Downloaded,
         },
-        operation: PreparedOperation::Download {
-            local_path: local_path.to_path_buf(),
-            remote: remote_hash,
+        operation: PlannedOperation::Download(Box::new(PlannedDownload {
+            local_path,
+            remote_path,
+            expected_remote: PlannedRemoteSource::capture(&remote_hash),
+            expected_local_hash: expected_local_hash.map(str::to_owned),
             destination,
-        },
+            existing_local_source,
+        })),
     })
+}
+
+fn finalize_download_destinations(
+    local_root: &Path,
+    directories: &[ExpectedDirectorySnapshots],
+    transfers: &mut [PlannedTransfer],
+    gate: &dyn CommitGate,
+) -> Result<bool> {
+    for transfer in transfers {
+        let PlannedOperation::Download(plan) = &mut transfer.operation else {
+            continue;
+        };
+        if plan.destination.is_some() {
+            continue;
+        }
+        if !gate.is_current() {
+            return Ok(true);
+        }
+        validate_local_directory_ancestors(local_root, directories, &transfer.event.path)?;
+        verify_planned_local_hash(&plan.local_path, plan.expected_local_hash.as_deref())?;
+        if let (Some(source), Some(hash)) = (
+            plan.existing_local_source.as_ref(),
+            plan.expected_local_hash.as_deref(),
+        ) {
+            source.verify_unchanged(hash)?;
+        }
+        if !gate.is_current() {
+            return Ok(true);
+        }
+
+        let destination = ExpectedLocalDestination::capture(local_root, &plan.local_path)?;
+        validate_local_directory_ancestors(local_root, directories, &transfer.event.path)?;
+        verify_planned_local_hash(&plan.local_path, plan.expected_local_hash.as_deref())?;
+        if let (Some(source), Some(hash)) = (
+            plan.existing_local_source.as_ref(),
+            plan.expected_local_hash.as_deref(),
+        ) {
+            source.verify_unchanged(hash)?;
+        }
+        if !gate.is_current() {
+            return Ok(true);
+        }
+        plan.destination = Some(destination);
+    }
+    Ok(false)
+}
+
+fn validate_local_directory_ancestors(
+    local_root: &Path,
+    directories: &[ExpectedDirectorySnapshots],
+    relative: &str,
+) -> Result<()> {
+    validate_local_directory(local_root, &directories[0])?;
+    for directory in &directories[1..] {
+        if is_strict_directory_ancestor(&directory.relative, relative) {
+            validate_local_directory(local_root, directory)?;
+        }
+    }
+    Ok(())
+}
+
+fn materialize_upload<R: RemoteWrite>(
+    remote: &mut R,
+    state: &mut StateFile,
+    relative: &str,
+    remote_root: &str,
+    plan: &PlannedUpload,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<CommitDecision> {
+    plan.source.verify_unchanged(&plan.hash)?;
+    if !gate.is_current() {
+        return Ok(CommitDecision::Cancelled);
+    }
+    let bytes = std::fs::read(&plan.source.path)
+        .with_context(|| format!("reading local {}", plan.source.path.display()))?;
+    if hash_bytes(&bytes) != plan.hash {
+        anyhow::bail!("local source changed while materializing {relative}");
+    }
+    plan.source.verify_unchanged(&plan.hash)?;
+    if !gate.is_current() {
+        return Ok(CommitDecision::Cancelled);
+    }
+    upload_one_guarded(
+        remote,
+        state,
+        relative,
+        remote_root,
+        &plan.remote_path,
+        &bytes,
+        &plan.hash,
+        &plan.source,
+        &plan.destination,
+        mode,
+        gate,
+    )
+}
+
+fn materialize_download<R: RemoteFileRetrieval>(
+    remote: &mut R,
+    state: &mut StateFile,
+    relative: &str,
+    plan: &PlannedDownload,
+    mode: ExecutionMode,
+    gate: &dyn CommitGate,
+) -> Result<CommitDecision> {
+    verify_planned_local_hash(&plan.local_path, plan.expected_local_hash.as_deref())?;
+    if let (Some(source), Some(hash)) = (
+        plan.existing_local_source.as_ref(),
+        plan.expected_local_hash.as_deref(),
+    ) {
+        source.verify_unchanged(hash)?;
+    }
+    if !gate.is_current() {
+        return Ok(CommitDecision::Cancelled);
+    }
+
+    let remote_hash = remote_hash::retrieve_fresh(remote, &plan.remote_path)?;
+    if !plan.expected_remote.matches(&remote_hash) {
+        anyhow::bail!("remote source changed while materializing {relative}");
+    }
+    if !gate.is_current() {
+        return Ok(CommitDecision::Cancelled);
+    }
+    download_one_guarded(
+        state,
+        &plan.local_path,
+        relative,
+        &remote_hash,
+        plan.destination
+            .as_ref()
+            .expect("download destination was finalized before materialization"),
+        mode,
+        gate,
+    )
 }
 
 fn verify_planned_local_hash(path: &Path, expected: Option<&str>) -> Result<()> {
@@ -806,14 +983,6 @@ fn verify_planned_local_hash(path: &Path, expected: Option<&str>) -> Result<()> 
         );
     }
     Ok(())
-}
-
-fn remote_snapshot(hash: &RemoteHash) -> RemoteDestinationSnapshot {
-    RemoteDestinationSnapshot::File {
-        size: hash.size,
-        modified: hash.mtime,
-        sha256: hash.sha256.clone(),
-    }
 }
 
 fn capture_directory_snapshots<R: StrictRemote + RemoteWrite>(
@@ -929,6 +1098,13 @@ fn capture_directory_snapshots<R: StrictRemote + RemoteWrite>(
     Ok(snapshots)
 }
 
+fn is_strict_directory_ancestor(ancestor: &str, relative: &str) -> bool {
+    !ancestor.is_empty()
+        && relative
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn directory_depth(relative: &str) -> usize {
     if relative.is_empty() {
         0
@@ -1030,6 +1206,7 @@ fn execute_directory_plan<R: StrictRemote + RemoteWrite>(
         let relative = directories[index].relative.clone();
         let local_path = local_root.join(&relative);
         let remote_path = remote_join(remote_root, &relative);
+        let mut created_local_identity = None;
         let decision = {
             let mut mutation = || {
                 validate_directory_prefix(remote, local_root, remote_root, directories, index)?;
@@ -1037,7 +1214,20 @@ fn execute_directory_plan<R: StrictRemote + RemoteWrite>(
                     DirectoryAction::CreateLocal => {
                         fs::create_dir(&local_path).with_context(|| {
                             format!("creating local directory {}", local_path.display())
-                        })?
+                        })?;
+                        let canonical_root = local_root.canonicalize().with_context(|| {
+                            format!("canonicalizing local_root {}", local_root.display())
+                        })?;
+                        created_local_identity = Some(
+                            capture_local_directory_identity(
+                                local_root,
+                                &canonical_root,
+                                &relative,
+                            )?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("created local directory disappeared at {relative}")
+                            })?,
+                        );
                     }
                     DirectoryAction::CreateRemote => remote
                         .mkdir_scoped_strict(&remote_path)
@@ -1052,15 +1242,11 @@ fn execute_directory_plan<R: StrictRemote + RemoteWrite>(
         }
         match action {
             DirectoryAction::CreateLocal => {
-                let canonical_root = local_root.canonicalize().with_context(|| {
-                    format!("canonicalizing local_root {}", local_root.display())
-                })?;
-                let identity =
-                    capture_local_directory_identity(local_root, &canonical_root, &relative)?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("created local directory disappeared at {relative}")
-                        })?;
-                directories[index].local = ExpectedLocalDirectory::Directory(identity);
+                directories[index].local = ExpectedLocalDirectory::Directory(
+                    created_local_identity
+                        .take()
+                        .expect("committed local directory has a captured identity"),
+                );
             }
             DirectoryAction::CreateRemote => {
                 directories[index].remote = ExpectedRemoteDirectory::Directory;
@@ -1081,10 +1267,17 @@ fn validate_directory_prefix<R: StrictRemote + RemoteWrite>(
     directories: &[ExpectedDirectorySnapshots],
     through: usize,
 ) -> Result<()> {
-    for index in 0..=through {
-        validate_directory_snapshot(remote, local_root, remote_root, directories, index)?;
+    validate_directory_entry(remote, local_root, remote_root, directories, 0)?;
+    if through == 0 {
+        return Ok(());
     }
-    Ok(())
+    let relative = &directories[through].relative;
+    for index in 1..through {
+        if is_strict_directory_ancestor(&directories[index].relative, relative) {
+            validate_directory_entry(remote, local_root, remote_root, directories, index)?;
+        }
+    }
+    validate_directory_entry(remote, local_root, remote_root, directories, through)
 }
 
 fn validate_directory_snapshot<R: StrictRemote + RemoteWrite>(
@@ -1095,9 +1288,18 @@ fn validate_directory_snapshot<R: StrictRemote + RemoteWrite>(
     index: usize,
 ) -> Result<()> {
     if index > 0 {
-        validate_local_directory(local_root, &directories[0])?;
-        validate_remote_directory(remote, remote_root, directories, 0)?;
+        validate_directory_entry(remote, local_root, remote_root, directories, 0)?;
     }
+    validate_directory_entry(remote, local_root, remote_root, directories, index)
+}
+
+fn validate_directory_entry<R: StrictRemote + RemoteWrite>(
+    remote: &mut R,
+    local_root: &Path,
+    remote_root: &str,
+    directories: &[ExpectedDirectorySnapshots],
+    index: usize,
+) -> Result<()> {
     let expected = &directories[index];
     validate_local_directory(local_root, expected)?;
     validate_remote_directory(remote, remote_root, directories, index)
