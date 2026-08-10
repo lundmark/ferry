@@ -12,7 +12,10 @@ use ferry::ftp::Ftp;
 use ferry::hash::hash_bytes;
 use ferry::state::{FileRecord, StateFile};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 use support::{remote_path, start_ftp, write_config};
 
 fn seed_state(local_root: &std::path::Path, rel: &str, known_bytes: &[u8]) {
@@ -746,15 +749,41 @@ fn write_lsp_frame(writer: &mut impl Write, value: &serde_json::Value) {
     writer.flush().unwrap();
 }
 
-fn read_lsp_frame(reader: &mut impl BufRead) -> Option<serde_json::Value> {
+fn valid_lsp_content_type(value: &str) -> bool {
+    let mut parts = value.split(';').map(str::trim);
+    if !parts
+        .next()
+        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/vscode-jsonrpc"))
+    {
+        return false;
+    }
+    let Some(charset) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let Some((name, value)) = charset.split_once('=') else {
+        return false;
+    };
+    name.trim().eq_ignore_ascii_case("charset")
+        && matches!(value.trim().to_ascii_lowercase().as_str(), "utf-8" | "utf8")
+}
+
+fn read_lsp_frame(reader: &mut impl BufRead) -> Result<Option<serde_json::Value>, String> {
     let mut content_length = None;
+    let mut content_type = None;
     let mut saw_header = false;
     loop {
         let mut line = String::new();
-        let read = reader.read_line(&mut line).unwrap();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("reading LSP stdout header: {error}"))?;
         if read == 0 {
-            assert!(!saw_header, "truncated LSP header at stdout EOF");
-            return None;
+            if saw_header {
+                return Err("truncated LSP header at stdout EOF".to_string());
+            }
+            return Ok(None);
         }
         saw_header = true;
         if line == "\r\n" {
@@ -762,21 +791,182 @@ fn read_lsp_frame(reader: &mut impl BufRead) -> Option<serde_json::Value> {
         }
         let line = line
             .strip_suffix("\r\n")
-            .expect("every stdout header line must use CRLF framing");
+            .ok_or_else(|| "every stdout header line must use CRLF framing".to_string())?;
         let (name, value) = line
             .split_once(':')
-            .expect("unframed stdout byte or malformed LSP header");
+            .ok_or_else(|| "unframed stdout byte or malformed LSP header".to_string())?;
         if name.eq_ignore_ascii_case("Content-Length") {
-            assert!(content_length.is_none(), "duplicate Content-Length header");
-            content_length = Some(value.trim().parse::<usize>().unwrap());
+            if content_length.is_some() {
+                return Err("duplicate Content-Length header".to_string());
+            }
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("invalid Content-Length header: {value:?}"));
+            }
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid Content-Length header: {error}"))?,
+            );
+        } else if name.eq_ignore_ascii_case("Content-Type") {
+            if content_type.is_some() {
+                return Err("duplicate Content-Type header".to_string());
+            }
+            let value = value.trim();
+            if !valid_lsp_content_type(value) {
+                return Err(format!("invalid Content-Type header: {value:?}"));
+            }
+            content_type = Some(value.to_string());
+        } else {
+            return Err(format!("unsupported LSP stdout header: {name}"));
         }
     }
-    let content_length = content_length.expect("LSP stdout frame must have Content-Length");
+    let content_length =
+        content_length.ok_or_else(|| "LSP stdout frame must have Content-Length".to_string())?;
     let mut payload = vec![0; content_length];
     reader
         .read_exact(&mut payload)
-        .expect("complete LSP stdout payload");
-    Some(serde_json::from_slice(&payload).expect("LSP stdout payload must be JSON"))
+        .map_err(|error| format!("reading complete LSP stdout payload: {error}"))?;
+    let value = serde_json::from_slice(&payload)
+        .map_err(|error| format!("LSP stdout payload must be JSON: {error}"))?;
+    Ok(Some(value))
+}
+
+#[test]
+fn lsp_frame_parser_rejects_unknown_colon_header() {
+    let bytes = b"X-Hostile: uploaded\r\nContent-Length: 2\r\n\r\n{}";
+    let error = read_lsp_frame(&mut BufReader::new(&bytes[..])).unwrap_err();
+
+    assert!(error.contains("unsupported LSP stdout header: X-Hostile"));
+}
+
+#[test]
+fn lsp_frame_parser_rejects_invalid_content_type() {
+    let bytes = b"Content-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}";
+    let error = read_lsp_frame(&mut BufReader::new(&bytes[..])).unwrap_err();
+
+    assert!(error.contains("invalid Content-Type header"));
+}
+
+#[test]
+fn lsp_frame_parser_accepts_valid_optional_content_type() {
+    let bytes =
+        b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: 2\r\n\r\n{}";
+    let frame = read_lsp_frame(&mut BufReader::new(&bytes[..]))
+        .expect("valid frame")
+        .expect("framed payload");
+
+    assert_eq!(frame, serde_json::json!({}));
+}
+
+const LSP_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+enum LspStdoutEvent {
+    Frame(serde_json::Value),
+    Eof,
+    Error(String),
+}
+
+fn spawn_lsp_stdout_reader(stdout: impl Read + Send + 'static) -> Receiver<LspStdoutEvent> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let event = match read_lsp_frame(&mut reader) {
+                Ok(Some(frame)) => LspStdoutEvent::Frame(frame),
+                Ok(None) => LspStdoutEvent::Eof,
+                Err(error) => LspStdoutEvent::Error(error),
+            };
+            let finished = !matches!(event, LspStdoutEvent::Frame(_));
+            if sender.send(event).is_err() || finished {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+fn receive_lsp_frame(receiver: &Receiver<LspStdoutEvent>, context: &str) -> serde_json::Value {
+    match receiver.recv_timeout(LSP_TEST_TIMEOUT) {
+        Ok(LspStdoutEvent::Frame(frame)) => frame,
+        Ok(LspStdoutEvent::Eof) => panic!("stdout closed while waiting for {context}"),
+        Ok(LspStdoutEvent::Error(error)) => {
+            panic!("invalid LSP stdout while waiting for {context}: {error}")
+        }
+        Err(error) => panic!("timed out waiting for {context}: {error}"),
+    }
+}
+
+fn receive_lsp_eof(receiver: &Receiver<LspStdoutEvent>) {
+    match receiver.recv_timeout(LSP_TEST_TIMEOUT) {
+        Ok(LspStdoutEvent::Eof) => {}
+        Ok(LspStdoutEvent::Frame(frame)) => panic!("unexpected framed message after exit: {frame}"),
+        Ok(LspStdoutEvent::Error(error)) => panic!("invalid LSP stdout before exit: {error}"),
+        Err(error) => panic!("timed out waiting for LSP stdout EOF: {error}"),
+    }
+}
+
+fn spawn_output_drain(mut output: impl Read + Send + 'static) -> Receiver<Result<Vec<u8>, String>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = output
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+            .map_err(|error| format!("reading child output: {error}"));
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+struct BoundedChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl BoundedChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn wait(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    return Ok(status);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    let status = self
+                        .child
+                        .wait()
+                        .map_err(|error| format!("reaping timed-out ferry-lsp: {error}"))?;
+                    self.reaped = true;
+                    return Err(format!(
+                        "ferry-lsp did not exit within {timeout:?}; killed with {status}"
+                    ));
+                }
+                Err(error) => return Err(format!("polling ferry-lsp exit: {error}")),
+            }
+        }
+    }
+}
+
+impl Drop for BoundedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 #[test]
@@ -790,15 +980,18 @@ fn ferry_lsp_scoped_sync_stdout_is_only_content_length_framed_json_rpc() {
     std::fs::write(&file_path, file_text).unwrap();
     let uri = format!("file://{}", file_path.display());
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ferry-lsp"))
-        .current_dir(local.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut child = BoundedChild::new(
+        Command::new(env!("CARGO_BIN_EXE_ferry-lsp"))
+            .current_dir(local.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.child.stdin.take().unwrap();
+    let stdout = spawn_lsp_stdout_reader(child.child.stdout.take().unwrap());
+    let stderr = spawn_output_drain(child.child.stderr.take().unwrap());
 
     write_lsp_frame(
         &mut stdin,
@@ -813,7 +1006,7 @@ fn ferry_lsp_scoped_sync_stdout_is_only_content_length_framed_json_rpc() {
             }
         }),
     );
-    let initialize = read_lsp_frame(&mut stdout).expect("initialize response");
+    let initialize = receive_lsp_frame(&stdout, "initialize response");
     assert_eq!(initialize["id"], 1);
     assert!(initialize.get("error").is_none());
 
@@ -856,7 +1049,7 @@ fn ferry_lsp_scoped_sync_stdout_is_only_content_length_framed_json_rpc() {
     let mut acknowledged = false;
     let mut feedback = None;
     for _ in 0..8 {
-        let message = read_lsp_frame(&mut stdout).expect("scoped-sync response or feedback");
+        let message = receive_lsp_frame(&stdout, "scoped-sync response or feedback");
         if message.get("id") == Some(&serde_json::json!(2)) {
             assert!(message.get("error").is_none());
             acknowledged = true;
@@ -881,7 +1074,7 @@ fn ferry_lsp_scoped_sync_stdout_is_only_content_length_framed_json_rpc() {
             "params": null
         }),
     );
-    let shutdown = read_lsp_frame(&mut stdout).expect("shutdown response");
+    let shutdown = receive_lsp_frame(&stdout, "shutdown response");
     assert_eq!(shutdown["id"], 3);
     assert!(shutdown.get("error").is_none());
     write_lsp_frame(
@@ -894,18 +1087,14 @@ fn ferry_lsp_scoped_sync_stdout_is_only_content_length_framed_json_rpc() {
     );
     drop(stdin);
 
-    assert!(
-        read_lsp_frame(&mut stdout).is_none(),
-        "unexpected framed message after exit"
-    );
-    let status = child.wait().unwrap();
-    let mut stderr = Vec::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_end(&mut stderr)
-        .unwrap();
+    let status = child
+        .wait(LSP_TEST_TIMEOUT)
+        .unwrap_or_else(|error| panic!("{error}"));
+    receive_lsp_eof(&stdout);
+    let stderr = stderr
+        .recv_timeout(LSP_TEST_TIMEOUT)
+        .unwrap_or_else(|error| panic!("timed out waiting for ferry-lsp stderr EOF: {error}"))
+        .unwrap_or_else(|error| panic!("{error}"));
     assert!(
         status.success(),
         "ferry-lsp failed: {}",

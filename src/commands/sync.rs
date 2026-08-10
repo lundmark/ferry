@@ -393,7 +393,7 @@ pub fn run_scoped(
     run_scoped_from_config(&config, scope, force, mode, gate)
 }
 
-fn run_scoped_from_config(
+pub(crate) fn run_scoped_from_config(
     config: &Config,
     scope: SyncScope,
     force: bool,

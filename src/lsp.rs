@@ -27,6 +27,7 @@ use crate::commands::file_transfer::TransferOutcome;
 use crate::commands::pull::{LocalIdentity, PreparedPull as CorePreparedPull, fetch_remote_one};
 use crate::commands::sync::scope::SyncScope;
 use crate::commands::sync::{CommitGate, SyncEventKind, SyncOutcome};
+use crate::config::Config;
 use document_state::{DocumentScope, DocumentTracker, OperationGuard};
 use lsp_types::request::{Request as LspRequest, ShowMessageRequest};
 
@@ -98,7 +99,7 @@ pub trait FileOperations {
 }
 
 pub struct SyncRequest {
-    pub config_path: PathBuf,
+    pub config: Config,
     pub scope: SyncScope,
     pub gate: Arc<dyn CommitGate>,
 }
@@ -264,8 +265,8 @@ impl FileOperations for FerryOperations {
     }
 
     fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
-        crate::commands::sync::run_scoped(
-            &request.config_path,
+        crate::commands::sync::run_scoped_from_config(
+            &request.config,
             request.scope,
             false,
             ExecutionMode::Apply,
@@ -514,7 +515,7 @@ impl<O: FileOperations> Server<O> {
                 let scope = sync_scope_for(command.action, &resolved.relative_path)
                     .expect("sync action must derive a scope");
                 sync_feedback(self.operations.sync(SyncRequest {
-                    config_path: resolved.config_path,
+                    config: resolved.config,
                     scope,
                     gate,
                 }))
@@ -1833,7 +1834,9 @@ mod tests {
             rel: String,
         },
         Sync {
-            config_path: PathBuf,
+            host: String,
+            local_root: PathBuf,
+            remote_root: String,
             scope: SyncScope,
             gate_current: bool,
         },
@@ -2041,6 +2044,16 @@ mod tests {
 
         fn set_raw_config(&self, config: &str) {
             fs::write(&self.config_path, config).unwrap();
+        }
+
+        fn expected_sync_call(&self, scope: SyncScope) -> Call {
+            Call::Sync {
+                host: "example.invalid".to_string(),
+                local_root: self._temp.path().join("."),
+                remote_root: "/project".to_string(),
+                scope,
+                gate_current: true,
+            }
         }
     }
 
@@ -4119,21 +4132,9 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[
-                Call::Sync {
-                    config_path: fixture.config_path.clone(),
-                    scope: SyncScope::Path("src/nested/hello world.c".to_string()),
-                    gate_current: true,
-                },
-                Call::Sync {
-                    config_path: fixture.config_path.clone(),
-                    scope: SyncScope::Path("src/nested".to_string()),
-                    gate_current: true,
-                },
-                Call::Sync {
-                    config_path: fixture.config_path,
-                    scope: SyncScope::RootDirectory,
-                    gate_current: true,
-                },
+                fixture.expected_sync_call(SyncScope::Path("src/nested/hello world.c".to_string())),
+                fixture.expected_sync_call(SyncScope::Path("src/nested".to_string())),
+                fixture.expected_sync_call(SyncScope::RootDirectory),
             ]
         );
     }
@@ -4278,11 +4279,7 @@ mod tests {
         finish_loop(&client, loop_thread, 193);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &[Call::Sync {
-                config_path: fixture.config_path,
-                scope: SyncScope::Path("src/nested".to_string()),
-                gate_current: true,
-            }]
+            &[fixture.expected_sync_call(SyncScope::Path("src/nested".to_string()))]
         );
     }
 
@@ -4821,8 +4818,11 @@ mod tests {
         }
 
         fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            let config = request.config;
             self.calls.lock().unwrap().push(Call::Sync {
-                config_path: request.config_path,
+                host: config.connection.host,
+                local_root: config.paths.local_root,
+                remote_root: config.paths.remote_root,
                 scope: request.scope,
                 gate_current: request.gate.is_current(),
             });
@@ -4833,6 +4833,75 @@ mod tests {
     struct BlockingSyncOperations {
         started: mpsc::SyncSender<SyncScope>,
         release: mpsc::Receiver<()>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ResolvedSyncSnapshot {
+        host: String,
+        local_root: PathBuf,
+        remote_root: String,
+        scope: SyncScope,
+    }
+
+    struct ConfigReplacingSyncOperations {
+        config_path: PathBuf,
+        replacement: String,
+        calls: Arc<AtomicUsize>,
+        observed: mpsc::SyncSender<ResolvedSyncSnapshot>,
+    }
+
+    impl FileOperations for ConfigReplacingSyncOperations {
+        type PreparedPull = String;
+
+        fn prepare_pull(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<Self::PreparedPull> {
+            Ok(rel.to_string())
+        }
+
+        fn apply_pull(
+            &mut self,
+            prepared: Self::PreparedPull,
+            request: PullRequest,
+        ) -> Result<TransferOutcome> {
+            anyhow::ensure!(request.try_claim(), "cancelled");
+            Ok(TransferOutcome::new(&prepared, TransferStatus::Unchanged))
+        }
+
+        fn push(
+            &mut self,
+            _config_path: &Path,
+            rel: &str,
+            _force: bool,
+        ) -> Result<TransferOutcome> {
+            Ok(TransferOutcome::new(rel, TransferStatus::Unchanged))
+        }
+
+        fn compile(&mut self, _config_path: &Path, rel: &str) -> Result<FileCheckResult> {
+            Ok(FileCheckResult {
+                path: rel.to_string(),
+                status: FileCheckStatus::Passed,
+                diagnostics: String::new(),
+            })
+        }
+
+        fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            fs::write(&self.config_path, &self.replacement)?;
+            let config = request.config;
+            self.observed
+                .send(ResolvedSyncSnapshot {
+                    host: config.connection.host,
+                    local_root: config.paths.local_root,
+                    remote_root: config.paths.remote_root,
+                    scope: request.scope,
+                })
+                .map_err(|_| anyhow!("snapshot observer disconnected"))?;
+            Ok(SyncOutcome::default())
+        }
     }
 
     impl FileOperations for BlockingSyncOperations {
@@ -4988,6 +5057,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scoped_sync_keeps_the_config_snapshot_resolved_by_the_worker() {
+        let fixture = Fixture::new("");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let operations = ConfigReplacingSyncOperations {
+            config_path: fixture.config_path.clone(),
+            replacement: "[connection]\nhost = \"replacement.invalid\"\nuser = \"other\"\npassword = \"other\"\n\
+                          [paths]\nlocal_root = \"replacement\"\nremote_root = \"/replacement\"\n"
+                .to_string(),
+            calls: Arc::clone(&calls),
+            observed: observed_tx,
+        };
+        let (server_connection, client) = Connection::memory();
+        let loop_thread =
+            thread::spawn(move || main_loop(server_connection, Server::new(operations)));
+
+        client
+            .sender
+            .send(Message::Notification(did_open(fixture.uri())))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Request(execute_command_request(
+                203,
+                SYNC_FILE_COMMAND,
+                vec![serde_json::to_value(fixture.uri()).unwrap()],
+            )))
+            .unwrap();
+        receive_acknowledgement(&client, 203);
+
+        assert_eq!(
+            observed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("resolved sync snapshot"),
+            ResolvedSyncSnapshot {
+                host: "example.invalid".to_string(),
+                local_root: fixture._temp.path().join("."),
+                remote_root: "/project".to_string(),
+                scope: SyncScope::Path("src/nested/hello world.c".to_string()),
+            }
+        );
+        receive_show_message(&client, "scoped sync completion");
+        finish_loop(&client, loop_thread, 204);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum SyncLifecycleNotification {
         Open,
@@ -5116,8 +5232,11 @@ mod tests {
         }
 
         fn sync(&mut self, request: SyncRequest) -> Result<SyncOutcome> {
+            let config = request.config;
             self.calls.lock().unwrap().push(Call::Sync {
-                config_path: request.config_path,
+                host: config.connection.host,
+                local_root: config.paths.local_root,
+                remote_root: config.paths.remote_root,
                 scope: request.scope,
                 gate_current: request.gate.is_current(),
             });
@@ -5208,11 +5327,7 @@ mod tests {
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[
-                Call::Sync {
-                    config_path: fixture.config_path.clone(),
-                    scope: SyncScope::Path("src/nested".to_string()),
-                    gate_current: true,
-                },
+                fixture.expected_sync_call(SyncScope::Path("src/nested".to_string())),
                 Call::Push {
                     config_path: fixture.config_path,
                     rel: "nested/hello world.c".to_string(),
