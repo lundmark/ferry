@@ -65,3 +65,21 @@ public methods remain unchanged.
 3. Audit `git diff --check`, changed files, lockfile dependency scope, and
    generated artifacts.
 4. Create logical commits and confirm the worktree is clean.
+
+## Implementation record (2026-08-10)
+
+- Local guarded staging does not unlink a reserved path when file-identity
+  capture fails. Until identity is captured, the pathname is unproven and is
+  preserved for manual inspection; identity-checked cleanup remains unchanged
+  after ownership is established.
+- Guarded remote staging retains the full strict LIST/size/hash snapshot as its
+  ownership record and separately captures exact MDTM only after that snapshot
+  proves the intended payload.
+- The final upload claim revalidates the strict snapshot and exact MDTM before
+  rename. State records that exact MDTM, and no snapshot or MDTM probe occurs
+  after rename.
+- Staging and claim failures remove a remote temp only when a fresh strict
+  snapshot exactly matches the owned snapshot; replacements remain untouched.
+- Scoped inventory still recognizes only the nonce-bearing reserved grammar.
+  Historical `TARGET.tmp.zedftp` files are not reserved or auto-cleaned and
+  require deliberate manual cleanup.
