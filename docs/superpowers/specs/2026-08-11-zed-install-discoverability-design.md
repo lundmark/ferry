@@ -22,8 +22,9 @@ for both command-line and Zed installation:
    open Zed's Extensions page and choose `Install Dev Extension`, or invoke
    `zed: install dev extension`, then select this repository's
    `extensions/ferry` directory.
-4. Add focused troubleshooting guidance: if Ferry actions do not appear after
-   installation, fully quit and relaunch Zed, then reopen the project.
+4. Add focused troubleshooting guidance: if Ferry actions do not appear for a
+   file in a configured Ferry project after installation, fully quit and
+   relaunch Zed, then reopen the project.
 5. Link to **Native Zed integration** for project configuration and available
    actions.
 
