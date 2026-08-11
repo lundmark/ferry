@@ -27,7 +27,24 @@ From a checkout of this repo:
 cargo install --path .
 ```
 
-This drops a `ferry` binary into `~/.cargo/bin`.
+This installs both `ferry` and `ferry-lsp` in `~/.cargo/bin`. Make sure
+that directory is on `PATH`.
+
+### Install in Zed
+
+Zed requires Rust to be installed through
+[`rustup`](https://zed.dev/docs/extensions/developing-extensions) when
+building a development extension.
+
+Open Zed's Extensions page and click `Install Dev Extension`, or run the
+`zed: install dev extension` action. Select this repository's
+`extensions/ferry` directory.
+
+After configuring a Ferry project, if its actions do not appear for a file,
+fully quit and relaunch Zed, then reopen the project.
+
+See [Native Zed integration](#native-zed-integration) for project configuration
+and the available actions.
 
 ## Quick start
 
@@ -196,16 +213,9 @@ Behaviour:
 
 The companion extension at [`extensions/ferry/`](extensions/ferry/README.md)
 starts `ferry-lsp` for Zed's C language. The language server handles file-open
-and file-save events directly and offers manual file actions. Install the
-binaries first:
-
-```sh
-cargo install --path .          # installs both ferry and ferry-lsp
-```
-
-Then open Zed's Extensions page and click `Install Dev Extension`, or run the
-`zed: install dev extension` action. Select this repository's
-`extensions/ferry` directory.
+and file-save events directly and offers manual file actions. Follow
+[Installation](#installation) to install both binaries and the development
+extension in Zed.
 
 Configure the editor behavior in the project's `.ferry.toml`:
 
