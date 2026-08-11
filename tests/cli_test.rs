@@ -823,7 +823,7 @@ fn scoped_sync_unchanged_file_does_not_rewrite_state_or_capability() {
 }
 
 #[test]
-fn scoped_sync_stale_state_only_noop_does_not_rewrite_state() {
+fn scoped_sync_exact_stale_state_only_renders_skip_and_does_not_rewrite_state() {
     let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
     let project = tempfile::tempdir().unwrap();
     let config = scoped_config(project.path(), server.port);
@@ -840,7 +840,7 @@ fn scoped_sync_stale_state_only_noop_does_not_rewrite_state() {
     let before = write_compact_scoped_state(project.path(), &state);
 
     let output = bin()
-        .args(["sync", ".", "--config"])
+        .args(["sync", "stale.c", "--config"])
         .arg(&config)
         .output()
         .unwrap();
@@ -850,6 +850,12 @@ fn scoped_sync_stale_state_only_noop_does_not_rewrite_state() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "skip (not on local or remote): stale.c\n"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!project.path().join("stale.c").exists());
     assert_eq!(
         std::fs::read(scoped_state_path(project.path())).unwrap(),
         before

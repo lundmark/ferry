@@ -87,7 +87,11 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
         entries.entry(path.clone()).or_default().in_state = true;
     }
 
-    if matches!(&scope, SyncScope::Path(_)) && !selected_local && !selected_remote {
+    if let SyncScope::Path(selected) = &scope
+        && !selected_local
+        && !selected_remote
+        && !entries.get(selected).is_some_and(|entry| entry.in_state)
+    {
         bail!("path not found locally or remotely");
     }
 
@@ -1119,15 +1123,36 @@ mod tests {
     }
 
     #[test]
-    fn stale_state_only_exact_path_does_not_count_as_selected_presence() {
+    fn stale_state_only_exact_path_counts_as_selected_presence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote = FakeRemote::default().directory("/remote", vec![]);
+
+        let actual = inventory(
+            &mut remote,
+            root.path(),
+            &state_with(&["gone.c"]),
+            SyncScope::Path("gone.c".into()),
+        )
+        .unwrap();
+
+        assert!(!actual.selected_local);
+        assert!(!actual.selected_remote);
+        assert_eq!(
+            actual.entries,
+            BTreeMap::from([("gone.c".into(), presence(None, None, true))])
+        );
+    }
+
+    #[test]
+    fn state_only_descendant_does_not_validate_its_absent_parent_selection() {
         let root = tempfile::tempdir().unwrap();
         let mut remote = FakeRemote::default().directory("/remote", vec![]);
 
         let error = inventory(
             &mut remote,
             root.path(),
-            &state_with(&["gone.c"]),
-            SyncScope::Path("gone.c".into()),
+            &state_with(&["gone/child.c"]),
+            SyncScope::Path("gone".into()),
         )
         .unwrap_err();
 

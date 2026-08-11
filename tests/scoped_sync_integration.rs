@@ -255,7 +255,7 @@ fn file_conflict_exits_two_after_clean_sibling_finishes_and_state_saves() {
 
 #[test]
 #[ignore = "requires Docker"]
-fn stale_state_only_entry_is_reported_without_deletion() {
+fn exact_stale_state_only_entry_is_reported_without_deletion() {
     let fixture = support::start_ftp();
     let project = tempfile::tempdir().unwrap();
     let root = project.path().join("mirror");
@@ -270,7 +270,7 @@ fn stale_state_only_entry_is_reported_without_deletion() {
     let config = project.path().join("scoped-sync.toml");
     std::fs::rename(generated, &config).unwrap();
 
-    let output = sync(&config, &["."]);
+    let output = sync(&config, &["gone.txt"]);
 
     assert_success(&output);
     assert!(

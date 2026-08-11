@@ -881,6 +881,44 @@ fn structured_production_orders_events_and_distinguishes_type_and_stale_issues()
     );
 }
 
+#[test]
+fn exact_stale_state_only_selection_skips_without_local_remote_or_state_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let mut remote = ProductionRemote::with_root();
+    let mut state = StateFile::default();
+    state
+        .files
+        .insert("gone.c".into(), state_record(b"previous bytes"));
+    let state_before = serde_json::to_vec(&state).unwrap();
+
+    let outcome = run_production(
+        &mut remote,
+        root.path(),
+        &mut state,
+        SyncScope::Path("gone.c".into()),
+        false,
+        ExecutionMode::Apply,
+        &UnconditionalCommitGate,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        SyncOutcome {
+            events: vec![SyncEvent {
+                path: "gone.c".into(),
+                kind: SyncEventKind::SkippedAbsent,
+            }],
+            ..SyncOutcome::default()
+        }
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    assert!(remote.files.is_empty());
+    assert_eq!(remote.directories, BTreeSet::from(["/remote".to_string()]));
+    assert!(!remote.has_mutation());
+    assert_eq!(serde_json::to_vec(&state).unwrap(), state_before);
+}
+
 struct SequenceGate {
     current: Mutex<VecDeque<bool>>,
     commits: AtomicUsize,
