@@ -1,0 +1,56 @@
+# Zed Installation Discoverability Design
+
+## Context
+
+The root README documents Zed's `Install Dev Extension` workflow only in the
+later **Native Zed integration** section. A reader following the top-level
+**Installation** section can therefore miss the Zed setup entirely. That
+section also says `cargo install --path .` installs only `ferry`, although the
+command installs both `ferry` and `ferry-lsp`.
+
+## Decision
+
+Make the root README's **Installation** section the short, accurate entry point
+for both command-line and Zed installation:
+
+1. State that `cargo install --path .` installs both binaries into
+   `~/.cargo/bin` and that the directory must be on `PATH`.
+2. Add an **Install in Zed** subsection immediately afterward. Tell users to
+   open Zed's Extensions page and choose `Install Dev Extension`, or invoke
+   `zed: install dev extension`, then select this repository's
+   `extensions/ferry` directory.
+3. Tell users to close and reopen Zed after the first development-extension
+   installation so the extension starts the installed `ferry-lsp`.
+4. Link to **Native Zed integration** for project configuration and available
+   actions.
+
+Keep the later integration section focused on behavior and configuration.
+Replace its duplicate binary and extension installation instructions with a
+short link back to **Installation**, preventing the two sections from drifting
+apart. Keep the extension-specific README self-contained, but add the same
+first-install restart guidance there for consistency.
+
+## Scope
+
+- Update only `README.md` and `extensions/ferry/README.md`.
+- Do not change Ferry behavior, Zed actions, configuration defaults, extension
+  metadata, or build output.
+- Do not document publication through Zed's extension registry; the supported
+  workflow remains development-extension installation from a checkout.
+
+## Validation
+
+1. Confirm the root installation section names both installed binaries and
+   exposes the complete Zed development-extension flow before **Quick start**.
+2. Confirm all relative links and Markdown anchors resolve within the checkout.
+3. Search for stale wording that claims Cargo installs only `ferry` or for
+   contradictory Zed installation instructions.
+4. Review the rendered Markdown structure for concise, non-duplicated guidance.
+
+## Success Criteria
+
+- A new reader can find and complete Zed installation from the root README's
+  top-level installation section.
+- The command-line installation result is described accurately.
+- Detailed Zed configuration and action documentation remains easy to reach.
+- The root and extension READMEs agree on the first-install workflow.
