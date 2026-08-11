@@ -49,9 +49,10 @@ that directory is on `PATH`.
 
 ### Install in Zed
 
-Zed requires Rust to be installed through
-[`rustup`](https://zed.dev/docs/extensions/developing-extensions) when
-building a development extension.
+Zed compiles development extensions for `wasm32-wasip2`. Install Rust through
+[`rustup`](https://zed.dev/docs/extensions/developing-extensions) so Zed can add
+that target automatically; with another Rust installation, make the target
+available yourself.
 
 Open Zed's Extensions page and click `Install Dev Extension`, or run the
 `zed: install dev extension` action. Select this repository's
@@ -109,20 +110,21 @@ git commit -m "docs: surface Zed development extension install"
 Run:
 
 ```sh
-rg -n 'rustup|fully quit and relaunch Zed' extensions/ferry/README.md
+rg -n 'wasm32-wasip2|fully quit and relaunch Zed' extensions/ferry/README.md
 ```
 
 Expected: no output and exit status 1.
 
-- [ ] **Step 2: Add the Zed prerequisite**
+- [ ] **Step 2: Add the Zed target guidance**
 
 Insert this as the first numbered prerequisite and renumber the existing two
 items:
 
 ```markdown
-1. Install Rust through
-   [`rustup`](https://zed.dev/docs/extensions/developing-extensions). Zed
-   requires a `rustup` toolchain to build development extensions.
+1. Zed compiles development extensions for `wasm32-wasip2`. Install Rust
+   through [`rustup`](https://zed.dev/docs/extensions/developing-extensions)
+   so Zed can add that target automatically; with another Rust installation,
+   make the target available yourself.
 ```
 
 Keep the binary-installation and `ferry init` prerequisites otherwise
@@ -153,7 +155,7 @@ git diff --check
 ```
 
 Expected: every command exits 0; both READMEs contain the same official
-prerequisite link and conditional relaunch guidance; no whitespace errors are
+target guidance and conditional relaunch guidance; no whitespace errors are
 reported.
 
 - [ ] **Step 5: Review the complete documentation diff**
@@ -164,7 +166,7 @@ Run:
 git diff -- README.md extensions/ferry/README.md
 ```
 
-Expected: only the approved installation, cross-link, prerequisite, and
+Expected: only the approved installation, cross-link, target guidance, and
 troubleshooting text changes; no behavior or configuration documentation
 changes.
 

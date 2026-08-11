@@ -15,9 +15,11 @@ for both command-line and Zed installation:
 
 1. State that `cargo install --path .` installs both binaries into
    `~/.cargo/bin` and that the directory must be on `PATH`.
-2. Add an **Install in Zed** subsection immediately afterward. State Zed's
-   requirement that Rust be installed through `rustup`, and link to Zed's
-   official development-extension instructions.
+2. Add an **Install in Zed** subsection immediately afterward. Document that
+   Zed compiles development extensions for `wasm32-wasip2`, link to Zed's
+   official development-extension instructions, explain that `rustup` lets
+   Zed add that target automatically, and state that other Rust installations
+   must provide the target manually.
 3. Tell users to
    open Zed's Extensions page and choose `Install Dev Extension`, or invoke
    `zed: install dev extension`, then select this repository's
@@ -32,7 +34,7 @@ Keep the later integration section focused on behavior and configuration.
 Replace its duplicate binary and extension installation instructions with a
 short link back to **Installation**, preventing the two sections from drifting
 apart. Keep the extension-specific README self-contained, but add the same
-`rustup` prerequisite and troubleshooting guidance there for consistency.
+Rust-target guidance and troubleshooting guidance there for consistency.
 
 ## Scope
 
@@ -46,8 +48,8 @@ apart. Keep the extension-specific README self-contained, but add the same
 
 1. Confirm the root installation section names both installed binaries and
    exposes the complete Zed development-extension flow before **Quick start**.
-2. Confirm the official Zed prerequisite link, all relative links, and all
-   Markdown anchors resolve.
+2. Confirm the official Zed target/toolchain guidance link, all relative
+   links, and all Markdown anchors resolve.
 3. Search for stale wording that claims Cargo installs only `ferry` or for
    contradictory Zed installation instructions.
 4. Review the rendered Markdown structure for concise, non-duplicated guidance.
