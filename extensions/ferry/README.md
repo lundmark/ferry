@@ -7,7 +7,12 @@ hover, or language diagnostics.
 
 ## Prerequisites
 
-1. Install the `ferry` and `ferry-lsp` binaries from the repository root:
+1. Zed compiles development extensions for `wasm32-wasip2`. Install Rust
+   through [`rustup`](https://zed.dev/docs/extensions/developing-extensions)
+   so Zed can add that target automatically; with another Rust installation,
+   make the target available yourself.
+
+2. Install the `ferry` and `ferry-lsp` binaries from the repository root:
 
    ```sh
    cargo install --path .
@@ -17,7 +22,7 @@ hover, or language diagnostics.
    on `PATH`. Native Compare also requires the `zed` CLI to be on the `PATH`
    visible to `ferry-lsp`.
 
-2. Configure a project by running `ferry init` at its root. For a file inside
+3. Configure a project by running `ferry init` at its root. For a file inside
    nested Ferry projects, the nearest `.ferry.toml` above that file wins. A
    file outside every Ferry project is ignored.
 
@@ -25,6 +30,9 @@ hover, or language diagnostics.
 
 Open Zed's Extensions page and click `Install Dev Extension`, or run the
 `zed: install dev extension` action. Select this `extensions/ferry` directory.
+
+If Ferry actions do not appear for a file in a configured Ferry project, fully
+quit and relaunch Zed, then reopen the project.
 
 ## Configuration
 
