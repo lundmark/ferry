@@ -32,9 +32,10 @@ that directory is on `PATH`.
 
 ### Install in Zed
 
-Zed requires Rust to be installed through
-[`rustup`](https://zed.dev/docs/extensions/developing-extensions) when
-building a development extension.
+Zed compiles development extensions for `wasm32-wasip2`. Install Rust through
+[`rustup`](https://zed.dev/docs/extensions/developing-extensions) so Zed can add
+that target automatically; with another Rust installation, make the target
+available yourself.
 
 Open Zed's Extensions page and click `Install Dev Extension`, or run the
 `zed: install dev extension` action. Select this repository's
