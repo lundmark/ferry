@@ -15,20 +15,23 @@ for both command-line and Zed installation:
 
 1. State that `cargo install --path .` installs both binaries into
    `~/.cargo/bin` and that the directory must be on `PATH`.
-2. Add an **Install in Zed** subsection immediately afterward. Tell users to
+2. Add an **Install in Zed** subsection immediately afterward. State Zed's
+   requirement that Rust be installed through `rustup`, and link to Zed's
+   official development-extension instructions.
+3. Tell users to
    open Zed's Extensions page and choose `Install Dev Extension`, or invoke
    `zed: install dev extension`, then select this repository's
    `extensions/ferry` directory.
-3. Tell users to close and reopen Zed after the first development-extension
-   installation so the extension starts the installed `ferry-lsp`.
-4. Link to **Native Zed integration** for project configuration and available
+4. Add focused troubleshooting guidance: if Ferry actions do not appear after
+   installation, fully quit and relaunch Zed, then reopen the project.
+5. Link to **Native Zed integration** for project configuration and available
    actions.
 
 Keep the later integration section focused on behavior and configuration.
 Replace its duplicate binary and extension installation instructions with a
 short link back to **Installation**, preventing the two sections from drifting
 apart. Keep the extension-specific README self-contained, but add the same
-first-install restart guidance there for consistency.
+`rustup` prerequisite and troubleshooting guidance there for consistency.
 
 ## Scope
 
@@ -42,7 +45,8 @@ first-install restart guidance there for consistency.
 
 1. Confirm the root installation section names both installed binaries and
    exposes the complete Zed development-extension flow before **Quick start**.
-2. Confirm all relative links and Markdown anchors resolve within the checkout.
+2. Confirm the official Zed prerequisite link, all relative links, and all
+   Markdown anchors resolve.
 3. Search for stale wording that claims Cargo installs only `ferry` or for
    contradictory Zed installation instructions.
 4. Review the rendered Markdown structure for concise, non-duplicated guidance.
