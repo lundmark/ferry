@@ -146,6 +146,13 @@ Run:
 ```sh
 rg -nF 'https://zed.dev/docs/extensions/developing-extensions' README.md
 rg -nF 'https://zed.dev/docs/extensions/developing-extensions' extensions/ferry/README.md
+rg -nF 'wasm32-wasip2' README.md
+rg -nF 'wasm32-wasip2' extensions/ferry/README.md
+rg -nF 'with another Rust installation,' README.md
+rg -nF 'with another Rust installation,' extensions/ferry/README.md
+rg -nU 'make the target\s+available yourself\.' README.md
+rg -nU 'make the target\s+available yourself\.' extensions/ferry/README.md
+! rg -n 'requires Rust to be installed through|requires a `rustup` toolchain' README.md extensions/ferry/README.md
 rg -nF 'relaunch Zed, then reopen the project.' README.md
 rg -nF 'relaunch Zed, then reopen the project.' extensions/ferry/README.md
 test -f extensions/ferry/README.md
@@ -193,6 +200,13 @@ test "$(rg -c '^cargo install --path \.$' README.md)" -eq 1
 test "$(rg -c 'zed: install dev extension' README.md)" -eq 1
 rg -nF 'https://zed.dev/docs/extensions/developing-extensions' README.md
 rg -nF 'https://zed.dev/docs/extensions/developing-extensions' extensions/ferry/README.md
+rg -nF 'wasm32-wasip2' README.md
+rg -nF 'wasm32-wasip2' extensions/ferry/README.md
+rg -nF 'with another Rust installation,' README.md
+rg -nF 'with another Rust installation,' extensions/ferry/README.md
+rg -nU 'make the target\s+available yourself\.' README.md
+rg -nU 'make the target\s+available yourself\.' extensions/ferry/README.md
+! rg -n 'requires Rust to be installed through|requires a `rustup` toolchain' README.md extensions/ferry/README.md
 rg -nF 'relaunch Zed, then reopen the project.' README.md
 rg -nF 'relaunch Zed, then reopen the project.' extensions/ferry/README.md
 ! rg -nF 'This drops a `ferry` binary into `~/.cargo/bin`.' README.md
@@ -205,7 +219,8 @@ git diff --check main...HEAD
 git status --short
 ```
 
-Expected: every assertion exits 0; Pandoc renders both READMEs and exposes the
+Expected: every assertion exits 0, including checks for the target and manual
+Rust-installation alternative; Pandoc renders both READMEs and exposes the
 expected heading IDs and internal link; `git diff --check` prints nothing; and
 `git status --short` prints nothing.
 
