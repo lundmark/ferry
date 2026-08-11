@@ -1,5 +1,6 @@
 target/
 .worktrees/
+extensions/ferry/extension.wasm
 .ferry.toml
 .ferry/
 # Legacy names, kept ignored until existing projects migrate to .ferry.*
