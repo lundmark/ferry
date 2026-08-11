@@ -38,6 +38,10 @@ pub trait Remote {
     }
 }
 
+pub trait StrictRemote: Remote {
+    fn list_dir_strict(&mut self, dir: &str) -> Result<Vec<Entry>>;
+}
+
 impl Remote for Ftp {
     fn list_dir(&mut self, dir: &str) -> Result<Vec<Entry>> {
         self.list(dir)
@@ -47,6 +51,12 @@ impl Remote for Ftp {
     }
     fn exact_file_presence(&mut self, path: &str) -> Result<ExactFilePresence> {
         self.exact_file_presence(path)
+    }
+}
+
+impl StrictRemote for Ftp {
+    fn list_dir_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list_strict(dir)
     }
 }
 
@@ -74,18 +84,16 @@ impl Ftp {
             .inner
             .list(Some(dir))
             .with_context(|| format!("ftp list {dir}"))?;
-        Ok(lines
-            .iter()
-            .filter_map(|line| {
-                let f = suppaftp::list::File::from_posix_line(line).ok()?;
-                Some(Entry {
-                    name: f.name().to_string(),
-                    is_dir: f.is_directory(),
-                    size: u64::try_from(f.size()).unwrap_or(0),
-                    modified: DateTime::<Utc>::from(f.modified()),
-                })
-            })
-            .collect())
+        Ok(parse_listing_tolerant(&lines))
+    }
+
+    pub fn list_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        let lines = self
+            .inner
+            .list(Some(dir))
+            .map_err(|error| strict_list_transport_error(dir, error))?;
+
+        parse_listing_strict(dir, &lines)
     }
 
     /// Probe exactly one remote pathname through `NLST`. Unlike [`Self::list`]
@@ -99,6 +107,114 @@ impl Ftp {
             .with_context(|| format!("ftp nlst {path}"))?;
         exact_nlst_presence(path, &lines)
     }
+}
+
+fn strict_list_transport_error(dir: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp list {}: remote listing failed",
+        sanitize_for_message(dir)
+    )
+}
+
+#[allow(dead_code)]
+fn strict_mkdir_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp mkdir {}: remote create failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_download_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped download {}: remote read failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_upload_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped upload {}: remote write failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_mtime_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped mtime {}: remote metadata read failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_size_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped size {}: remote metadata read failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn scoped_rename_transport_error(
+    from: &str,
+    to: &str,
+    _error: suppaftp::FtpError,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped rename {} -> {}: remote rename failed",
+        sanitize_for_message(from),
+        sanitize_for_message(to)
+    )
+}
+
+fn scoped_rm_transport_error(path: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ftp scoped rm {}: remote remove failed",
+        sanitize_for_message(path)
+    )
+}
+
+fn parse_listing_tolerant(lines: &[String]) -> Vec<Entry> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let file = suppaftp::list::File::from_posix_line(line).ok()?;
+            Some(entry_from_posix_file(&file))
+        })
+        .collect()
+}
+
+fn parse_listing_strict(dir: &str, lines: &[String]) -> Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let file = suppaftp::list::File::from_posix_line(line).map_err(|_| {
+            anyhow::anyhow!(
+                "ftp list {}: invalid record {index}",
+                sanitize_for_message(dir)
+            )
+        })?;
+        if !file.is_directory() && !file.is_file() {
+            anyhow::bail!(
+                "ftp list {}: unsupported record type at record {index}",
+                sanitize_for_message(dir)
+            );
+        }
+        entries.push(entry_from_posix_file(&file));
+    }
+    Ok(entries)
+}
+
+fn entry_from_posix_file(file: &suppaftp::list::File) -> Entry {
+    Entry {
+        name: file.name().to_string(),
+        is_dir: file.is_directory(),
+        size: u64::try_from(file.size()).unwrap_or(0),
+        modified: DateTime::<Utc>::from(file.modified()),
+    }
+}
+
+fn sanitize_for_message(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 fn exact_nlst_presence(path: &str, lines: &[String]) -> Result<ExactFilePresence> {
@@ -142,6 +258,55 @@ impl Ftp {
         Ok(copied)
     }
 
+    pub(crate) fn upload_bytes_scoped(&mut self, remote_path: &str, data: &[u8]) -> Result<()> {
+        let mut reader = Cursor::new(data);
+        self.inner
+            .put_file(remote_path, &mut reader)
+            .map_err(|error| scoped_upload_transport_error(remote_path, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn download_scoped(&mut self, remote_path: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.inner
+            .retr(remote_path, |reader| {
+                std::io::copy(reader, &mut bytes).map_err(suppaftp::FtpError::ConnectionError)?;
+                Ok(())
+            })
+            .map_err(|error| scoped_download_transport_error(remote_path, error))?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn mtime_scoped(&mut self, remote_path: &str) -> Result<DateTime<Utc>> {
+        let naive = self
+            .inner
+            .mdtm(remote_path)
+            .map_err(|error| scoped_mtime_transport_error(remote_path, error))?;
+        Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+    }
+
+    pub(crate) fn size_scoped(&mut self, remote_path: &str) -> Result<u64> {
+        let size = self
+            .inner
+            .size(remote_path)
+            .map_err(|error| scoped_size_transport_error(remote_path, error))?;
+        Ok(size as u64)
+    }
+
+    pub(crate) fn rename_scoped(&mut self, from: &str, to: &str) -> Result<()> {
+        self.inner
+            .rename(from, to)
+            .map_err(|error| scoped_rename_transport_error(from, to, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn rm_scoped(&mut self, path: &str) -> Result<()> {
+        self.inner
+            .rm(path)
+            .map_err(|error| scoped_rm_transport_error(path, error))?;
+        Ok(())
+    }
+
     pub fn size(&mut self, remote_path: &str) -> Result<u64> {
         let n = self
             .inner
@@ -183,6 +348,17 @@ impl Ftp {
         Ok(())
     }
 
+    /// Issue exactly one `MKD` command and propagate every server failure.
+    ///
+    /// Scoped commits must not use [`Self::mkdir`]'s tolerant LIST fallback:
+    /// a generic 550 is never evidence that a directory already exists.
+    #[allow(dead_code)]
+    pub(crate) fn mkdir_scoped_strict(&mut self, path: &str) -> Result<()> {
+        self.inner
+            .mkdir(path)
+            .map_err(|error| strict_mkdir_transport_error(path, error))
+    }
+
     /// Create a remote directory. Returns Ok if the directory was created OR
     /// already exists. Other errors are propagated.
     ///
@@ -217,7 +393,157 @@ impl Ftp {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExactFilePresence, exact_nlst_presence};
+    use super::{
+        ExactFilePresence, exact_nlst_presence, parse_listing_strict, parse_listing_tolerant,
+        scoped_download_transport_error, scoped_mtime_transport_error,
+        scoped_rename_transport_error, scoped_rm_transport_error, scoped_size_transport_error,
+        scoped_upload_transport_error, strict_list_transport_error, strict_mkdir_transport_error,
+    };
+
+    const VALID_POSIX_FILE: &str = "-rw-r--r-- 1 owner group 42 Jan 1 2000 file.txt";
+    const VALID_POSIX_DIRECTORY: &str = "drwxr-xr-x 2 owner group 4096 Jan 1 2000 subdir";
+
+    #[test]
+    fn strict_listing_transport_error_omits_server_response() {
+        const ATTACKER_REPLY: &str = "\u{1b}[31mattacker-reply";
+        let transport_error =
+            suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+                suppaftp::Status::FileUnavailable,
+                ATTACKER_REPLY.as_bytes().to_vec(),
+            ));
+
+        let error = strict_list_transport_error("/root", transport_error);
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ftp list /root"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("attacker-reply"));
+        assert!(message.contains("remote listing failed"));
+    }
+
+    #[test]
+    fn strict_mkdir_transport_error_omits_server_response_and_escapes_path() {
+        const ATTACKER_REPLY: &str = "\u{1b}[31mattacker-reply";
+        let transport_error =
+            suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+                suppaftp::Status::FileUnavailable,
+                ATTACKER_REPLY.as_bytes().to_vec(),
+            ));
+
+        let error = strict_mkdir_transport_error("/root/unsafe\nname", transport_error);
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ftp mkdir /root/unsafe\\nname"));
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("attacker-reply"));
+        assert!(message.contains("remote create failed"));
+    }
+
+    fn attacker_reply() -> suppaftp::FtpError {
+        suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+            suppaftp::Status::FileUnavailable,
+            b"\x1b[31mattacker-reply\nsecond-line".to_vec(),
+        ))
+    }
+
+    #[test]
+    fn scoped_transfer_errors_drop_every_raw_server_reply_and_escape_paths() {
+        let errors = [
+            scoped_download_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_upload_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_mtime_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_size_transport_error("/root/unsafe\nname", attacker_reply()),
+            scoped_rename_transport_error("/root/from\nname", "/root/to\nname", attacker_reply()),
+            scoped_rm_transport_error("/root/unsafe\nname", attacker_reply()),
+        ];
+
+        for error in errors {
+            let message = format!("{error:#}");
+            assert!(message.contains("ftp scoped"), "{message}");
+            assert!(message.contains("\\n"), "{message}");
+            assert!(!message.contains('\n'), "{message}");
+            assert!(!message.contains('\u{1b}'), "{message}");
+            assert!(!message.contains("attacker-reply"), "{message}");
+            assert!(!message.contains("second-line"), "{message}");
+        }
+    }
+
+    #[test]
+    fn strict_listing_rejects_one_malformed_line_among_valid_entries() {
+        let lines = vec![
+            VALID_POSIX_FILE.to_string(),
+            "\u{1b}[31mmalformed".to_string(),
+            VALID_POSIX_DIRECTORY.to_string(),
+        ];
+
+        let error = parse_listing_strict("/root", &lines).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("ftp list /root"));
+        assert!(message.contains("record 1"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("malformed"));
+    }
+
+    #[test]
+    fn strict_listing_accounts_for_blank_dot_and_dotdot_records() {
+        let lines = vec![
+            String::new(),
+            " \t".to_string(),
+            "drwxr-xr-x 2 owner group 4096 Jan 1 2000 .".to_string(),
+            "drwxr-xr-x 2 owner group 4096 Jan 1 2000 ..".to_string(),
+            VALID_POSIX_FILE.to_string(),
+        ];
+
+        let entries = parse_listing_strict("/root", &lines).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![".", "..", "file.txt"]
+        );
+    }
+
+    #[test]
+    fn tolerant_listing_drops_malformed_records_for_legacy_callers() {
+        let lines = vec![
+            VALID_POSIX_FILE.to_string(),
+            "\u{1b}[31mmalformed".to_string(),
+            VALID_POSIX_DIRECTORY.to_string(),
+        ];
+
+        let entries = parse_listing_tolerant(&lines);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file.txt", "subdir"]
+        );
+    }
+
+    #[test]
+    fn strict_listing_rejects_symlinks_while_tolerant_listing_stays_compatible() {
+        const ATTACKER_LINK: &str =
+            "lrwxrwxrwx 1 owner group 8 Jan 1 2000 link -> \u{1b}[31mtarget";
+        let lines = vec![ATTACKER_LINK.to_string()];
+
+        let error = parse_listing_strict("/root", &lines).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("unsupported record type"));
+        assert!(message.contains("record 0"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains("target"));
+
+        let tolerant_entries = parse_listing_tolerant(&lines);
+        assert_eq!(tolerant_entries.len(), 1);
+        assert!(!tolerant_entries[0].is_dir);
+    }
 
     #[test]
     fn exact_nlst_recognizes_a_hidden_requested_name() {

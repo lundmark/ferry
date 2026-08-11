@@ -72,6 +72,41 @@ Previewed actions use future-tense output such as `would push`, `would pull`,
 also suppresses its normally hidden state-cache update. The observational
 `ls` and `cc` / `check` commands otherwise behave normally.
 
+## Scoped sync
+
+`ferry sync` with no path retains Ferry's established project-wide behavior.
+To limit reconciliation, pass exactly one file or directory, or use the
+interactive picker:
+
+```sh
+ferry sync src/example.c
+ferry sync areas
+ferry sync --select
+ferry sync areas --dry-run
+ferry sync areas --force
+```
+
+`sync PATH` accepts one path relative to the configured `local_root`, or an
+absolute path contained by that root. A directory path is recursive. `PATH`
+and `--select` are mutually exclusive. The picker merges the current local and
+remote directory, including remote-only roots, and closes after one file or
+folder is selected. Selecting a folder runs the same recursive scoped sync as
+a direct directory path.
+
+Normal scoped sync is conflict-safe. `--force` is an explicit CLI-only option:
+for both-changed and untracked files, local wins and is uploaded. No supplied
+Zed Code Action or task uses force. `--dry-run` is non-mutating and previews
+the scoped plan without changing local files, remote files or directories, or
+Ferry state.
+
+Remote-only directories are created locally, local-only directories are
+created remotely, and empty selected directories and descendants are created
+on the missing side. Sync never treats a one-sided entry as a deletion and
+never removes files or directories. Clean entries in a selected directory may
+finish before another entry reports a conflict; that partial clean progress
+and its state are retained, and the command exits with conflict code `2` after
+reporting every conflict.
+
 ## Zed Task Picker integration
 
 Copy [`examples/tasks.json`](examples/tasks.json) into your project's
@@ -79,22 +114,43 @@ Copy [`examples/tasks.json`](examples/tasks.json) into your project's
 Zed, open the command palette and run `task: spawn`. The example provides:
 
 - current-file Pull, Push, and Compile-check tasks;
+- current-file and recursive current-folder Sync tasks;
+- a `Ferry: choose path to sync...` terminal picker;
 - a clearly labelled project-wide Status task;
-- a clearly labelled project-wide Sync task; and
-- a destructive current-file Delete task.
+- and a clearly labelled project-wide Sync task.
 
-Current-file tasks pass Zed's absolute `$ZED_FILE` path and run from
-`$ZED_DIRNAME`, so Ferry can find the nearest project configuration. Status
-and Sync run from `$ZED_WORKTREE_ROOT`. Status is the safe way to inspect the
-whole project. Project-wide Sync is conflict-aware and does not use force, but
-it may transfer files throughout the configured project; review Status first.
-There are deliberately no whole-tree Pull, Push, or force tasks.
+Zed's extension API does not expose literal Project Panel right-click actions
+to Ferry. Use `Ctrl+.` for the current document, or these Task Picker entries
+when you want terminal output or need to choose a path.
 
-> **Destructive:** `Ferry: DELETE current file locally and remotely` runs
-> `ferry rm`, which removes the named file on the server **and** the local copy
-> (and drops its sync record) without prompting. A bare `rm` with no path is
-> refused. To delete a directory subtree, explicitly run
-> `ferry rm --recursive <dir>` from a terminal.
+Current-file and current-folder tasks pass Zed's absolute `$ZED_FILE` or
+`$ZED_DIRNAME` and run from `$ZED_DIRNAME`, so Ferry can find the nearest
+project configuration. Status and project-wide Sync run from
+`$ZED_WORKTREE_ROOT`. The chooser starts in `$ZED_DIRNAME`, browses local and
+remote entries (including remote-only roots), and synchronizes one selection
+before closing.
+
+Run **Save All** before any terminal-backed directory or picker task. Tasks
+cannot inspect dirty Zed buffers, so unsaved editor content cannot participate
+in their safety checks. Status is the safe way to inspect the whole project.
+Project-wide Sync is conflict-aware and does not use force, but it may transfer
+files throughout the configured project; review Status first. There are
+deliberately no whole-tree Pull, Push, force, or deletion tasks.
+
+For a frequently used project folder, add a stable named task using one
+relative path, for example `ferry sync areas`:
+
+```json
+{
+  "label": "Ferry: sync areas",
+  "command": "ferry",
+  "args": ["sync", "areas"],
+  "cwd": "$ZED_WORKTREE_ROOT",
+  "use_new_terminal": false,
+  "reveal": "always",
+  "hide": "on_success"
+}
+```
 
 ## Claude Code / Codex hook
 
@@ -155,26 +211,61 @@ Configure the editor behavior in the project's `.ferry.toml`:
 
 ```toml
 [editor]
-pull_on_open = true
+pull_on_open = false
 push_on_save = false
 ```
 
-Both values shown are the defaults: Pull on open is enabled, while Push on
-save is opt-in. For nested projects, the nearest `.ferry.toml` above the file
-wins. The configuration is read again on every open, save, and manual action,
-so changes apply on the next event without restarting Zed.
+Both settings default to `false`. Each project can opt into Pull on open,
+Push on save, or both independently. For nested projects, the nearest
+`.ferry.toml` above the file wins. The configuration is read again on every
+open, save, and manual action, so changes apply on the next event without
+restarting Zed.
 
-Automatic Pull and the optional automatic Push are always non-force and
-conflict-safe. A conflict or other failure produces a warning; automatic
-success is silent. Zed initially opens the on-disk file, so it can briefly
+When enabled, automatic Pull and Push are always non-force and conflict-safe.
+A conflict or other failure produces a warning; automatic success is silent.
+Zed initially opens the on-disk file, so it can briefly
 show stale content before its external-file watcher observes a successful
-Pull. No open or save event performs a whole-tree sync.
+Pull. No open or save event performs a whole-tree or directory sync; directory
+sync is always an explicit manual action.
 
-For an explicit operation, open the lightbulb menu or press `Ctrl-.` and pick
-exactly one of `Ferry: Pull`, `Ferry: Push`, or `Ferry: Compile-check`. Manual
-actions report results with Info or Warning notifications. The Task Picker
-tasks described above are terminal-backed alternatives when you want command
-output, project Status/Sync, or the destructive Delete command.
+Automatic settings do not hide manual actions. For an explicit operation,
+open the lightbulb menu or press `Ctrl-.`; for a file in a Ferry project the
+actions appear in this order:
+
+1. `Ferry: Pull`
+2. `Ferry: Compare with Remote`
+3. `Ferry: Force Pull (overwrite local)`
+4. `Ferry: Push`
+5. `Ferry: Sync Current File`
+6. `Ferry: Sync Current Folder`
+7. `Ferry: Compile-check`
+
+Pull, Compare, Force Pull, and both Sync actions are save-first operations:
+they use saved local files. If the current buffer has unsaved changes, Ferry
+refuses the file-scoped action and asks you to save and retry. Sync Current
+Folder recursively reconciles the current file's parent directory; it refuses
+when any buffer known to Ferry beneath that folder is dirty and asks you to
+Save All before retrying. Neither Sync action uses force.
+
+Compare fetches the remote file into a private snapshot, then opens Zed's
+native diff with the saved local file on the left (old) and the fetched remote
+file on the right (new). It does not change the local file, Ferry state, or
+sync settings. For native diff, the `zed` CLI must be on the `PATH` visible to
+`ferry-lsp`.
+
+Force Pull retrieves the remote file first, then displays Zed's native warning
+confirmation. Only the exact `Overwrite local file` action applies it. Cancel,
+dismissal, an edit, shutdown, or a change to the local file's identity leaves
+the current file and Ferry state intact. A confirmed overwrite updates the
+local file and state through a guarded atomic install. This confirmation
+applies only to the Zed action; the existing `ferry pull --force` CLI remains
+noninteractive and unchanged.
+
+Manual actions report results with Info or Warning notifications and remain
+scoped to the current file's nearest Ferry project. The Task Picker tasks
+described above are terminal-backed alternatives when you want command
+output, project Status/Sync, a recursive current-folder sync, or a single
+interactive path selection.
 
 The extension attaches only to Zed's C language by default. `.h` files are
 covered when Zed classifies them as C; see the extension README if your header

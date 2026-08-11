@@ -18,7 +18,7 @@ fn main() -> Result<()> {
         };
     let _params: InitializeParams = serde_json::from_value(initialization_params)?;
 
-    ferry::lsp::main_loop(connection, Server::new(FerryOperations))?;
+    ferry::lsp::main_loop(connection, Server::new(FerryOperations::new()?))?;
     io_threads.join()?;
     Ok(())
 }

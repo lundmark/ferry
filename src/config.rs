@@ -39,21 +39,12 @@ pub struct Sync {
     pub include: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Default)]
 pub struct Editor {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub pull_on_open: bool,
     #[serde(default)]
     pub push_on_save: bool,
-}
-
-impl Default for Editor {
-    fn default() -> Self {
-        Self {
-            pull_on_open: true,
-            push_on_save: false,
-        }
-    }
 }
 
 fn default_port() -> u16 {
@@ -119,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_defaults_preserve_pull_and_disable_push() {
+    fn editor_defaults_disable_automatic_sync() {
         let cfg: Config = toml::from_str(
             r#"
             [connection]
@@ -132,8 +123,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(cfg.editor.pull_on_open);
-        assert!(!cfg.editor.push_on_save);
+        assert_eq!(
+            cfg.editor,
+            Editor {
+                pull_on_open: false,
+                push_on_save: false
+            }
+        );
     }
 
     #[test]

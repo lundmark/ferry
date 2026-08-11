@@ -2,6 +2,12 @@ use crate::config::Config;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelativeToRoot {
+    Root,
+    Path(String),
+}
+
 #[derive(Debug)]
 pub struct ProjectLocation {
     pub config_dir: PathBuf,
@@ -101,7 +107,7 @@ fn canonicalize_path_or_new_file(path: &Path) -> Result<PathBuf> {
     }
 }
 
-pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> {
+pub fn relative_to_local_root_or_root(local_root: &Path, path: &Path) -> Result<RelativeToRoot> {
     let local_root = local_root
         .canonicalize()
         .with_context(|| format!("canonicalizing local_root {}", local_root.display()))?;
@@ -114,6 +120,9 @@ pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> 
             local_root.display()
         )
     })?;
+    if relative.as_os_str().is_empty() {
+        return Ok(RelativeToRoot::Root);
+    }
     let relative = relative
         .to_str()
         .context("relative path is not valid UTF-8")?;
@@ -121,7 +130,17 @@ pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> 
     let relative = relative.replace('\\', "/");
     #[cfg(not(windows))]
     let relative = relative.to_owned();
-    crate::commands::walk::safe_rel(&relative)
+    crate::commands::walk::safe_rel(&relative).map(RelativeToRoot::Path)
+}
+
+pub fn relative_to_local_root(local_root: &Path, path: &Path) -> Result<String> {
+    match relative_to_local_root_or_root(local_root, path)? {
+        RelativeToRoot::Path(path) => Ok(path),
+        RelativeToRoot::Root => anyhow::bail!(
+            "file {} resolves to local_root itself; expected a descendant path",
+            path.display()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +306,92 @@ mod tests {
         let error = relative_to_local_root(&mirror, &mirror.join("link.c")).unwrap_err();
         assert!(error.to_string().contains("outside local_root"));
     }
+
+    #[test]
+    fn root_aware_absolute_root_returns_root() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            relative_to_local_root_or_root(root.path(), root.path()).unwrap(),
+            RelativeToRoot::Root
+        );
+    }
+
+    #[test]
+    fn root_aware_absolute_descendant_returns_path() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let file = nested.join("file.c");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            relative_to_local_root_or_root(root.path(), &file).unwrap(),
+            RelativeToRoot::Path("nested/file.c".into())
+        );
+    }
+
+    #[test]
+    fn root_aware_accepts_new_descendant_via_existing_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            relative_to_local_root_or_root(root.path(), &root.path().join("new/nested/file.c"))
+                .unwrap(),
+            RelativeToRoot::Path("new/nested/file.c".into())
+        );
+    }
+
+    #[test]
+    fn root_aware_rejects_absolute_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside.c");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, "").unwrap();
+
+        let error = relative_to_local_root_or_root(&root, &outside).unwrap_err();
+        assert!(error.to_string().contains("outside local_root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_aware_rejects_dangling_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(outside.join("new.c"), root.join("link.c")).unwrap();
+
+        let error = relative_to_local_root_or_root(&root, &root.join("link.c")).unwrap_err();
+        assert!(error.to_string().contains("outside local_root"));
+    }
+
+    #[test]
+    fn root_aware_legacy_resolver_still_rejects_root() {
+        let root = tempfile::tempdir().unwrap();
+
+        let error = relative_to_local_root(root.path(), root.path()).unwrap_err();
+        assert!(error.to_string().contains("local_root itself"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_aware_rejects_non_utf8_descendant() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"bad-\xff.c".to_vec());
+        let path = root.path().join(name);
+        std::fs::write(&path, "").unwrap();
+
+        let error = relative_to_local_root_or_root(root.path(), &path).unwrap_err();
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
     #[test]
     fn migration_moves_legacy_state_from_descendant_local_root() {
         let tmp = tempfile::tempdir().unwrap();

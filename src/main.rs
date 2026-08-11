@@ -52,6 +52,9 @@ enum Cmd {
     },
     /// Pull then push; refuses on conflict unless --force.
     Sync {
+        path: Option<String>,
+        #[arg(long, conflicts_with = "path")]
+        select: bool,
         #[arg(long)]
         force: bool,
     },
@@ -82,6 +85,11 @@ fn main() {
 
 fn run() -> i32 {
     let cli = Cli::parse();
+    if matches!(&cli.cmd, Cmd::Sync { select: true, .. })
+        && let Err(error) = ferry::commands::sync::require_select_terminal()
+    {
+        return finish(Err(error));
+    }
     let mode = ferry::commands::ExecutionMode::from_dry_run(cli.dry_run);
     if matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty()) {
         return finish(ferry::commands::rm::run(
@@ -98,10 +106,9 @@ fn run() -> i32 {
             .file_name()
             .is_some_and(|name| name == std::ffi::OsStr::new(ferry::names::LEGACY_CONFIG_FILE));
     let explicit_legacy_entry_exists = explicit_legacy_config && path_entry_exists(&cfg);
-    let is_hook = matches!(&cli.cmd, Cmd::Hook { .. });
     let should_load_config = !matches!(&cli.cmd, Cmd::Init { .. })
         && !matches!(&cli.cmd, Cmd::Rm { paths, .. } if paths.is_empty());
-    if !is_hook && mode.should_apply() {
+    if should_prepare_config_before_dispatch(&cli.cmd, mode) {
         let config_dir = cfg.parent().unwrap_or_else(|| std::path::Path::new("."));
         if let Err(e) = ferry::names::migrate_legacy(config_dir) {
             eprintln!("warning: {e:#}");
@@ -131,7 +138,11 @@ fn run() -> i32 {
         Cmd::Status => ferry::commands::status::run(&cfg, mode),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
-        Cmd::Sync { force } => ferry::commands::sync::run(&cfg, force, mode),
+        Cmd::Sync {
+            path,
+            select,
+            force,
+        } => ferry::commands::sync::run_cli(&cfg, path.as_deref(), select, force, mode),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
     };
@@ -160,6 +171,10 @@ fn path_entry_is_missing(path: &std::path::Path) -> bool {
         std::fs::symlink_metadata(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     )
+}
+
+fn should_prepare_config_before_dispatch(cmd: &Cmd, mode: ferry::commands::ExecutionMode) -> bool {
+    mode.should_apply() && !matches!(cmd, Cmd::Hook { .. } | Cmd::Sync { select: true, .. })
 }
 
 fn default_config_path(cmd: &Cmd) -> std::path::PathBuf {
@@ -207,6 +222,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sync_accepts_zero_or_one_path_or_select() {
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync"]).unwrap().cmd,
+            Cmd::Sync {
+                path: None,
+                select: false,
+                force: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "areas"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: Some(path),
+                select: false,
+                force: false
+            } if path == "areas"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "--select"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: None,
+                select: true,
+                force: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "areas", "--force"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: Some(path),
+                select: false,
+                force: true
+            } if path == "areas"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "sync", "--select", "--force"])
+                .unwrap()
+                .cmd,
+            Cmd::Sync {
+                path: None,
+                select: true,
+                force: true
+            }
+        ));
+    }
+
+    #[test]
+    fn sync_rejects_multiple_paths_and_path_plus_select() {
+        assert!(Cli::try_parse_from(["ferry", "sync", "one", "two"]).is_err());
+        assert!(Cli::try_parse_from(["ferry", "sync", "one", "--select"]).is_err());
+    }
+
+    #[test]
     fn init_default_config_stays_in_cwd() {
         let project = tempfile::tempdir().unwrap();
         let nested = project.path().join("nested");
@@ -218,5 +291,59 @@ mod tests {
             default_config_path_at(&init, &nested),
             std::path::PathBuf::from(ferry::names::CONFIG_FILE),
         );
+    }
+}
+
+#[cfg(test)]
+mod select_dispatch_tests {
+    use super::{Cmd, default_config_path_at, should_prepare_config_before_dispatch};
+    use ferry::commands::ExecutionMode;
+
+    #[test]
+    fn select_skips_preselection_migration_so_cancel_stays_read_only() {
+        let select = Cmd::Sync {
+            path: None,
+            select: true,
+            force: false,
+        };
+        let direct = Cmd::Sync {
+            path: Some("areas".into()),
+            select: false,
+            force: false,
+        };
+        let bare = Cmd::Sync {
+            path: None,
+            select: false,
+            force: false,
+        };
+
+        assert!(!should_prepare_config_before_dispatch(
+            &select,
+            ExecutionMode::Apply
+        ));
+        assert!(should_prepare_config_before_dispatch(
+            &direct,
+            ExecutionMode::Apply
+        ));
+        assert!(should_prepare_config_before_dispatch(
+            &bare,
+            ExecutionMode::Apply
+        ));
+    }
+
+    #[test]
+    fn select_discovers_the_nearest_config_from_the_task_cwd() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("one/two");
+        std::fs::create_dir_all(&nested).unwrap();
+        let config = project.path().join(ferry::names::CONFIG_FILE);
+        std::fs::write(&config, "config").unwrap();
+        let select = Cmd::Sync {
+            path: None,
+            select: true,
+            force: false,
+        };
+
+        assert_eq!(default_config_path_at(&select, &nested), config);
     }
 }
