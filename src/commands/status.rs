@@ -93,10 +93,21 @@ pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
         println!("{:>14}\t{}", format!("{:?}", st), rel);
     }
 
-    // In apply mode, persist the MDTM capability decision so subsequent runs
-    // can skip the probe. Dry-run keeps the cache update in memory only.
+    // In apply mode, persist ONLY the MDTM capability decision so subsequent
+    // runs can skip the probe. Dry-run keeps the cache update in memory only.
+    //
+    // Re-read from disk and carry over just that one field, rather than saving
+    // the snapshot this run started with. A full walk of a large tree takes
+    // tens of minutes, and writing `state` back wholesale silently REVERTS
+    // every per-file record a concurrent `ferry push` updated in the meantime.
+    // The next push then reports "conflict (BothChanged)" against its own
+    // earlier work, with no real divergence anywhere -- observed exactly that
+    // way against a live mudlib. status is a read-only query and has no
+    // business authoring file records.
     if mode.should_apply() {
-        state.save(&state_path)?;
+        let mut on_disk = StateFile::load_or_default(&state_path)?;
+        on_disk.server_supports_mdtm = state.server_supports_mdtm;
+        on_disk.save(&state_path)?;
     }
 
     Ok(())
