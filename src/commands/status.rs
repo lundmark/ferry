@@ -48,8 +48,19 @@ pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
             println!("{:>14}\t{}", "Stale", rel);
             continue;
         }
+        // Non-fatal for the same reason as the remote hash below: one file we
+        // cannot read must not end the run. walk_local() now filters out
+        // non-regular files, so this is defence in depth against anything that
+        // becomes unreadable between the walk and the hash.
         let local_hash = if on_local {
-            Some(hash_file(&local_root.join(rel))?)
+            match hash_file(&local_root.join(rel)) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("warning: cannot read local {rel}: {e:#}");
+                    println!("{:>14}\t{}", "Unreadable", rel);
+                    continue;
+                }
+            }
         } else {
             None
         };
