@@ -55,9 +55,25 @@ pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
         };
         // Use the MDTM/SIZE fast path where possible — status only needs
         // the hash for classification, never the bytes.
+        //
+        // A remote file we cannot read must NOT abort the run. Some servers
+        // list paths they then refuse to serve: the 3Scapes mud lists
+        // /all_explorer_rooms at its root, and any download of it answers
+        // "550 No such file or directory". With `?` here that single entry
+        // ended the whole command — status got through the root-level files
+        // and never reported on players/, secure/ or anything below them,
+        // which made it useless on that install. One unreadable path is a
+        // property of that path, not of the several thousand others.
         let remote_hash = if on_remote {
             let remote_path = remote_join(&cfg.paths.remote_root, rel);
-            Some(remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false)?.sha256)
+            match remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false) {
+                Ok(h) => Some(h.sha256),
+                Err(e) => {
+                    eprintln!("warning: cannot read remote {rel}: {e:#}");
+                    println!("{:>14}\t{}", "Unreadable", rel);
+                    continue;
+                }
+            }
         } else {
             None
         };

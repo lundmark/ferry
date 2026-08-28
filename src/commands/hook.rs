@@ -97,10 +97,26 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
         }
     }
 
-    // Fast single-file pull with force=true. The hook contract is "give me
-    // the current remote version"; users who don't want that shouldn't
-    // install the hook.
-    match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ true, mode) {
+    // Fast single-file pull. The hook contract is "give me the current remote
+    // version" -- but that stops short of discarding work the user has not
+    // pushed yet.
+    //
+    // This used to pass force=true, which made the pull overwrite un-pushed
+    // local edits with no warning and no way to get them back. It is a real
+    // data-loss path, not staleness: an agent that edits a file twice without
+    // pushing in between has its first edit silently reverted by the hook
+    // firing before the second, and the only sign is that the change is
+    // simply not there afterwards. Reproduced as:
+    //
+    //     echo MARKER >> NEWS                       # un-pushed local edit
+    //     echo '{...NEWS...}' | ferry hook -v       # "ferry hook: pulled NEWS"
+    //     grep -c MARKER NEWS                       # 0
+    //
+    // force=false makes pull_one apply the same BothChanged rule the `pull`
+    // subcommand already applies, so a diverged file is reported instead of
+    // clobbered. Recovering staleness costs an explicit `ferry pull`;
+    // recovering a clobbered edit may cost the edit.
+    match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ false, mode) {
         Ok(outcome) if outcome.status == TransferStatus::Transferred => {
             if mode.is_dry_run() {
                 eprintln!("ferry hook: would pull {}", outcome.path);
@@ -111,7 +127,13 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
         Ok(_) => {}
         Err(error) => {
             // Don't fail the hook — deny would surprise the user. Just log.
-            eprintln!("ferry hook: pull {rel} failed: {error:#}");
+            // The common case here is a conflict: local has edits that were
+            // never pushed, so the pull is refused and the local copy stands.
+            eprintln!(
+                "ferry hook: not pulling {rel} ({error:#}) -- \
+                 local copy kept; run 'ferry push {rel}' or an explicit \
+                 'ferry pull {rel}' to reconcile"
+            );
         }
     }
     Ok(())
