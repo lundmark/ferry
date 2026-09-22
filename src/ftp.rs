@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::io::Cursor;
 use suppaftp::FtpStream;
 
 pub struct Ftp {
     inner: FtpStream,
+    // Explicit pull arguments may ask about several files in one directory.
+    // A symlink check only needs the parent LIST, so retain the result for the
+    // lifetime of this command and avoid repeating the same network round-trip.
+    symlink_targets: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,7 +86,10 @@ impl Ftp {
         } else {
             suppaftp::Mode::Active
         });
-        Ok(Self { inner: s })
+        Ok(Self {
+            inner: s,
+            symlink_targets: HashMap::new(),
+        })
     }
 
     pub fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
@@ -99,6 +107,37 @@ impl Ftp {
             .map_err(|error| strict_list_transport_error(dir, error))?;
 
         parse_listing_strict(dir, &lines)
+    }
+
+    /// Resolve a symlink leaf from one parent LIST response. This is used only
+    /// by an explicit pull argument; normal walks and all write operations keep
+    /// refusing remote symlinks.
+    pub fn symlink_target(&mut self, path: &str) -> Result<Option<String>> {
+        let trimmed = path.trim_end_matches('/');
+        if let Some(target) = self.symlink_targets.get(trimmed) {
+            return Ok(target.clone());
+        }
+        let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("/", trimmed));
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let lines = self
+            .inner
+            .list(Some(parent))
+            .with_context(|| format!("ftp list {parent}"))?;
+        let target = lines.into_iter().find_map(|line| {
+            let file = match suppaftp::list::File::from_posix_line(&line) {
+                Ok(file) => file,
+                Err(_) => return None,
+            };
+            if file.name() == leaf && file.is_symlink() {
+                return file
+                    .symlink()
+                    .map(|target| target.to_string_lossy().into_owned());
+            }
+            None
+        });
+        self.symlink_targets
+            .insert(trimmed.to_string(), target.clone());
+        Ok(target)
     }
 
     /// Probe exactly one remote pathname through `NLST`. Unlike [`Self::list`]
