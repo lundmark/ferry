@@ -364,7 +364,13 @@ These are stable so you can branch on them from shell scripts or task runners.
 ```sh
 cargo test                  # unit + non-Docker integration tests
 cargo test -- --ignored     # Docker-gated FTP integration tests
+cargo build --bin ferry
+python3 tests/download_snapshot_regression.py --binary target/debug/ferry
 ```
+
+The Python regression exercises pull, project sync, and init against a local
+FTP peer, including edits during/after downloads, metadata request counts,
+conflicts, dry runs, and missing MDTM support. It needs only Python 3.
 
 The `--ignored` suite requires a working Docker daemon and pulls
 `delfer/alpine-ftp-server` to spin up a real FTP server per test.

@@ -20,7 +20,9 @@
 pub use self::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use self::scope::SyncScope;
 use crate::commands::file_transfer::{RemoteDestinationSnapshot, RemoteWrite};
-use crate::commands::pull::{ExpectedLocalDestination, download_one, download_one_guarded};
+use crate::commands::pull::{
+    ExpectedLocalDestination, download_one_guarded, download_snapshot_one,
+};
 use crate::commands::push::{
     ExpectedLocalSource, ExpectedRemoteDestination, upload_one, upload_one_guarded,
 };
@@ -1775,27 +1777,12 @@ fn run_legacy(config_path: &Path, force: bool, mode: ExecutionMode) -> Result<()
                 }
             }
             FileState::RemoteChanged | FileState::RemoteOnly => {
-                // We need real bytes to write locally. If the fast path
-                // fired (rh.bytes is None) we would normally have classified
-                // as InSync (since the cached hash matches state). Defensive
-                // fallback: fetch fresh if bytes are absent.
-                let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
-                let bytes_owned: Vec<u8> = match &rh_inner.bytes {
-                    Some(b) => b.clone(),
-                    None => ftp
-                        .download(&remote_path)
-                        .with_context(|| format!("downloading {remote_path}"))?,
-                };
-                download_one(
+                let snapshot = remote_hash::complete_for_install(
                     &mut ftp,
-                    &mut state,
-                    &local_root.join(rel),
-                    rel,
                     &remote_path,
-                    &bytes_owned,
-                    &rh_inner.sha256,
-                    mode,
+                    rh.expect("rh set when on_remote is true"),
                 )?;
+                download_snapshot_one(&mut state, &local_root.join(rel), rel, &snapshot, mode)?;
                 if mode.is_dry_run() {
                     println!("would download {rel}");
                 } else {
