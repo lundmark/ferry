@@ -164,31 +164,14 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                 // remote is missing them. Skip.
             }
             FileState::RemoteOnly | FileState::RemoteChanged => {
-                // We need the actual remote bytes to write locally. If the
-                // fast path fired (from_cache=true), we got here with the
-                // hash but no bytes — which can only happen if state has a
-                // record AND it matches AND yet classify said the remote
-                // changed. That implies the local file diverged from `known`
-                // while remote matches `known` (LocalChanged) — not this
-                // branch. So in practice rh.bytes is Some here. Defensive
-                // fallback: if bytes are missing, fetch them now.
-                let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
-                let bytes_owned: Vec<u8> = match &rh_inner.bytes {
-                    Some(b) => b.clone(),
-                    None => ftp
-                        .download(&remote_path)
-                        .with_context(|| format!("downloading {remote_path}"))?,
-                };
-                download_one(
+                // Reuse the validated payload and metadata together. A cache-only
+                // result must complete its original observation before install.
+                let snapshot = remote_hash::complete_for_install(
                     &mut ftp,
-                    &mut state,
-                    &local_root.join(rel),
-                    rel,
                     &remote_path,
-                    &bytes_owned,
-                    &rh_inner.sha256,
-                    mode,
+                    rh.expect("rh set when on_remote is true"),
                 )?;
+                download_snapshot_one(&mut state, &local_root.join(rel), rel, &snapshot, mode)?;
                 println!(
                     "{} {rel}",
                     if mode.is_dry_run() {
@@ -203,28 +186,17 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                 // Design action matrix treats this as "as if both-changed": refuse
                 // without --force so the user makes an explicit choice.
                 if force {
-                    let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
-                    let bytes_owned: Vec<u8> = match &rh_inner.bytes {
-                        Some(b) => b.clone(),
-                        None => ftp
-                            .download(&remote_path)
-                            .with_context(|| format!("downloading {remote_path}"))?,
-                    };
+                    let snapshot = remote_hash::complete_for_install(
+                        &mut ftp,
+                        &remote_path,
+                        rh.expect("rh set when on_remote is true"),
+                    )?;
                     if mode.is_dry_run() {
                         eprintln!("would overwrite local with remote (--force): {rel}");
                     } else {
                         eprintln!("overwriting local with remote (--force): {rel}");
                     }
-                    download_one(
-                        &mut ftp,
-                        &mut state,
-                        &local_root.join(rel),
-                        rel,
-                        &remote_path,
-                        &bytes_owned,
-                        &rh_inner.sha256,
-                        mode,
-                    )?;
+                    download_snapshot_one(&mut state, &local_root.join(rel), rel, &snapshot, mode)?;
                 } else {
                     eprintln!(
                         "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
@@ -287,6 +259,39 @@ pub fn download_one(
             .ok_or_else(|| anyhow::anyhow!("download commit mutation invoked more than once"))?
             .commit()?;
         record_download(state, rel, new_hash, bytes.len() as u64, remote_mtime);
+        Ok(())
+    };
+    UnconditionalCommitGate.commit(&mut mutation)?;
+    Ok(())
+}
+
+/// Install a retrieved snapshot without re-querying MDTM. A later timestamp
+/// could make the older downloaded bytes look current on the next cache probe.
+/// The before/after metadata checks remain in remote_hash retrieval.
+pub fn download_snapshot_one(
+    state: &mut StateFile,
+    local_path: &Path,
+    rel: &str,
+    remote: &RemoteHash,
+    mode: ExecutionMode,
+) -> Result<()> {
+    if mode.is_dry_run() {
+        return Ok(());
+    }
+    let bytes = remote
+        .bytes
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("remote payload missing for download {rel}"))?;
+    if bytes.len() as u64 != remote.size || hash_bytes(bytes) != remote.sha256 {
+        anyhow::bail!("remote payload changed before download {rel}");
+    }
+    let mut staged = Some(stage_local_write(local_path, bytes)?);
+    let mut mutation = || {
+        staged
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("download commit mutation invoked more than once"))?
+            .commit()?;
+        record_download(state, rel, &remote.sha256, remote.size, remote.mtime);
         Ok(())
     };
     UnconditionalCommitGate.commit(&mut mutation)?;
@@ -1250,5 +1255,78 @@ mod staging_tests {
         );
         assert_eq!(std::fs::read(&symlink_target).unwrap(), original);
         assert!(!target.exists());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_install_tests {
+    use super::*;
+
+    fn snapshot(bytes: &[u8]) -> RemoteHash {
+        RemoteHash {
+            sha256: hash_bytes(bytes),
+            size: bytes.len() as u64,
+            mtime: DateTime::parse_from_rfc3339("2026-10-05T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            from_cache: false,
+            metadata_stable: true,
+            bytes: Some(bytes.to_vec()),
+            pre_download: None,
+        }
+    }
+
+    #[test]
+    fn install_records_the_validated_snapshot_timestamp_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.c");
+        let remote = snapshot(b"downloaded bytes");
+        let mut state = StateFile::default();
+        download_snapshot_one(&mut state, &path, "file.c", &remote, ExecutionMode::Apply).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"downloaded bytes");
+        let record = &state.files["file.c"];
+        assert_eq!(record.remote_mtime, remote.mtime);
+        assert_eq!(record.sha256, remote.sha256);
+        assert_eq!(record.size, remote.size);
+    }
+
+    #[test]
+    fn invalid_snapshot_cannot_replace_local_bytes_or_update_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.c");
+        std::fs::write(&path, b"local edits").unwrap();
+        for defect in 0..3 {
+            let mut remote = snapshot(b"remote bytes");
+            match defect {
+                0 => remote.bytes = None,
+                1 => remote.size += 1,
+                _ => remote.sha256 = hash_bytes(b"foreign bytes"),
+            }
+            let mut state = StateFile::default();
+            assert!(
+                download_snapshot_one(&mut state, &path, "file.c", &remote, ExecutionMode::Apply)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"local edits");
+            assert!(state.files.is_empty());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dry_run_neither_creates_parent_directories_nor_updates_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing/file.c");
+        let mut state = StateFile::default();
+        download_snapshot_one(
+            &mut state,
+            &path,
+            "missing/file.c",
+            &snapshot(b"remote"),
+            ExecutionMode::DryRun,
+        )
+        .unwrap();
+        assert!(!path.parent().unwrap().exists());
+        assert!(state.files.is_empty());
     }
 }

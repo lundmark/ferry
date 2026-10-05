@@ -14,7 +14,7 @@ use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCom
 use crate::commands::transfer_temp::fresh_remote_candidate;
 use crate::commands::walk::{
     collect_remote_arg_with_symlinks, leaf_is_symlink, remote_join, safe_arg, safe_rel, walk_local,
-    walk_remote_with_symlinks,
+    walk_remote_for_push,
 };
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
@@ -59,10 +59,11 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     let mut remote_symlinks: BTreeSet<String> = BTreeSet::new();
     if paths.is_empty() {
         walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
-        walk_remote_with_symlinks(
+        walk_remote_for_push(
             &mut ftp,
             &cfg.paths.remote_root,
-            "",
+            &local_root,
+            &matcher,
             &mut remote_paths,
             &mut remote_symlinks,
         )?;

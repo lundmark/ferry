@@ -147,7 +147,30 @@ pub fn walk_remote_with_symlinks<R: Remote + ?Sized>(
         return Ok(());
     }
     walk_remote_inner(
-        ftp, root, sub, &dir, out, symlinks, /* top_level = */ true,
+        ftp, root, sub, &dir, out, symlinks, /* top_level = */ true, None,
+    )
+}
+
+/// Bare push already filters ignored paths before classifying or transferring.
+/// Avoid listing ignored subtrees only when no whitelist could rescue a child.
+/// Other commands keep their existing enumeration semantics.
+pub(crate) fn walk_remote_for_push<R: Remote + ?Sized>(
+    ftp: &mut R,
+    root: &str,
+    local_root: &Path,
+    matcher: &Matcher,
+    out: &mut BTreeSet<String>,
+    symlinks: &mut BTreeSet<String>,
+) -> Result<()> {
+    walk_remote_inner(
+        ftp,
+        root,
+        "",
+        &listable_remote_root(root),
+        out,
+        symlinks,
+        true,
+        Some((local_root, matcher)),
     )
 }
 
@@ -296,6 +319,7 @@ fn walk_remote_inner<R: Remote + ?Sized>(
     out: &mut BTreeSet<String>,
     symlinks: &mut BTreeSet<String>,
     top_level: bool,
+    pruning: Option<(&Path, &Matcher)>,
 ) -> Result<()> {
     let entries = match ftp.list_dir(dir) {
         Ok(e) => e,
@@ -358,8 +382,15 @@ fn walk_remote_inner<R: Remote + ?Sized>(
             format!("{}/{}", sub, name)
         };
         if entry.is_dir {
+            if pruning.is_some_and(|(local_root, matcher)| {
+                matcher.can_prune_directory(&local_root.join(&child_sub))
+            }) {
+                continue;
+            }
             let child_dir = format!("{}/{}", dir.trim_end_matches('/'), name);
-            let _ = walk_remote_inner(ftp, root, &child_sub, &child_dir, out, symlinks, false);
+            let _ = walk_remote_inner(
+                ftp, root, &child_sub, &child_dir, out, symlinks, false, pruning,
+            );
         } else {
             out.insert(child_sub);
         }
@@ -418,6 +449,94 @@ mod walk_remote_tests {
             size: 1,
             modified: Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap(),
         }
+    }
+
+    #[test]
+    fn push_pruning_preserves_filtered_targets_and_visible_symlinks() {
+        fn server() -> Fake {
+            let mut ftp = Fake::new(Echo::Error);
+            ftp.dirs
+                .get_mut("/root/sub")
+                .unwrap()
+                .extend([("deep".into(), true), ("keep.log".into(), false)]);
+            ftp.dirs
+                .insert("/root/sub/deep".into(), vec![("keep.txt".into(), false)]);
+            ftp.symlinks
+                .insert("/root".into(), vec!["outside-link".into()]);
+            ftp.symlinks
+                .insert("/root/sub".into(), vec!["nested-link".into()]);
+            ftp
+        }
+        let local_root = Path::new("/mirror");
+        for patterns in [
+            vec![],
+            vec!["sub/"],
+            vec!["sub"],
+            vec!["sub/*"],
+            vec!["*.txt"],
+            vec!["**/deep/"],
+            vec!["/sub/"],
+            vec!["s*/"],
+            vec!["sub/deep/"],
+            vec!["*.log"],
+            vec!["sub/", "!sub/deep/keep.txt"],
+            vec!["sub/*", "!sub/deep", "!sub/deep/keep.txt"],
+            vec!["*.txt", "!a.txt"],
+            vec!["!unrelated.c", "sub/"],
+        ] {
+            let patterns: Vec<String> = patterns.into_iter().map(str::to_owned).collect();
+            let matcher = Matcher::new(&patterns, local_root).unwrap();
+            let mut old = server();
+            let mut new = server();
+            let mut old_paths = BTreeSet::new();
+            let mut new_paths = BTreeSet::new();
+            let mut old_links = BTreeSet::new();
+            let mut new_links = BTreeSet::new();
+            walk_remote_with_symlinks(&mut old, "/root", "", &mut old_paths, &mut old_links)
+                .unwrap();
+            walk_remote_for_push(
+                &mut new,
+                "/root",
+                local_root,
+                &matcher,
+                &mut new_paths,
+                &mut new_links,
+            )
+            .unwrap();
+            let visible = |set: BTreeSet<String>| -> BTreeSet<String> {
+                set.into_iter()
+                    .filter(|p| !matcher.is_ignored(&local_root.join(p), false))
+                    .collect()
+            };
+            assert_eq!(visible(old_paths), visible(new_paths), "{patterns:?}");
+            assert_eq!(visible(old_links), visible(new_links), "{patterns:?}");
+            if patterns.iter().any(|p| p.starts_with('!')) {
+                assert_eq!(
+                    old.listed, new.listed,
+                    "whitelists require full enumeration"
+                );
+            } else if patterns == ["sub/"] {
+                assert_eq!(old.listed.len(), 3);
+                assert_eq!(new.listed, ["/root"]);
+            }
+        }
+    }
+
+    #[test]
+    fn push_pruning_still_reports_a_root_listing_failure() {
+        let mut ftp = Fake::new(Echo::Error);
+        let matcher = Matcher::new(&["*".into()], Path::new("/mirror")).unwrap();
+        assert!(
+            walk_remote_for_push(
+                &mut ftp,
+                "/missing",
+                Path::new("/mirror"),
+                &matcher,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
     }
 
     impl Fake {

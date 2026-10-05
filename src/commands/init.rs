@@ -15,8 +15,9 @@
 //! it isn't (so integration tests can pipe answers in via `Stdio::piped()`).
 
 use crate::commands::ExecutionMode;
-use crate::commands::pull::download_one;
+use crate::commands::pull::download_snapshot_one;
 use crate::commands::push::upload_one;
+use crate::commands::remote_hash;
 use crate::commands::walk::{remote_join, walk_local, walk_remote};
 use crate::ftp::Ftp;
 use crate::hash::{hash_bytes, hash_file};
@@ -288,21 +289,9 @@ fn validate_and_resolve<R: BufRead, W: Write>(
             }
             'P' => {
                 let remote_path = remote_join(remote_root, rel);
-                let bytes = ftp
-                    .download(&remote_path)
-                    .with_context(|| format!("downloading {remote_path}"))?;
-                let new_hash = hash_bytes(&bytes);
+                let snapshot = remote_hash::retrieve_fresh(&mut ftp, &remote_path)?;
                 let local_path = local_root.join(rel);
-                download_one(
-                    &mut ftp,
-                    &mut state,
-                    &local_path,
-                    rel,
-                    &remote_path,
-                    &bytes,
-                    &new_hash,
-                    mode,
-                )?;
+                download_snapshot_one(&mut state, &local_path, rel, &snapshot, mode)?;
                 would_seed_state = true;
                 let verb = if mode.is_dry_run() {
                     "would pull"
