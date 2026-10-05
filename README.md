@@ -359,6 +359,11 @@ These are stable so you can branch on them from shell scripts or task runners.
   requested name is missing) cannot safely prove absence. Ferry therefore
   refuses to create a new remote or local counterpart instead of guessing.
 
+Bare `ferry push` avoids descending into ignored remote directories when the
+ignore rules contain no `!` exceptions. With any exception rule present it keeps
+the complete walk, preserving descendant exceptions. Explicit file/folder
+commands retain their existing traversal and symlink checks.
+
 ## Development
 
 ```sh
@@ -368,9 +373,10 @@ cargo build --bin ferry
 python3 tests/download_snapshot_regression.py --binary target/debug/ferry
 ```
 
-The Python regression exercises pull, project sync, and init against a local
-FTP peer, including edits during/after downloads, metadata request counts,
-conflicts, dry runs, and missing MDTM support. It needs only Python 3.
+The Python regression exercises pull, push, project sync, and init against a
+local FTP peer, including edits during/after downloads, metadata request counts,
+conflicts, forced uploads, dry runs, missing MDTM support, ignored-directory
+pruning with exception rules, and batched pulls. It needs only Python 3.
 
 The `--ignored` suite requires a working Docker daemon and pulls
 `delfer/alpine-ftp-server` to spin up a real FTP server per test.

@@ -14,6 +14,13 @@ impl Matcher {
         Ok(Self { gi: b.build()? })
     }
 
+    /// With no whitelist rules, an ignored parent excludes every descendant.
+    /// Whitelists can match descendants directly, so retain the complete walk
+    /// whenever any are present instead of guessing which subtree is safe.
+    pub(crate) fn can_prune_directory(&self, path: &Path) -> bool {
+        self.gi.num_whitelists() == 0 && self.is_ignored(path, true)
+    }
+
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         self.gi
             .matched_path_or_any_parents(path, is_dir)

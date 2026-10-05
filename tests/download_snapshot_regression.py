@@ -23,6 +23,7 @@ class Peer:
         self.mode, self.metadata = mode, metadata
         self.body, self.mtime = b"old!", OLD_TIME
         self.events, self.failure = [], None
+        self.listed = []
         self.root = None
         self.changed = False
         self.listener = socket.socket()
@@ -50,6 +51,7 @@ class Peer:
 
     def session(self, conn):
         passive = None
+        rename_from = None
         def reply(text):
             conn.sendall((text + "\r\n").encode())
         reply("220 deterministic test FTP")
@@ -68,7 +70,8 @@ class Peer:
                     elif cmd == "PWD":
                         reply('257 "/"')
                     elif cmd == "SIZE":
-                        reply(f"213 {len(self.body)}" if path == "/file.c" else "550 not a file")
+                        payload = self.file(path)
+                        reply(f"213 {len(payload)}" if payload is not None else "550 not a file")
                     elif cmd == "MDTM":
                         if not self.metadata:
                             reply("502 MDTM unsupported")
@@ -88,24 +91,38 @@ class Peer:
                         passive.settimeout(5)
                         port = passive.getsockname()[1]
                         reply(f"227 Entering Passive Mode (127,0,0,1,{port // 256},{port % 256})")
-                    elif cmd in ("LIST", "RETR"):
-                        if cmd == "RETR" and path != "/file.c":
+                    elif cmd in ("LIST", "RETR", "STOR"):
+                        if cmd == "RETR" and self.file(path) is None:
                             reply("550 missing")
                             continue
                         reply("150 opening data connection")
                         data, _ = passive.accept()
                         with data:
-                            if cmd == "LIST":
-                                payload = f"-rw-r--r-- 1 test test {len(self.body)} Oct 05 10:00 file.c\r\n".encode()
+                            if cmd == "STOR":
+                                chunks = []
+                                while chunk := data.recv(65536):
+                                    chunks.append(chunk)
+                                self.store(path, b"".join(chunks))
+                                payload = None
+                            elif cmd == "LIST":
+                                self.listed.append(path)
+                                payload = self.listing(path)
                             else:
-                                payload = self.body
-                            data.sendall(payload)
+                                payload = self.file(path)
+                            if payload is not None:
+                                data.sendall(payload)
                         passive.close()
                         passive = None
                         if cmd == "RETR" and (self.mode == "during_transfer" or
                                               self.mode == "during_init_transfer" and self.events.count("RETR") == 2):
                             self.body, self.mtime = b"new!", NEW_TIME
                         reply("226 transfer complete")
+                    elif cmd == "RNFR":
+                        rename_from = path
+                        reply("350 ready for destination")
+                    elif cmd == "RNTO":
+                        self.rename(rename_from, path)
+                        reply("250 renamed")
                     elif cmd == "QUIT":
                         reply("221 bye")
                         break
@@ -115,6 +132,18 @@ class Peer:
             if passive:
                 passive.close()
 
+    def store(self, path, payload):
+        raise AssertionError("Unexpected upload")
+
+    def rename(self, source, target):
+        raise AssertionError("Unexpected rename")
+
+    def file(self, path):
+        return self.body if path == "/file.c" else None
+
+    def listing(self, path):
+        return f"-rw-r--r-- 1 test test {len(self.body)} Oct 05 10:00 file.c\r\n".encode()
+
     def close(self):
         self.stop.set()
         self.thread.join(timeout=6)
@@ -123,6 +152,37 @@ class Peer:
         assert self.failure is None, self.failure
         if self.root is not None:
             shutil.rmtree(self.root)
+
+
+class TreePeer(Peer):
+    def __init__(self, tree):
+        self.tree = tree
+        self.overrides, self.uploads = {}, []
+        super().__init__()
+
+    def store(self, path, payload):
+        assert path.startswith("/ferry-tmp."), path
+        self.overrides[path] = payload
+        self.uploads.append(path)
+        self.mtime = NEW_TIME
+
+    def rename(self, source, target):
+        self.overrides[target] = self.overrides.pop(source)
+        parent, _, leaf = target.rpartition("/")
+        self.tree[parent or "/"][leaf] = False
+
+    def file(self, path):
+        if path in self.overrides:
+            return self.overrides[path]
+        parent, _, leaf = path.rpartition("/")
+        children = self.tree.get(parent or "/", {})
+        return self.body if leaf in children and not children[leaf] else None
+
+    def listing(self, path):
+        return "".join(
+            f"{'drwxr-xr-x' if is_dir else '-rw-r--r--'} 1 test test {len(self.body)} Oct 05 10:00 {name}\r\n"
+            for name, is_dir in self.tree[path].items()
+        ).encode()
 
 
 def config(root, peer):
@@ -254,6 +314,61 @@ def run(binary):
                 assert (root / "file.c").read_bytes() == b"local edits"
                 assert not (root / ".ferry/state.json").exists()
             print("PASS: init pull / " + mode)
+        finally:
+            peer.close()
+
+    for ignores, expected_lists in ((["ignored/"], ["/"]),
+                                   (["ignored/", "!ignored/deep/keep.c"], ["/", "/ignored", "/ignored/deep"])):
+        peer = TreePeer({"/": {"file.c": False, "ignored": True},
+                         "/ignored": {"deep": True, "skip.c": False},
+                         "/ignored/deep": {"keep.c": False, "skip.c": False}})
+        root = Path(tempfile.mkdtemp(prefix="ferry-push-pruning-test-"))
+        peer.root = root
+        try:
+            config(root, peer)
+            cfg = root / ".ferry.toml"
+            cfg.write_text(cfg.read_text().replace('ignore=[".ferry/", ".ferry.toml"]',
+                                                   'ignore=' + json.dumps([".ferry/", ".ferry.toml", *ignores])))
+            (root / "file.c").write_bytes(b"old!")
+            result = invoke(binary, root, "--dry-run", "push", success=False)
+            assert "conflict (Untracked" in result.stderr, result.stderr
+            assert peer.listed == expected_lists, peer.listed
+            peer.listed.clear()
+            invoke(binary, root, "--dry-run", "push", "--force")
+            assert peer.listed == expected_lists, peer.listed
+            assert not (root / ".ferry/state.json").exists()
+            assert (root / "file.c").read_bytes() == b"old!"
+            (root / "file.c").write_bytes(b"new local contents")
+            invoke(binary, root, "push", success=False)
+            assert not peer.uploads, "conflict must never upload"
+            assert not state(root)["files"]
+            invoke(binary, root, "push", "--force")
+            assert len(peer.uploads) == 1
+            assert peer.file("/file.c") == b"new local contents"
+            assert peer.file("/ignored/deep/keep.c") == b"old!"
+            assert peer.file("/ignored/skip.c") == b"old!"
+            assert set(state(root)["files"]) == {"file.c"}
+            print("PASS: push pruning, conflict, dry-run, forced upload / " + repr(ignores))
+        finally:
+            peer.close()
+
+    for batched, expected_connections in ((False, 2), (True, 1)):
+        peer = TreePeer({"/": {"file.c": False, "second.c": False}})
+        root = Path(tempfile.mkdtemp(prefix="ferry-batch-test-"))
+        peer.root = root
+        try:
+            config(root, peer)
+            if batched:
+                invoke(binary, root, "pull", "file.c", "second.c")
+            else:
+                invoke(binary, root, "pull", "file.c")
+                invoke(binary, root, "pull", "second.c")
+            assert peer.events.count("USER") == expected_connections
+            assert peer.events.count("RETR") == 2
+            for name in ("file.c", "second.c"):
+                assert (root / name).read_bytes() == b"old!"
+            assert set(state(root)["files"]) == {"file.c", "second.c"}
+            print(f"PASS: {'batched' if batched else 'separate'} pulls / {expected_connections} connections")
         finally:
             peer.close()
 
