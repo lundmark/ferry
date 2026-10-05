@@ -36,8 +36,8 @@ enum Cmd {
         #[arg(long, default_value_t = 3600)]
         cooldown: i64,
     },
-    /// Show per-file sync state vs remote.
-    Status,
+    /// Show per-file sync state, optionally limited to one file or directory.
+    Status { path: Option<String> },
     /// Download remote -> local.
     Pull {
         paths: Vec<String>,
@@ -135,7 +135,7 @@ fn run() -> i32 {
         Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate, mode),
         Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
         Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
-        Cmd::Status => ferry::commands::status::run(&cfg, mode),
+        Cmd::Status { path } => ferry::commands::status::run_with_path(&cfg, path.as_deref(), mode),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
         Cmd::Sync {
@@ -220,6 +220,20 @@ fn code_for(exit: &ferry::Exit) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_accepts_one_optional_scope() {
+        assert!(matches!(
+            Cli::try_parse_from(["ferry", "status"]).unwrap().cmd,
+            Cmd::Status { path: None }
+        ));
+        assert!(
+            matches!(Cli::try_parse_from(["ferry", "status", "players/viking"]).unwrap().cmd,
+                         Cmd::Status { path: Some(path) } if path == "players/viking")
+        );
+        assert!(Cli::try_parse_from(["ferry", "status", "one", "two"]).is_err());
+        assert!(Cli::try_parse_from(["ferry", "status", "one", "--force"]).is_err());
+    }
 
     #[test]
     fn sync_accepts_zero_or_one_path_or_select() {

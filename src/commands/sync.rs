@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 // The scoped sync engine wires this collector in Task 5.
 pub(crate) mod commit;
-mod inventory;
+pub(crate) mod inventory;
 mod picker;
 #[cfg(test)]
 mod production_tests;
