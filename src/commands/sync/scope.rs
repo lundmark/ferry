@@ -10,11 +10,19 @@ pub enum SyncScope {
 }
 
 pub fn from_cli_path(local_root: &Path, input: Option<&str>) -> Result<SyncScope> {
+    from_cli_path_for_command(local_root, input, "sync")
+}
+
+pub(crate) fn from_cli_path_for_command(
+    local_root: &Path,
+    input: Option<&str>,
+    command: &str,
+) -> Result<SyncScope> {
     let Some(input) = input else {
         return Ok(SyncScope::LegacyProject);
     };
     if input.is_empty() {
-        bail!("sync path must not be empty");
+        bail!("{command} path must not be empty");
     }
 
     let input_path = Path::new(input);
@@ -22,7 +30,7 @@ pub fn from_cli_path(local_root: &Path, input: Option<&str>) -> Result<SyncScope
         .components()
         .any(|component| component == Component::ParentDir)
     {
-        bail!("refusing sync path {input:?}: parent traversal is not allowed");
+        bail!("refusing {command} path {input:?}: parent traversal is not allowed");
     }
 
     let path = if input_path.is_absolute() {

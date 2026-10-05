@@ -74,3 +74,73 @@ pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
 
     Ok(())
 }
+
+/// An optional scope leaves the established bare-status behavior untouched.
+pub fn run_with_path(config_path: &Path, path: Option<&str>, mode: ExecutionMode) -> Result<()> {
+    use crate::commands::sync::inventory::{EntryKind, collect_for_status};
+    use crate::commands::sync::scope::{SyncScope, from_cli_path_for_command};
+
+    let Some(path) = path else {
+        return run(config_path, mode);
+    };
+    let cfg = Config::load(config_path)?;
+    let scope = from_cli_path_for_command(&cfg.paths.local_root, Some(path), "status")?;
+    // Explicit dot/root requests are exactly the established whole-tree status.
+    if scope == SyncScope::RootDirectory {
+        return run(config_path, mode);
+    }
+    let local_root = &cfg.paths.local_root;
+    let state_path = state_path_for(local_root, mode);
+    let mut state = StateFile::load_or_default(&state_path)?;
+    let matcher = Matcher::new(&cfg.sync.ignore, local_root)?;
+    let mut ftp = Ftp::connect(
+        &cfg.connection.host,
+        cfg.connection.port,
+        &cfg.connection.user,
+        &cfg.connection.password,
+        cfg.connection.passive,
+    )?;
+    let inventory = collect_for_status(
+        &mut ftp,
+        local_root,
+        &cfg.paths.remote_root,
+        &matcher,
+        &state,
+        scope,
+    )?;
+    for (rel, entry) in inventory.entries {
+        if matches!(
+            (entry.local, entry.remote),
+            (Some(EntryKind::File), Some(EntryKind::Directory))
+                | (Some(EntryKind::Directory), Some(EntryKind::File))
+        ) {
+            println!("{:>14}\t{}", "TypeConflict", rel);
+            continue;
+        }
+        if entry.local == Some(EntryKind::Directory) || entry.remote == Some(EntryKind::Directory) {
+            continue;
+        }
+        if entry.local.is_none() && entry.remote.is_none() {
+            println!("{:>14}\t{}", "Stale", rel);
+            continue;
+        }
+        let local_hash = if entry.local == Some(EntryKind::File) {
+            Some(hash_file(&local_root.join(&rel))?)
+        } else {
+            None
+        };
+        let remote_hash = if entry.remote == Some(EntryKind::File) {
+            let remote_path = remote_join(&cfg.paths.remote_root, &rel);
+            Some(remote_hash::compute(&mut ftp, &mut state, &rel, &remote_path, false)?.sha256)
+        } else {
+            None
+        };
+        let known = state.files.get(&rel).map(|record| record.sha256.as_str());
+        let result = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
+        println!("{:>14}\t{}", format!("{:?}", result), rel);
+    }
+    if mode.should_apply() {
+        state.save(&state_path)?;
+    }
+    Ok(())
+}

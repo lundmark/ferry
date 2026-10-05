@@ -24,6 +24,8 @@ enum HostileHashOperation {
 #[derive(Clone)]
 enum FakeFtpScenario {
     Missing,
+    StatusTree(Arc<Mutex<Vec<(String, String)>>>),
+    StatusDeniedDirectory,
     DirectoryPrefix,
     TypeConflict,
     TypeConflictWithClean(Vec<u8>, Vec<u8>),
@@ -40,6 +42,16 @@ enum FakeFtpScenario {
 impl FakeFtpScenario {
     fn listing(&self, path: &str) -> String {
         match (self, path) {
+            (Self::StatusDeniedDirectory, "/remote") =>
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 selected\r\n".into(),
+            (Self::StatusTree(_), "/remote") =>
+                "drwxr-xr-x 1 owner group 0 Aug 10 12:00 selected\r\ndrwxr-xr-x 1 owner group 0 Aug 10 12:00 selected-other\r\ndrwxr-xr-x 1 owner group 0 Aug 10 12:00 unrelated\r\n".into(),
+            (Self::StatusTree(_), "/remote/selected") =>
+                "-rw-r--r-- 1 owner group 6 Aug 10 12:00 a.c\r\ndrwxr-xr-x 1 owner group 0 Aug 10 12:00 nested\r\n-rw-r--r-- 1 owner group 6 Aug 10 12:00 skip.c\r\n".into(),
+            (Self::StatusTree(_), "/remote/selected/nested") =>
+                "-rw-r--r-- 1 owner group 6 Aug 10 12:00 b.c\r\n".into(),
+            (Self::StatusTree(_), "/remote/selected-other" | "/remote/unrelated") =>
+                "-rw-r--r-- 1 owner group 6 Aug 10 12:00 outside.c\r\n".into(),
             (Self::Missing, "/remote") => String::new(),
             (Self::DirectoryPrefix, "/remote") => {
                 "drwxr-xr-x 1 owner group 0 Aug 10 12:00 area\r\n".into()
@@ -96,6 +108,14 @@ impl FakeFtpScenario {
 
     fn file(&self, path: &str) -> Option<&[u8]> {
         match (self, path) {
+            (
+                Self::StatusTree(_),
+                "/remote/selected/a.c"
+                | "/remote/selected/skip.c"
+                | "/remote/selected/nested/b.c"
+                | "/remote/selected-other/outside.c"
+                | "/remote/unrelated/outside.c",
+            ) => Some(b"remote"),
             (Self::FileConflict(bytes), "/remote/conflict.c") => Some(bytes),
             (Self::TwoFiles(first, _), "/remote/a.c") => Some(first),
             (Self::TwoFiles(_, second), "/remote/b.c") => Some(second),
@@ -145,6 +165,12 @@ impl FakeFtpServer {
                     .next()
                     .unwrap_or_default()
                     .to_ascii_uppercase();
+                if let FakeFtpScenario::StatusTree(events) = &scenario {
+                    if !matches!(verb.as_str(), "USER" | "PASS") {
+                        let path = command.split_once(' ').map(|(_, path)| path).unwrap_or("");
+                        events.lock().unwrap().push((verb.clone(), path.into()));
+                    }
+                }
                 match verb.as_str() {
                     "USER" => write_control(&mut control, "331 Password required"),
                     "PASS" => write_control(&mut control, "230 Logged in"),
@@ -178,6 +204,13 @@ impl FakeFtpServer {
                             .split_once(' ')
                             .map(|(_, path)| path)
                             .unwrap_or("/remote");
+                        if matches!(scenario, FakeFtpScenario::StatusDeniedDirectory)
+                            && path == "/remote/selected"
+                        {
+                            drop(data_listener.take());
+                            write_control(&mut control, "550 Permission denied");
+                            continue;
+                        }
                         transfer_data(
                             &mut control,
                             data_listener.take().expect("LIST after passive command"),
@@ -1516,4 +1549,351 @@ remote_root = "/remote"
     );
     assert!(!project.path().join(ferry::names::CONFIG_FILE).exists());
     assert!(!project.path().join(ferry::names::STATE_DIR).exists());
+}
+
+fn cached_status_record() -> ferry::state::FileRecord {
+    let time = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    ferry::state::FileRecord {
+        sha256: ferry::hash::hash_bytes(b"old"),
+        size: 3,
+        remote_mtime: time,
+        last_synced: time,
+    }
+}
+
+fn status_rows(output: &std::process::Output) -> Vec<String> {
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|s| s.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn scoped_status_file_reads_only_its_ancestors_and_payload() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let server = FakeFtpServer::spawn(FakeFtpScenario::StatusTree(events.clone()));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    std::fs::create_dir(project.path().join("selected")).unwrap();
+    let target = project.path().join("selected/a.c");
+    std::fs::write(&target, b"local").unwrap();
+    let output = bin()
+        .args(["status", "selected/a.c", "--dry-run", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert_eq!(status_rows(&output), ["Untracked\tselected/a.c"]);
+    let events = events.lock().unwrap();
+    let listed: Vec<&str> = events
+        .iter()
+        .filter(|(verb, _)| verb == "LIST")
+        .map(|(_, path)| path.as_str())
+        .collect();
+    assert_eq!(listed, ["/remote", "/remote/selected"]);
+    let retrieved: Vec<&str> = events
+        .iter()
+        .filter(|(verb, _)| verb == "RETR")
+        .map(|(_, path)| path.as_str())
+        .collect();
+    assert_eq!(retrieved, ["/remote/selected/a.c"]);
+    assert_eq!(std::fs::read(target).unwrap(), b"local");
+    assert!(!scoped_state_path(project.path()).exists());
+}
+
+#[test]
+fn scoped_status_folder_preserves_ignore_rules_state_and_unrelated_paths() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let server = FakeFtpServer::spawn(FakeFtpScenario::StatusTree(events.clone()));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let contents = std::fs::read_to_string(&config).unwrap().replace(
+        "ignore = [\".ferry.toml\"]",
+        "ignore = [\".ferry.toml\", \"selected/skip.c\"]",
+    );
+    std::fs::write(&config, &contents).unwrap();
+    std::fs::create_dir(project.path().join("selected")).unwrap();
+    for (name, bytes) in [
+        ("a.c", "local"),
+        ("local.c", "local only"),
+        ("skip.c", "ignored local"),
+    ] {
+        std::fs::write(project.path().join("selected").join(name), bytes).unwrap();
+    }
+    let mut state = ferry::state::StateFile::default();
+    for name in [
+        "selected/a.c",
+        "selected/gone.c",
+        "selected-other/stale.c",
+        "unrelated/stale.c",
+    ] {
+        state.files.insert(name.into(), cached_status_record());
+    }
+    let before = write_compact_scoped_state(project.path(), &state);
+    let output = bin()
+        .args(["status", "selected/", "--dry-run", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(
+        status_rows(&output),
+        [
+            "BothChanged\tselected/a.c",
+            "Stale\tselected/gone.c",
+            "LocalOnly\tselected/local.c",
+            "RemoteOnly\tselected/nested/b.c"
+        ]
+    );
+    assert_eq!(
+        std::fs::read(scoped_state_path(project.path())).unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), contents);
+    assert_eq!(
+        std::fs::read(project.path().join("selected/skip.c")).unwrap(),
+        b"ignored local"
+    );
+    let events = events.lock().unwrap();
+    let listed: Vec<&str> = events
+        .iter()
+        .filter(|(verb, _)| verb == "LIST")
+        .map(|(_, path)| path.as_str())
+        .collect();
+    assert_eq!(
+        listed,
+        ["/remote", "/remote/selected", "/remote/selected/nested"]
+    );
+    assert!(!events.iter().any(|(_, path)| path.ends_with("skip.c")
+        || path.contains("selected-other")
+        || path.contains("unrelated")));
+}
+
+#[test]
+fn scoped_status_reports_stale_descendants_without_changing_missing_sync_behavior() {
+    for command in ["status", "sync"] {
+        let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
+        let project = tempfile::tempdir().unwrap();
+        let config = scoped_config(project.path(), server.port);
+        let mut state = ferry::state::StateFile::default();
+        state
+            .files
+            .insert("removed/a.c".into(), cached_status_record());
+        state
+            .files
+            .insert("removed-other/a.c".into(), cached_status_record());
+        let before = write_compact_scoped_state(project.path(), &state);
+        let output = bin()
+            .args([command, "removed", "--dry-run", "--config"])
+            .arg(config)
+            .output()
+            .unwrap();
+        if command == "status" {
+            assert_eq!(status_rows(&output), ["Stale\tremoved/a.c"]);
+        } else {
+            assert!(!output.status.success());
+        }
+        assert_eq!(
+            std::fs::read(scoped_state_path(project.path())).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn scoped_status_unknown_path_fails_without_recording_false_absence() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::Missing);
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    let output = bin()
+        .args(["status", "missing.c", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("path not found"));
+    assert!(!scoped_state_path(project.path()).exists());
+}
+
+#[test]
+fn scoped_status_reports_type_conflict_without_hashing_a_directory() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::TypeConflictWithClean(
+        b"clean".to_vec(),
+        b"child".to_vec(),
+    ));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    std::fs::write(project.path().join("type.c"), b"local file").unwrap();
+    let output = bin()
+        .args(["status", "type.c", "--dry-run", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert_eq!(
+        status_rows(&output),
+        ["TypeConflict\ttype.c", "RemoteOnly\ttype.c/child.c"]
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("type.c")).unwrap(),
+        b"local file"
+    );
+}
+
+#[test]
+fn scoped_status_rejects_unsafe_paths_before_connecting() {
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), 1);
+    let outside = tempfile::tempdir().unwrap();
+    let mut paths = vec![
+        "".to_owned(),
+        "../outside".to_owned(),
+        "one/../two".to_owned(),
+        outside.path().to_str().unwrap().to_owned(),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.path(), project.path().join("link")).unwrap();
+        paths.push("link/file.c".into());
+    }
+    for path in paths {
+        let output = bin()
+            .args(["status", &path, "--config"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "path={path:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("ftp connect"),
+            "path={path:?}; stderr={stderr}"
+        );
+        assert!(!scoped_state_path(project.path()).exists());
+    }
+}
+
+#[test]
+fn status_dot_and_absolute_root_preserve_bare_output() {
+    let project = tempfile::tempdir().unwrap();
+    let mut outputs = Vec::new();
+    for path in [None, Some("."), project.path().to_str()] {
+        let server = FakeFtpServer::spawn(FakeFtpScenario::TwoFiles(
+            b"first".to_vec(),
+            b"second".to_vec(),
+        ));
+        let config = scoped_config(project.path(), server.port);
+        let mut command = bin();
+        command.arg("status");
+        if let Some(path) = path {
+            command.arg(path);
+        }
+        let output = command
+            .args(["--dry-run", "--config"])
+            .arg(config)
+            .output()
+            .unwrap();
+        outputs.push(status_rows(&output));
+    }
+    assert_eq!(outputs[0], ["RemoteOnly\ta.c", "RemoteOnly\tb.c"]);
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], outputs[2]);
+}
+
+#[test]
+fn scoped_status_absolute_file_uses_cache_and_preserves_unrelated_records() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let server = FakeFtpServer::spawn(FakeFtpScenario::StatusTree(events.clone()));
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    std::fs::create_dir(project.path().join("selected")).unwrap();
+    let file = project.path().join("selected/a.c");
+    std::fs::write(&file, b"remote").unwrap();
+    let mut state = ferry::state::StateFile::default();
+    let mut record = cached_status_record();
+    record.sha256 = ferry::hash::hash_bytes(b"remote");
+    record.size = 6;
+    record.remote_mtime = chrono::DateTime::parse_from_rfc3339("2026-08-10T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    state.files.insert("selected/a.c".into(), record);
+    state
+        .files
+        .insert("unrelated/untouched.c".into(), cached_status_record());
+    write_compact_scoped_state(project.path(), &state);
+    let output = bin()
+        .arg("status")
+        .arg(&file)
+        .arg("--config")
+        .arg(config)
+        .output()
+        .unwrap();
+    assert_eq!(status_rows(&output), ["InSync\tselected/a.c"]);
+    let after =
+        ferry::state::StateFile::load_or_default(&scoped_state_path(project.path())).unwrap();
+    assert_eq!(
+        serde_json::to_value(after.files).unwrap(),
+        serde_json::to_value(state.files).unwrap()
+    );
+    assert_eq!(after.server_supports_mdtm, Some(true));
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(verb, _)| verb == "RETR" || verb == "STOR")
+    );
+    assert_eq!(std::fs::read(file).unwrap(), b"remote");
+}
+
+#[test]
+fn scoped_status_handles_local_only_and_remote_only_without_installing() {
+    for local_only in [true, false] {
+        let server = FakeFtpServer::spawn(FakeFtpScenario::StatusTree(Arc::new(Mutex::new(
+            Vec::new(),
+        ))));
+        let project = tempfile::tempdir().unwrap();
+        let config = scoped_config(project.path(), server.port);
+        let (path, expected) = if local_only {
+            std::fs::create_dir(project.path().join("selected")).unwrap();
+            std::fs::write(project.path().join("selected/local.c"), b"local").unwrap();
+            ("selected/local.c", "LocalOnly\tselected/local.c")
+        } else {
+            ("selected/nested/b.c", "RemoteOnly\tselected/nested/b.c")
+        };
+        let output = bin()
+            .args(["status", path, "--dry-run", "--config"])
+            .arg(config)
+            .output()
+            .unwrap();
+        assert_eq!(status_rows(&output), [expected]);
+        assert!(!scoped_state_path(project.path()).exists());
+        if local_only {
+            assert_eq!(std::fs::read(project.path().join(path)).unwrap(), b"local");
+        } else {
+            assert!(!project.path().join("selected").exists());
+        }
+    }
+}
+
+#[test]
+fn scoped_status_listing_errors_abort_instead_of_reporting_missing_files() {
+    let server = FakeFtpServer::spawn(FakeFtpScenario::StatusDeniedDirectory);
+    let project = tempfile::tempdir().unwrap();
+    let config = scoped_config(project.path(), server.port);
+    std::fs::create_dir(project.path().join("selected")).unwrap();
+    std::fs::write(project.path().join("selected/local.c"), b"local").unwrap();
+    let output = bin()
+        .args(["status", "selected", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("remote listing failed"));
+    assert!(!scoped_state_path(project.path()).exists());
 }

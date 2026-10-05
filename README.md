@@ -90,6 +90,28 @@ Previewed actions use future-tense output such as `would push`, `would pull`,
 also suppresses its normally hidden state-cache update. The observational
 `ls` and `cc` / `check` commands otherwise behave normally.
 
+## Scoped status
+
+Bare `ferry status` retains its existing whole-project behavior. Pass one file
+or directory to check only that path and its descendants:
+
+```sh
+ferry status players/viking
+ferry status players/shaman/obj/gobj.c
+ferry status players/viking --dry-run
+```
+
+Paths are relative to the configured `local_root`, including when invoked from
+another working directory. Absolute paths inside that root are accepted;
+parent traversal and paths outside it are rejected. `status .` checks the whole
+project. Scoped checks respect ignore rules, report stale cached descendants,
+and show `TypeConflict` when a file on one side is a directory on the other.
+
+Scoped status lists parent directories to resolve the selection, but does not
+walk sibling subtrees. It reads remote bytes when needed to calculate hashes;
+it never uploads or installs those bytes. Like bare status, it can update the
+MDTM capability cache. Add `--dry-run` to suppress that cache write too.
+
 ## Scoped sync
 
 `ferry sync` with no path retains Ferry's established project-wide behavior.

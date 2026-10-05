@@ -50,6 +50,39 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
     state: &StateFile,
     scope: SyncScope,
 ) -> Result<ScopedInventory> {
+    collect_impl(
+        remote,
+        local_root,
+        remote_root,
+        matcher,
+        state,
+        scope,
+        false,
+    )
+}
+
+/// Status may report stale descendants when the selected folder has disappeared.
+/// Sync keeps its existing requirement that the selection itself is known.
+pub(crate) fn collect_for_status<R: StrictRemote + ?Sized>(
+    remote: &mut R,
+    local_root: &Path,
+    remote_root: &str,
+    matcher: &Matcher,
+    state: &StateFile,
+    scope: SyncScope,
+) -> Result<ScopedInventory> {
+    collect_impl(remote, local_root, remote_root, matcher, state, scope, true)
+}
+
+fn collect_impl<R: StrictRemote + ?Sized>(
+    remote: &mut R,
+    local_root: &Path,
+    remote_root: &str,
+    matcher: &Matcher,
+    state: &StateFile,
+    scope: SyncScope,
+    allow_stale_descendants: bool,
+) -> Result<ScopedInventory> {
     if scope == SyncScope::LegacyProject {
         bail!("scoped inventory requires an explicit sync scope");
     }
@@ -91,6 +124,7 @@ pub(crate) fn collect<R: StrictRemote + ?Sized>(
         && !selected_local
         && !selected_remote
         && !entries.get(selected).is_some_and(|entry| entry.in_state)
+        && !(allow_stale_descendants && entries.values().any(|entry| entry.in_state))
     {
         bail!("path not found locally or remotely");
     }
