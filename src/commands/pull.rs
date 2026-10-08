@@ -186,6 +186,13 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         out.into_iter().collect()
     };
 
+    // ferry's own upload temps (a push interrupted between upload and
+    // rename leaves one behind) are not files to mirror.
+    let targets: Vec<String> = targets
+        .into_iter()
+        .filter(|rel| !crate::commands::transfer_temp::is_reserved_remote_transfer_temp(rel))
+        .collect();
+
     let mut had_conflict = false;
     let mut last_save = std::time::Instant::now();
 

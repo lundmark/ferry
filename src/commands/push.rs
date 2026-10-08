@@ -102,6 +102,12 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
             .collect()
     };
 
+    // Never upload ferry's own transfer temps, local or remote style.
+    let targets: Vec<String> = targets
+        .into_iter()
+        .filter(|rel| !crate::commands::transfer_temp::is_reserved_remote_transfer_temp(rel))
+        .collect();
+
     let mut had_conflict = false;
 
     let mut last_save = std::time::Instant::now();
