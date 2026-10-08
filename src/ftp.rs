@@ -107,15 +107,17 @@ pub trait Remote {
     }
 }
 
-/// Parallel FTP sessions for walks and prefetching (`FERRY_PARALLEL`,
-/// default 4, at most 16; 1 keeps everything on one connection).
+/// Parallel FTP sessions for walks and prefetching (`FERRY_PARALLEL`, at
+/// most 8). Off unless asked for: the server caps connections per host, and
+/// tools that already run several ferry processes at once would otherwise
+/// multiply their connection count and lock everyone out.
 pub fn parallel_workers() -> usize {
     std::env::var("FERRY_PARALLEL")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(4)
-        .min(16)
+        .unwrap_or(1)
+        .min(8)
 }
 
 pub trait StrictRemote: Remote {
