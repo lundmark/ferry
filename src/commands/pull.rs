@@ -189,7 +189,7 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     let mut had_conflict = false;
     let mut last_save = std::time::Instant::now();
 
-    let workers = parallel_workers();
+    let workers = crate::ftp::parallel_workers();
     for chunk in targets.chunks(PREFETCH_CHUNK) {
     // Fetch and hash, in parallel, the files the listing cannot vouch for;
     // classification and local writes below stay sequential and in order.
@@ -262,16 +262,6 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
 /// how many downloaded files are held in memory at once.
 const PREFETCH_CHUNK: usize = 200;
 
-/// Parallel FTP connections for prefetching (`FERRY_PARALLEL`, default 4;
-/// 1 turns prefetching off).
-fn parallel_workers() -> usize {
-    std::env::var("FERRY_PARALLEL")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(4)
-        .min(16)
-}
 
 /// Fetch remote hashes (and bytes) for the remote files in `chunk` that the
 /// session listing cannot prove unchanged, using `workers` connections of

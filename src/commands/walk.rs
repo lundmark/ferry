@@ -287,6 +287,11 @@ fn child_name<'a>(root: &str, dir: &str, name: &'a str) -> Option<&'a str> {
     is_under(root, &format!("{dir}/{rest}")).then_some(rest)
 }
 
+/// Walk `dir` and everything below it. The top level's listing failure is an
+/// error; a deeper directory that will not list is warned about and skipped.
+/// Subdirectories are handed to `Remote::walk_dirs_parallel` first, so a
+/// remote that can open extra sessions lists them concurrently; whatever it
+/// leaves is walked here, one directory at a time.
 #[allow(clippy::too_many_arguments)]
 fn walk_remote_inner<R: Remote + ?Sized>(
     ftp: &mut R,
@@ -297,16 +302,42 @@ fn walk_remote_inner<R: Remote + ?Sized>(
     symlinks: &mut BTreeSet<String>,
     top_level: bool,
 ) -> Result<()> {
-    let entries = match ftp.list_dir(dir) {
-        Ok(e) => e,
-        Err(e) if top_level => {
-            return Err(e).with_context(|| format!("walking remote dir {dir}"));
-        }
+    let mut pending = match walk_one_dir(ftp, root, sub, dir, out, symlinks, top_level) {
+        Ok(subdirs) => subdirs,
+        Err(e) if top_level => return Err(e),
         Err(e) => {
             eprintln!("warning: skipping remote dir {dir}: {e:#}");
             return Ok(());
         }
     };
+    ftp.walk_dirs_parallel(root, &mut pending, out, symlinks);
+    while let Some((child_sub, child_dir)) = pending.pop() {
+        match walk_one_dir(ftp, root, &child_sub, &child_dir, out, symlinks, false) {
+            Ok(more) => pending.extend(more),
+            Err(e) => eprintln!("warning: skipping remote dir {child_dir}: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// List one remote directory: record its files in `out` and its symlinks in
+/// `symlinks`, and return its subdirectories still to walk, as
+/// `(relative path, full remote dir)`. A listing failure is returned as an
+/// error; the caller decides whether that is fatal (the top level) or a
+/// warning-and-skip (any deeper directory).
+pub(crate) fn walk_one_dir<R: Remote + ?Sized>(
+    ftp: &mut R,
+    root: &str,
+    sub: &str,
+    dir: &str,
+    out: &mut BTreeSet<String>,
+    symlinks: &mut BTreeSet<String>,
+    top_level: bool,
+) -> Result<Vec<(String, String)>> {
+    let mut subdirs = Vec::new();
+    let entries = ftp
+        .list_dir(dir)
+        .with_context(|| format!("walking remote dir {dir}"))?;
     for entry in entries {
         if entry.name == "." || entry.name == ".." {
             continue;
@@ -359,12 +390,12 @@ fn walk_remote_inner<R: Remote + ?Sized>(
         };
         if entry.is_dir {
             let child_dir = format!("{}/{}", dir.trim_end_matches('/'), name);
-            let _ = walk_remote_inner(ftp, root, &child_sub, &child_dir, out, symlinks, false);
+            subdirs.push((child_sub, child_dir));
         } else {
             out.insert(child_sub);
         }
     }
-    Ok(())
+    Ok(subdirs)
 }
 
 #[cfg(test)]

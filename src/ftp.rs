@@ -78,6 +78,30 @@ pub trait Remote {
     fn exact_file_presence(&mut self, _path: &str) -> Result<ExactFilePresence> {
         anyhow::bail!("exact remote presence lookup unavailable")
     }
+    /// Walk the queued `(relative path, remote dir)` subdirectories with extra
+    /// sessions, if this remote can open them, adding their files and
+    /// symlinks to `out` and `symlinks` exactly as the sequential walk would.
+    /// Directories it does not finish stay in `pending` for the caller. The
+    /// default walks nothing, so fakes and plain remotes stay sequential.
+    fn walk_dirs_parallel(
+        &mut self,
+        _root: &str,
+        _pending: &mut Vec<(String, String)>,
+        _out: &mut std::collections::BTreeSet<String>,
+        _symlinks: &mut std::collections::BTreeSet<String>,
+    ) {
+    }
+}
+
+/// Parallel FTP sessions for walks and prefetching (`FERRY_PARALLEL`,
+/// default 4, at most 16; 1 keeps everything on one connection).
+pub fn parallel_workers() -> usize {
+    std::env::var("FERRY_PARALLEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
+        .min(16)
 }
 
 pub trait StrictRemote: Remote {
@@ -93,6 +117,15 @@ impl Remote for Ftp {
     }
     fn exact_file_presence(&mut self, path: &str) -> Result<ExactFilePresence> {
         self.exact_file_presence(path)
+    }
+    fn walk_dirs_parallel(
+        &mut self,
+        root: &str,
+        pending: &mut Vec<(String, String)>,
+        out: &mut std::collections::BTreeSet<String>,
+        symlinks: &mut std::collections::BTreeSet<String>,
+    ) {
+        Ftp::walk_dirs_parallel(self, root, pending, out, symlinks);
     }
 }
 
@@ -271,6 +304,122 @@ impl Ftp {
             .with_context(|| format!("ftp nlst {path}"))?;
         exact_nlst_presence(path, &lines)
     }
+}
+
+/// Work queue shared by parallel walk sessions: directories still to list,
+/// and how many are being listed right now (their subdirectories may still
+/// arrive, so an empty queue alone does not mean the walk is over).
+struct WalkQueue {
+    pending: Vec<(String, String)>,
+    in_flight: usize,
+}
+
+impl Ftp {
+    /// See [`Remote::walk_dirs_parallel`]. Each worker opens its own session;
+    /// a directory that fails to list is retried once on a fresh connection
+    /// before it is warned about and skipped, as the sequential walk does.
+    /// Workers that cannot connect simply do not take part.
+    fn walk_dirs_parallel(
+        &mut self,
+        root: &str,
+        pending: &mut Vec<(String, String)>,
+        out: &mut std::collections::BTreeSet<String>,
+        symlinks: &mut std::collections::BTreeSet<String>,
+    ) {
+        let workers = parallel_workers();
+        if workers < 2 || pending.is_empty() {
+            return;
+        }
+        let queue = std::sync::Mutex::new(WalkQueue {
+            pending: std::mem::take(pending),
+            in_flight: 0,
+        });
+        let wake = std::sync::Condvar::new();
+        let params = self.params.clone();
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let (queue, wake, params) = (&queue, &wake, params.clone());
+                    scope.spawn(move || walk_worker(&params, root, queue, wake))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok().flatten())
+                .collect::<Vec<_>>()
+        });
+        for (worker_out, worker_syms, listed) in results {
+            out.extend(worker_out);
+            symlinks.extend(worker_syms);
+            self.listed.extend(listed);
+        }
+        // Anything no worker got to (all failed to connect) goes back.
+        if let Ok(q) = queue.into_inner() {
+            pending.extend(q.pending);
+        }
+    }
+}
+
+type WalkResult = (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+    HashMap<String, (u64, DateTime<Utc>)>,
+);
+
+/// One parallel walk session: take directories off the queue, list them,
+/// queue their subdirectories, until nothing is queued or in flight.
+fn walk_worker(
+    params: &ConnectParams,
+    root: &str,
+    queue: &std::sync::Mutex<WalkQueue>,
+    wake: &std::sync::Condvar,
+) -> Option<WalkResult> {
+    let mut ftp = Ftp {
+        inner: Ftp::open(params).ok()?,
+        params: params.clone(),
+        listed: HashMap::new(),
+        symlink_targets: HashMap::new(),
+    };
+    let mut out = std::collections::BTreeSet::new();
+    let mut syms = std::collections::BTreeSet::new();
+    loop {
+        let job = {
+            let mut q = queue.lock().ok()?;
+            loop {
+                if let Some(job) = q.pending.pop() {
+                    q.in_flight += 1;
+                    break Some(job);
+                }
+                if q.in_flight == 0 {
+                    break None;
+                }
+                q = wake.wait(q).ok()?;
+            }
+        };
+        let Some((sub, dir)) = job else { break };
+        let mut listed = crate::commands::walk::walk_one_dir(
+            &mut ftp, root, &sub, &dir, &mut out, &mut syms, false,
+        );
+        if listed.is_err() && ftp.reconnect().is_ok() {
+            listed = crate::commands::walk::walk_one_dir(
+                &mut ftp, root, &sub, &dir, &mut out, &mut syms, false,
+            );
+        }
+        let subdirs = match listed {
+            Ok(subdirs) => subdirs,
+            Err(e) => {
+                eprintln!("warning: skipping remote dir {dir}: {e:#}");
+                Vec::new()
+            }
+        };
+        let mut q = queue.lock().ok()?;
+        q.pending.extend(subdirs);
+        q.in_flight -= 1;
+        wake.notify_all();
+    }
+    // Wake any worker still waiting so it can see the walk is finished.
+    wake.notify_all();
+    Some((out, syms, ftp.listed))
 }
 
 fn strict_list_transport_error(dir: &str, _error: anyhow::Error) -> anyhow::Error {
