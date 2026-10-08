@@ -36,6 +36,10 @@ enum Cmd {
         #[arg(long, default_value_t = 3600)]
         cooldown: i64,
     },
+    /// Keeps one FTP session logged in for `ferry hook` (started by the hook
+    /// itself; exits after 15 idle minutes).
+    #[command(hide = true)]
+    Hookd,
     /// Show per-file sync state vs remote.
     Status,
     /// Download remote -> local.
@@ -65,6 +69,13 @@ enum Cmd {
         paths: Vec<String>,
         #[arg(long)]
         recursive: bool,
+    },
+    /// Remove ferry's own leftover upload temps (`ferry-tmp.<hex>`) under the
+    /// given remote paths, if older than --hours. Nothing else is touched.
+    Clean {
+        paths: Vec<String>,
+        #[arg(long, default_value_t = ferry::commands::clean::DEFAULT_MIN_AGE_HOURS)]
+        hours: i64,
     },
     /// Check-compile files on the MUD via the UDP compile service. Prints
     /// per-file OK/FAIL and diagnostics; exits non-zero if any failed.
@@ -135,6 +146,7 @@ fn run() -> i32 {
         Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate, mode),
         Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
         Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
+        Cmd::Hookd => ferry::commands::hookd::run(&cfg),
         Cmd::Status => ferry::commands::status::run(&cfg, mode),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),
@@ -145,6 +157,7 @@ fn run() -> i32 {
         } => ferry::commands::sync::run_cli(&cfg, path.as_deref(), select, force, mode),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
+        Cmd::Clean { paths, hours } => ferry::commands::clean::run(&cfg, &paths, hours, mode),
     };
     finish(result)
 }

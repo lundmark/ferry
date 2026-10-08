@@ -3935,6 +3935,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("outside.c");
         fs::write(&path, "").unwrap();
+        crate::project::assert_no_config_above(temp.path());
         let uri = Uri::from_str(&format!("file://{}", path.display())).unwrap();
 
         let response = request_code_actions(uri);
@@ -4004,6 +4005,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let outside = temp.path().join("outside.c");
         fs::write(&outside, "").unwrap();
+        crate::project::assert_no_config_above(temp.path());
         let outside_uri = serde_json::json!(format!("file://{}", outside.display()));
         let requests = vec![
             execute_command_request(70, "ferry.unknown", vec![uri.clone()]),

@@ -9,7 +9,7 @@ mod prepared;
 
 pub use prepared::{
     LocalIdentity, PreparedPull, RemoteFile, apply_prepared_pull, apply_prepared_pull_if,
-    fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one,
+    fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one, pull_one_on,
 };
 
 use crate::commands::file_transfer::LocalPathExpectation;
@@ -17,7 +17,9 @@ use crate::commands::remote_hash;
 use crate::commands::remote_hash::RemoteHash;
 use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use crate::commands::transfer_temp::fresh_local_candidate;
-use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
+use crate::commands::walk::{
+    collect_remote_arg, remote_join, safe_arg, safe_rel, walk_local, walk_remote,
+};
 use crate::commands::{ExecutionMode, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -27,17 +29,72 @@ use crate::state::{FileRecord, FileState, StateFile, classify};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use same_file::Handle;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Normalize a pull argument. Absolute paths inside local_root remain local
+/// paths; an absolute path outside local_root is interpreted as a path from
+/// the configured remote root. This lets `pull /players/shaman/` work when
+/// local_root is `/home/nicke/3S` and remote_root is `/`.
+fn resolve_pull_symlink(remote_root: &str, link: &str, target: &str) -> Result<String> {
+    let root = remote_root.trim_end_matches('/');
+    let root = if root.is_empty() { "/" } else { root };
+    let link_parent = link
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("/");
+    let absolute = if target.starts_with('/') {
+        target.to_string()
+    } else {
+        format!("{}/{}", link_parent.trim_end_matches('/'), target)
+    };
+    let mut parts = Vec::new();
+    for part in absolute.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    anyhow::bail!("refusing remote symlink {link:?}: target escapes remote root");
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    let resolved_abs = format!("/{}", parts.join("/"));
+    let root_prefix = root.trim_end_matches('/');
+    let rel = if root_prefix.is_empty() {
+        resolved_abs.trim_start_matches('/').to_string()
+    } else if resolved_abs == root_prefix {
+        String::new()
+    } else if let Some(rest) = resolved_abs.strip_prefix(&(root_prefix.to_string() + "/")) {
+        rest.to_string()
+    } else {
+        anyhow::bail!("refusing remote symlink {link:?}: target escapes remote root");
+    };
+    if rel.is_empty() {
+        anyhow::bail!("refusing remote symlink {link:?}: target is remote root");
+    }
+    Ok(rel)
+}
+
+fn normalize_pull_arg(local_root: &Path, input: &str) -> Result<String> {
+    if Path::new(input).is_absolute() {
+        if let Ok(relative) = crate::project::relative_to_local_root(local_root, Path::new(input)) {
+            return Ok(relative);
+        }
+        return safe_rel(input.trim_start_matches('/'));
+    }
+    safe_arg(local_root, input)
+}
+
 pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
-    let paths: Vec<String> = paths
+    let mut paths: Vec<String> = paths
         .iter()
-        .map(|path| safe_arg(&local_root, path))
+        .map(|path| normalize_pull_arg(&local_root, path))
         .collect::<Result<_>>()?;
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
@@ -51,6 +108,20 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
         &cfg.connection.password,
         cfg.connection.passive,
     )?;
+
+    // An explicit pull of a remote symlink is allowed to follow its target,
+    // but only for a target that stays inside remote_root. The resolved target
+    // becomes the local path too, so the mirror contains the actual file rather
+    // than silently pretending to reproduce an FTP symlink.
+    for rel in &mut paths {
+        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+        let Some(target) = ftp.symlink_target(&remote_path)? else {
+            continue;
+        };
+        let resolved = resolve_pull_symlink(&cfg.paths.remote_root, &remote_path, &target)?;
+        eprintln!("following remote symlink {rel} -> {resolved}");
+        *rel = resolved;
+    }
 
     // Scope the walks to the paths we actually care about, and build the
     // target set in one pass so we emit exactly one status message per arg.
@@ -116,122 +187,63 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     };
 
     let mut had_conflict = false;
+    let mut last_save = std::time::Instant::now();
 
-    for rel in &targets {
-        let on_local = local_paths.contains(rel);
-        let on_remote = remote_paths.contains(rel);
-
-        if !on_local && !on_remote {
-            // Stale state entry or path that exists on neither side. Nothing
-            // to pull.
-            eprintln!("skip (not on local or remote): {rel}");
-            continue;
-        }
-
-        let local_hash = if on_local {
-            Some(hash_file(&local_root.join(rel))?)
-        } else {
-            None
-        };
-        let remote_path = remote_join(&cfg.paths.remote_root, rel);
-        // Use the MDTM/SIZE fast path: skip downloading entirely when the
-        // server's (mtime, size) match the cached state — that case is
-        // exactly the InSync branch below, which doesn't need the bytes.
-        // When the fast path can't fire we ask for bytes (`want_bytes=true`)
-        // so we have them in hand for the actual local write.
-        let rh = if on_remote {
-            Some(remote_hash::compute(
-                &mut ftp,
-                &mut state,
-                rel,
-                &remote_path,
+    let workers = crate::ftp::parallel_workers();
+    let mut pool: Vec<Option<Ftp>> = Vec::new();
+    for chunk in targets.chunks(remote_hash::PREFETCH_CHUNK) {
+        // Fetch and hash, in parallel, the files the listing cannot vouch for;
+        // classification and local writes below stay sequential and in order.
+        let mut prefetched = if workers > 1 {
+            remote_hash::prefetch(
+                &ftp,
+                &cfg,
+                &state,
+                &remote_paths,
+                chunk,
+                workers,
                 true,
-            )?)
+                &mut pool,
+            )
         } else {
-            None
+            HashMap::new()
         };
-        let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
-
-        let known = state.files.get(rel).map(|r| r.sha256.as_str());
-        let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
-
-        match st {
-            FileState::InSync => {
-                // Nothing to write. Local matches remote.
-            }
-            FileState::LocalOnly => {
-                // Pull is one-way: we don't delete local files because the
-                // remote is missing them. Skip.
-            }
-            FileState::RemoteOnly | FileState::RemoteChanged => {
-                // We need the actual remote bytes to write locally. If the
-                // fast path fired (from_cache=true), we got here with the
-                // hash but no bytes — which can only happen if state has a
-                // record AND it matches AND yet classify said the remote
-                // changed. That implies the local file diverged from `known`
-                // while remote matches `known` (LocalChanged) — not this
-                // branch. So in practice rh.bytes is Some here. Defensive
-                // fallback: if bytes are missing, fetch them now.
-                let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
-                let bytes_owned: Vec<u8> = match &rh_inner.bytes {
-                    Some(b) => b.clone(),
-                    None => ftp
-                        .download(&remote_path)
-                        .with_context(|| format!("downloading {remote_path}"))?,
-                };
-                download_one(
+        for rel in chunk {
+            let mut pre = prefetched.remove(rel);
+            // A dropped or timed-out connection fails only the current file:
+            // reconnect and try it again, up to three attempts in all.
+            let mut attempt = 0;
+            let conflict = loop {
+                attempt += 1;
+                match pull_target(
                     &mut ftp,
                     &mut state,
-                    &local_root.join(rel),
+                    &local_root,
+                    &cfg.paths.remote_root,
+                    &local_paths,
+                    &remote_paths,
                     rel,
-                    &remote_path,
-                    &bytes_owned,
-                    &rh_inner.sha256,
+                    force,
                     mode,
-                )?;
-                println!(
-                    "{} {rel}",
-                    if mode.is_dry_run() {
-                        "would pull"
-                    } else {
-                        "pulled"
+                    pre.take(),
+                ) {
+                    Ok(conflict) => break conflict,
+                    Err(e) if attempt < 3 => {
+                        eprintln!("retrying {rel} after error: {e:#}");
+                        ftp.reconnect()
+                            .with_context(|| format!("reconnecting after error on {rel}"))?;
                     }
-                );
-            }
-            FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
-                // Untracked = both sides have a file but no record of a prior sync.
-                // Design action matrix treats this as "as if both-changed": refuse
-                // without --force so the user makes an explicit choice.
-                if force {
-                    let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
-                    let bytes_owned: Vec<u8> = match &rh_inner.bytes {
-                        Some(b) => b.clone(),
-                        None => ftp
-                            .download(&remote_path)
-                            .with_context(|| format!("downloading {remote_path}"))?,
-                    };
-                    if mode.is_dry_run() {
-                        eprintln!("would overwrite local with remote (--force): {rel}");
-                    } else {
-                        eprintln!("overwriting local with remote (--force): {rel}");
-                    }
-                    download_one(
-                        &mut ftp,
-                        &mut state,
-                        &local_root.join(rel),
-                        rel,
-                        &remote_path,
-                        &bytes_owned,
-                        &rh_inner.sha256,
-                        mode,
-                    )?;
-                } else {
-                    eprintln!(
-                        "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
-                        st
-                    );
-                    had_conflict = true;
+                    Err(e) => return Err(e),
                 }
+            };
+            had_conflict |= conflict;
+
+            // Persist progress every few seconds, so a run that is killed or
+            // fails part-way keeps the records of what it already pulled instead
+            // of leaving those files looking untracked to the next run.
+            if mode.should_apply() && last_save.elapsed() >= std::time::Duration::from_secs(5) {
+                state.save(&state_path)?;
+                last_save = std::time::Instant::now();
             }
         }
     }
@@ -254,6 +266,155 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     }
 
     Ok(())
+}
+
+/// Classify one target and pull it if appropriate. Returns `Ok(true)` when
+/// the file is a conflict that needs `--force`.
+#[allow(clippy::too_many_arguments)]
+fn pull_target(
+    ftp: &mut Ftp,
+    state: &mut StateFile,
+    local_root: &Path,
+    remote_root: &str,
+    local_paths: &BTreeSet<String>,
+    remote_paths: &BTreeSet<String>,
+    rel: &String,
+    force: bool,
+    mode: ExecutionMode,
+    prefetched: Option<RemoteHash>,
+) -> Result<bool> {
+    let on_local = local_paths.contains(rel);
+    let on_remote = remote_paths.contains(rel);
+
+    if !on_local && !on_remote {
+        // Stale state entry or path that exists on neither side. Nothing
+        // to pull.
+        eprintln!("skip (not on local or remote): {rel}");
+        return Ok(false);
+    }
+
+    let local_hash = if on_local {
+        Some(hash_file(&local_root.join(rel))?)
+    } else {
+        None
+    };
+    let remote_path = remote_join(remote_root, rel);
+    // Use the MDTM/SIZE fast path: skip downloading entirely when the
+    // server's (mtime, size) match the cached state — that case is
+    // exactly the InSync branch below, which doesn't need the bytes.
+    // When the fast path can't fire we ask for bytes (`want_bytes=true`)
+    // so we have them in hand for the actual local write.
+    let rh = if on_remote {
+        Some(match prefetched {
+            Some(rh) => rh,
+            None => remote_hash::compute(ftp, state, rel, &remote_path, true)?,
+        })
+    } else {
+        None
+    };
+    let remote_hash_str = rh.as_ref().map(|r| r.sha256.clone());
+
+    let known = state.files.get(rel).map(|r| r.sha256.as_str());
+    let st = classify(local_hash.as_deref(), remote_hash_str.as_deref(), known);
+
+    match st {
+        FileState::InSync => {
+            // Nothing to write. Local matches remote. When the remote side was
+            // confirmed from the record (MDTM or listing), note that it was
+            // verified now: once its listed minute has passed, later listings
+            // can then vouch for it without MDTM
+            // (`remote_hash::listing_proves_unchanged`).
+            if rh.as_ref().is_some_and(|r| r.from_cache)
+                && let Some(record) = state.files.get_mut(rel.as_str())
+            {
+                record.last_synced = record.last_synced.max(Utc::now());
+            } else if let Some(r) = rh.as_ref()
+                && !r.from_cache
+                && r.metadata_stable
+                && mode.should_apply()
+            {
+                // Downloaded and found identical, but the record was stale
+                // (or missing): refresh it, or every later run downloads the
+                // file again just to learn the same thing.
+                record_download(state, rel, &r.sha256, r.size, r.mtime);
+            }
+        }
+        FileState::LocalOnly => {
+            // Pull is one-way: we don't delete local files because the
+            // remote is missing them. Skip.
+        }
+        FileState::RemoteOnly | FileState::RemoteChanged => {
+            // We need the actual remote bytes to write locally. If the
+            // fast path fired (from_cache=true), we got here with the
+            // hash but no bytes — which can only happen if state has a
+            // record AND it matches AND yet classify said the remote
+            // changed. That implies the local file diverged from `known`
+            // while remote matches `known` (LocalChanged) — not this
+            // branch. So in practice rh.bytes is Some here. Defensive
+            // fallback: if bytes are missing, fetch them now.
+            let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
+            let bytes_owned: Vec<u8> = match &rh_inner.bytes {
+                Some(b) => b.clone(),
+                None => ftp
+                    .download(&remote_path)
+                    .with_context(|| format!("downloading {remote_path}"))?,
+            };
+            download_one(
+                ftp,
+                state,
+                &local_root.join(rel),
+                rel,
+                &remote_path,
+                &bytes_owned,
+                &rh_inner.sha256,
+                mode,
+            )?;
+            println!(
+                "{} {rel}",
+                if mode.is_dry_run() {
+                    "would pull"
+                } else {
+                    "pulled"
+                }
+            );
+        }
+        FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
+            // Untracked = both sides have a file but no record of a prior sync.
+            // Design action matrix treats this as "as if both-changed": refuse
+            // without --force so the user makes an explicit choice.
+            if force {
+                let rh_inner = rh.as_ref().expect("rh set when on_remote is true");
+                let bytes_owned: Vec<u8> = match &rh_inner.bytes {
+                    Some(b) => b.clone(),
+                    None => ftp
+                        .download(&remote_path)
+                        .with_context(|| format!("downloading {remote_path}"))?,
+                };
+                if mode.is_dry_run() {
+                    eprintln!("would overwrite local with remote (--force): {rel}");
+                } else {
+                    eprintln!("overwriting local with remote (--force): {rel}");
+                }
+                download_one(
+                    ftp,
+                    state,
+                    &local_root.join(rel),
+                    rel,
+                    &remote_path,
+                    &bytes_owned,
+                    &rh_inner.sha256,
+                    mode,
+                )?;
+            } else {
+                eprintln!(
+                    "conflict ({:?}, would overwrite local edits): {rel} — pass --force to override",
+                    st
+                );
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// In [`ExecutionMode::Apply`], write `bytes` to `local_path` atomically (via
@@ -653,6 +814,45 @@ fn record_download(
             last_synced: Utc::now(),
         },
     );
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::normalize_pull_arg;
+    use std::path::Path;
+
+    #[test]
+    fn absolute_remote_directory_is_relative_to_remote_root() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            normalize_pull_arg(root.path(), "/players/shaman/").unwrap(),
+            "players/shaman"
+        );
+    }
+
+    #[test]
+    fn absolute_local_path_inside_root_stays_local_relative() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("players");
+        std::fs::create_dir(&local).unwrap();
+        assert_eq!(
+            normalize_pull_arg(root.path(), local.to_str().unwrap()).unwrap(),
+            "players"
+        );
+    }
+
+    #[test]
+    fn absolute_remote_parent_traversal_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(normalize_pull_arg(root.path(), "/players/../outside").is_err());
+        assert!(
+            normalize_pull_arg(
+                root.path(),
+                Path::new("/players/../outside").to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

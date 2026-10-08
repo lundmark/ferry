@@ -35,6 +35,12 @@ pub fn run(config_path: &Path, sub: Option<&str>) -> Result<()> {
 
     let entries = ftp.list(&dir)?;
     for e in entries {
+        // `LIST -a` (used so dotfiles show) also returns the directory's own
+        // `.` and `..`. They are not contents, and a script that pulls each
+        // listed name would otherwise pull the directory itself and its parent.
+        if e.name == "." || e.name == ".." {
+            continue;
+        }
         let kind = kind_char(&e);
         println!(
             "{kind} {size:>10} {mtime}  {name}",

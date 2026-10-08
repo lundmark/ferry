@@ -91,8 +91,10 @@ mod execution_mode_tests {
 }
 
 pub mod cc;
+pub mod clean;
 pub mod file_transfer;
 pub mod hook;
+pub mod hookd;
 pub mod init;
 pub mod ls;
 pub mod pull;

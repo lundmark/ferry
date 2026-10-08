@@ -1,10 +1,62 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::Duration;
 use suppaftp::FtpStream;
+
+/// How long a connect, read or write may stall before it fails. Without it a
+/// data connection the server drops can leave ferry waiting forever (the
+/// socket sits in CLOSE-WAIT). It limits each stall, not a whole transfer, so
+/// a slow but moving download is unaffected. Override with
+/// `FERRY_TIMEOUT_SECS`.
+const DEFAULT_IO_TIMEOUT_SECS: u64 = 15;
+
+/// Pauses between reconnect attempts after a failure. A refused login (the
+/// server's per-host connection cap, a restart) is usually gone within
+/// seconds; retrying turns it into a short wait instead of a failed run.
+const RECONNECT_BACKOFF_SECS: [u64; 2] = [1, 3];
+
+fn io_timeout() -> Duration {
+    let secs = std::env::var("FERRY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_IO_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Everything needed to open the session again after a transport failure.
+#[derive(Clone)]
+struct ConnectParams {
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+    passive: bool,
+}
 
 pub struct Ftp {
     inner: FtpStream,
+    params: ConnectParams,
+    // Size and modification time of every plain file seen in a LIST during
+    // this session, keyed by full remote path. Lets the hash step skip the
+    // per-file MDTM/SIZE round trips when the listing already proves a file
+    // unchanged (see `remote_hash::listing_proves_unchanged`).
+    listed: HashMap<String, (u64, DateTime<Utc>)>,
+    // Directories this session has seen exist (listed, or seen as a
+    // directory entry in a listing, or created). Lets uploads skip the
+    // MKD-and-confirm round trips for parents that are already there.
+    known_dirs: std::collections::HashSet<String>,
+    // The most recent listing of each directory this session, reused only by
+    // the single-leaf symlink probe (`Remote::list_dir_reuse`) so one path
+    // argument does not list its parent twice.
+    recent_lists: HashMap<String, Vec<Entry>>,
+    // Explicit pull arguments may ask about several files in one directory.
+    // A symlink check only needs the parent LIST, so retain the result for the
+    // lifetime of this command and avoid repeating the same network round-trip.
+    symlink_targets: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +93,38 @@ pub trait Remote {
     fn exact_file_presence(&mut self, _path: &str) -> Result<ExactFilePresence> {
         anyhow::bail!("exact remote presence lookup unavailable")
     }
+    /// Walk the queued `(relative path, remote dir)` subdirectories with extra
+    /// sessions, if this remote can open them, adding their files and
+    /// symlinks to `out` and `symlinks` exactly as the sequential walk would.
+    /// Directories it does not finish stay in `pending` for the caller. The
+    /// default walks nothing, so fakes and plain remotes stay sequential.
+    /// A listing of `dir` that may come from earlier in the same session.
+    /// Only for the single-leaf symlink probe, which would otherwise list a
+    /// path argument's parent a second time. Defaults to a fresh listing.
+    fn list_dir_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list_dir(dir)
+    }
+    fn walk_dirs_parallel(
+        &mut self,
+        _root: &str,
+        _pending: &mut Vec<(String, String)>,
+        _out: &mut std::collections::BTreeSet<String>,
+        _symlinks: &mut std::collections::BTreeSet<String>,
+    ) {
+    }
+}
+
+/// Parallel FTP sessions for walks and prefetching (`FERRY_PARALLEL`, at
+/// most 8). Off unless asked for: the server caps connections per host, and
+/// tools that already run several ferry processes at once would otherwise
+/// multiply their connection count and lock everyone out.
+pub fn parallel_workers() -> usize {
+    std::env::var("FERRY_PARALLEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+        .min(8)
 }
 
 pub trait StrictRemote: Remote {
@@ -57,6 +141,18 @@ impl Remote for Ftp {
     fn exact_file_presence(&mut self, path: &str) -> Result<ExactFilePresence> {
         self.exact_file_presence(path)
     }
+    fn list_dir_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list_reuse(dir)
+    }
+    fn walk_dirs_parallel(
+        &mut self,
+        root: &str,
+        pending: &mut Vec<(String, String)>,
+        out: &mut std::collections::BTreeSet<String>,
+        symlinks: &mut std::collections::BTreeSet<String>,
+    ) {
+        Ftp::walk_dirs_parallel(self, root, pending, out, symlinks);
+    }
 }
 
 impl StrictRemote for Ftp {
@@ -67,13 +163,111 @@ impl StrictRemote for Ftp {
 
 impl Ftp {
     pub fn connect(host: &str, port: u16, user: &str, pass: &str, passive: bool) -> Result<Self> {
+        let params = ConnectParams {
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            pass: pass.to_string(),
+            passive,
+        };
+        let inner = Self::open_retrying(&params)?;
+        Ok(Self {
+            inner,
+            params,
+            listed: HashMap::new(),
+            known_dirs: std::collections::HashSet::new(),
+            recent_lists: HashMap::new(),
+            symlink_targets: HashMap::new(),
+        })
+    }
+
+    /// Drop the current session and log in again with the same settings.
+    /// Used to recover from a timed-out or broken connection; the listing
+    /// and symlink caches stay valid because they describe the server, not
+    /// the session.
+    pub fn reconnect(&mut self) -> Result<()> {
+        // After a failure, trust nothing remembered about directories: the
+        // retry re-checks parents and re-lists, exactly as a fresh run would.
+        self.known_dirs.clear();
+        self.recent_lists.clear();
+        let _ = self.inner.quit();
+        self.inner = Self::open_retrying(&self.params)?;
+        Ok(())
+    }
+
+    /// `open`, retried after the `RECONNECT_BACKOFF_SECS` pauses while the
+    /// failure is the server's (refused, dropped). A config or credential
+    /// problem (`Exit::Auth`) is returned at once: waiting will not fix it.
+    fn open_retrying(params: &ConnectParams) -> Result<FtpStream> {
+        let mut result = Self::open(params);
+        for pause in RECONNECT_BACKOFF_SECS {
+            match &result {
+                Err(e) if e.downcast_ref::<crate::error::Exit>().is_none() => {
+                    std::thread::sleep(Duration::from_secs(pause));
+                    result = Self::open(params);
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
+    fn open(params: &ConnectParams) -> Result<FtpStream> {
+        let ConnectParams {
+            host,
+            port,
+            user,
+            pass,
+            passive,
+        } = params;
+        let (host, port, passive) = (host.as_str(), *port, *passive);
+        let timeout = io_timeout();
         // Connect + login failures become `Exit::Auth` so the process exits 3
         // (config/auth) rather than 1. The underlying suppaftp message is
         // preserved in the payload so the user still sees the real cause.
-        let mut s = FtpStream::connect((host, port))
-            .map_err(|e| crate::error::Exit::Auth(format!("ftp connect {host}:{port}: {e}")))?;
-        s.login(user, pass)
-            .map_err(|e| crate::error::Exit::Auth(format!("ftp login as {user}: {e}")))?;
+        let addr: SocketAddr = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| crate::error::Exit::Auth(format!("ftp connect {host}:{port}: {e}")))?
+            .next()
+            .ok_or_else(|| {
+                crate::error::Exit::Auth(format!("ftp connect {host}:{port}: no address"))
+            })?;
+        // A refused, dropped or garbled greeting is the server being busy (its
+        // per-host connection cap) or restarting -- not a config problem, so
+        // it is an ordinary error, which `connect` and `reconnect` retry.
+        let s = FtpStream::connect_timeout(addr, timeout).map_err(|e| {
+            anyhow::anyhow!(
+                "ftp connect {host}:{port}: the server refused or dropped the connection \
+                 (busy, at its connection limit, or restarting): {e}"
+            )
+        })?;
+        s.get_ref()
+            .set_read_timeout(Some(timeout))
+            .context("ftp set control read timeout")?;
+        s.get_ref()
+            .set_write_timeout(Some(timeout))
+            .context("ftp set control write timeout")?;
+        // Data connections (LIST/RETR/STOR) get the same limits, so a transfer
+        // the server abandons fails instead of hanging.
+        let mut s = s.passive_stream_builder(move |addr| {
+            let data = TcpStream::connect_timeout(&addr, timeout)
+                .map_err(suppaftp::FtpError::ConnectionError)?;
+            data.set_read_timeout(Some(timeout))
+                .map_err(suppaftp::FtpError::ConnectionError)?;
+            data.set_write_timeout(Some(timeout))
+                .map_err(suppaftp::FtpError::ConnectionError)?;
+            Ok(data)
+        });
+        // Only a real rejection of the credentials (530) is an auth problem;
+        // a session dropped during login is the server again.
+        s.login(user, pass).map_err(|e| match &e {
+            suppaftp::FtpError::UnexpectedResponse(r)
+                if r.status == suppaftp::Status::NotLoggedIn =>
+            {
+                anyhow::Error::from(crate::error::Exit::Auth(format!("ftp login as {user}: {e}")))
+            }
+            _ => anyhow::anyhow!("ftp login as {user}: the server dropped the session: {e}"),
+        })?;
         s.transfer_type(suppaftp::types::FileType::Binary)
             .context("ftp set binary transfer type")?;
         s.set_mode(if passive {
@@ -81,24 +275,134 @@ impl Ftp {
         } else {
             suppaftp::Mode::Active
         });
-        Ok(Self { inner: s })
+        Ok(s)
+    }
+
+    /// Keep an idle session alive (and find out whether it still is).
+    pub fn noop(&mut self) -> Result<()> {
+        self.inner.noop().context("ftp noop")?;
+        Ok(())
+    }
+
+    /// Forget everything remembered from earlier listings. For a session that
+    /// outlives one command (the hook helper): a listing from minutes ago
+    /// must not vouch for a file now.
+    pub fn forget_session_caches(&mut self) {
+        self.listed.clear();
+        self.known_dirs.clear();
+        self.recent_lists.clear();
+        self.symlink_targets.clear();
+    }
+
+    /// Size and modification time of `path` as the last LIST of its parent
+    /// directory reported them, if this session listed it.
+    pub fn listed_meta(&self, path: &str) -> Option<(u64, DateTime<Utc>)> {
+        self.listed.get(path.trim_end_matches('/')).copied()
+    }
+
+    fn remember_listing(&mut self, dir: &str, entries: &[Entry]) {
+        let key = dir_key(dir);
+        let dir = dir.trim_end_matches('/');
+        self.known_dirs.insert(key.clone());
+        for entry in entries {
+            if entry.is_symlink || entry.name.contains('/') {
+                continue;
+            }
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            if entry.is_dir {
+                self.known_dirs.insert(format!("{dir}/{}", entry.name));
+                continue;
+            }
+            self.listed.insert(
+                format!("{dir}/{}", entry.name),
+                (entry.size, entry.modified),
+            );
+        }
+        self.recent_lists.insert(key, entries.to_vec());
+    }
+
+    /// True when this session has seen `path` exist as a directory.
+    pub fn dir_known(&self, path: &str) -> bool {
+        self.known_dirs.contains(&dir_key(path))
+    }
+
+    /// Record that `path` exists as a directory (e.g. just created).
+    pub fn note_dir(&mut self, path: &str) {
+        self.known_dirs.insert(dir_key(path));
+    }
+
+    /// The listing of `dir` from earlier in this session, or a fresh one.
+    pub fn list_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        if let Some(entries) = self.recent_lists.get(&dir_key(dir)) {
+            return Ok(entries.clone());
+        }
+        self.list(dir)
+    }
+
+    /// Raw LIST response for `dir`, including dotfiles: the 3k FTP server
+    /// hides `.*` entries from a plain `LIST <dir>` but honors `LIST -a`.
+    /// Servers that reject the flag outright get a plain `LIST` retry, and
+    /// servers that silently swallow it (an empty `-a` reply for a dir that
+    /// is not actually empty) are caught by comparing the two replies.
+    fn list_lines(&mut self, dir: &str) -> Result<Vec<String>> {
+        let flagged = self.inner.list(Some(&format!("-a {dir}")));
+        let flagged_lines = match flagged {
+            Ok(lines) if !lines.is_empty() => return Ok(lines),
+            _ => self
+                .inner
+                .list(Some(dir))
+                .with_context(|| format!("ftp list {dir}"))?,
+        };
+        Ok(flagged_lines)
     }
 
     pub fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
-        let lines = self
-            .inner
-            .list(Some(dir))
-            .with_context(|| format!("ftp list {dir}"))?;
-        Ok(parse_listing_tolerant(&lines))
+        let lines = self.list_lines(dir)?;
+        let entries = parse_listing_tolerant(&lines);
+        self.remember_listing(dir, &entries);
+        Ok(entries)
     }
 
     pub fn list_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
         let lines = self
-            .inner
-            .list(Some(dir))
+            .list_lines(dir)
             .map_err(|error| strict_list_transport_error(dir, error))?;
 
-        parse_listing_strict(dir, &lines)
+        let entries = parse_listing_strict(dir, &lines)?;
+        self.remember_listing(dir, &entries);
+        Ok(entries)
+    }
+
+    /// Resolve a symlink leaf from one parent LIST response. This is used only
+    /// by an explicit pull argument; normal walks and all write operations keep
+    /// refusing remote symlinks.
+    pub fn symlink_target(&mut self, path: &str) -> Result<Option<String>> {
+        let trimmed = path.trim_end_matches('/');
+        if let Some(target) = self.symlink_targets.get(trimmed) {
+            return Ok(target.clone());
+        }
+        let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("/", trimmed));
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let lines = self.list_lines(parent)?;
+        let entries = parse_listing_tolerant(&lines);
+        self.remember_listing(parent, &entries);
+        let target = lines.into_iter().find_map(|line| {
+            let file = match suppaftp::list::File::from_posix_line(&line) {
+                Ok(file) => file,
+                Err(_) => return None,
+            };
+            if file.name() == leaf && file.is_symlink() {
+                return file
+                    .symlink()
+                    .map(|target| target.to_string_lossy().into_owned());
+            }
+            None
+        });
+        self.symlink_targets
+            .insert(trimmed.to_string(), target.clone());
+        Ok(target)
     }
 
     /// Probe exactly one remote pathname through `NLST`. Unlike [`Self::list`]
@@ -114,7 +418,127 @@ impl Ftp {
     }
 }
 
-fn strict_list_transport_error(dir: &str, _error: suppaftp::FtpError) -> anyhow::Error {
+/// Work queue shared by parallel walk sessions: directories still to list,
+/// and how many are being listed right now (their subdirectories may still
+/// arrive, so an empty queue alone does not mean the walk is over).
+struct WalkQueue {
+    pending: Vec<(String, String)>,
+    in_flight: usize,
+}
+
+impl Ftp {
+    /// See [`Remote::walk_dirs_parallel`]. Each worker opens its own session;
+    /// a directory that fails to list is retried once on a fresh connection
+    /// before it is warned about and skipped, as the sequential walk does.
+    /// Workers that cannot connect simply do not take part.
+    fn walk_dirs_parallel(
+        &mut self,
+        root: &str,
+        pending: &mut Vec<(String, String)>,
+        out: &mut std::collections::BTreeSet<String>,
+        symlinks: &mut std::collections::BTreeSet<String>,
+    ) {
+        let workers = parallel_workers();
+        if workers < 2 || pending.is_empty() {
+            return;
+        }
+        let queue = std::sync::Mutex::new(WalkQueue {
+            pending: std::mem::take(pending),
+            in_flight: 0,
+        });
+        let wake = std::sync::Condvar::new();
+        let params = self.params.clone();
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let (queue, wake, params) = (&queue, &wake, params.clone());
+                    scope.spawn(move || walk_worker(&params, root, queue, wake))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok().flatten())
+                .collect::<Vec<_>>()
+        });
+        for (worker_out, worker_syms, listed, dirs) in results {
+            out.extend(worker_out);
+            symlinks.extend(worker_syms);
+            self.listed.extend(listed);
+            self.known_dirs.extend(dirs);
+        }
+        // Anything no worker got to (all failed to connect) goes back.
+        if let Ok(q) = queue.into_inner() {
+            pending.extend(q.pending);
+        }
+    }
+}
+
+type WalkResult = (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+    HashMap<String, (u64, DateTime<Utc>)>,
+    std::collections::HashSet<String>,
+);
+
+/// One parallel walk session: take directories off the queue, list them,
+/// queue their subdirectories, until nothing is queued or in flight.
+fn walk_worker(
+    params: &ConnectParams,
+    root: &str,
+    queue: &std::sync::Mutex<WalkQueue>,
+    wake: &std::sync::Condvar,
+) -> Option<WalkResult> {
+    let mut ftp = Ftp {
+        inner: Ftp::open(params).ok()?,
+        params: params.clone(),
+        listed: HashMap::new(),
+        known_dirs: std::collections::HashSet::new(),
+        recent_lists: HashMap::new(),
+        symlink_targets: HashMap::new(),
+    };
+    let mut out = std::collections::BTreeSet::new();
+    let mut syms = std::collections::BTreeSet::new();
+    loop {
+        let job = {
+            let mut q = queue.lock().ok()?;
+            loop {
+                if let Some(job) = q.pending.pop() {
+                    q.in_flight += 1;
+                    break Some(job);
+                }
+                if q.in_flight == 0 {
+                    break None;
+                }
+                q = wake.wait(q).ok()?;
+            }
+        };
+        let Some((sub, dir)) = job else { break };
+        let mut listed = crate::commands::walk::walk_one_dir(
+            &mut ftp, root, &sub, &dir, &mut out, &mut syms, false,
+        );
+        if listed.is_err() && ftp.reconnect().is_ok() {
+            listed = crate::commands::walk::walk_one_dir(
+                &mut ftp, root, &sub, &dir, &mut out, &mut syms, false,
+            );
+        }
+        let subdirs = match listed {
+            Ok(subdirs) => subdirs,
+            Err(e) => {
+                eprintln!("warning: skipping remote dir {dir}: {e:#}");
+                Vec::new()
+            }
+        };
+        let mut q = queue.lock().ok()?;
+        q.pending.extend(subdirs);
+        q.in_flight -= 1;
+        wake.notify_all();
+    }
+    // Wake any worker still waiting so it can see the walk is finished.
+    wake.notify_all();
+    Some((out, syms, ftp.listed, ftp.known_dirs))
+}
+
+fn strict_list_transport_error(dir: &str, _error: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!(
         "ftp list {}: remote listing failed",
         sanitize_for_message(dir)
@@ -228,6 +652,17 @@ fn entry_from_posix_file(file: &suppaftp::list::File) -> Entry {
         is_symlink: file.is_symlink(),
         size: u64::try_from(file.size()).unwrap_or(0),
         modified: DateTime::<Utc>::from(file.modified()),
+    }
+}
+
+/// Canonical cache key for a remote directory: no trailing slash, except
+/// that the root stays "/".
+fn dir_key(dir: &str) -> String {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -433,7 +868,7 @@ mod tests {
                 ATTACKER_REPLY.as_bytes().to_vec(),
             ));
 
-        let error = strict_list_transport_error("/root", transport_error);
+        let error = strict_list_transport_error("/root", transport_error.into());
         let message = format!("{error:#}");
 
         assert!(message.contains("ftp list /root"));
