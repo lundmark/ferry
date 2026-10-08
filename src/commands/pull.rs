@@ -190,11 +190,11 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     let mut last_save = std::time::Instant::now();
 
     let workers = crate::ftp::parallel_workers();
-    for chunk in targets.chunks(PREFETCH_CHUNK) {
+    for chunk in targets.chunks(remote_hash::PREFETCH_CHUNK) {
     // Fetch and hash, in parallel, the files the listing cannot vouch for;
     // classification and local writes below stay sequential and in order.
     let mut prefetched = if workers > 1 {
-        prefetch_remote_hashes(&ftp, &cfg, &state, &remote_paths, chunk, workers)
+        remote_hash::prefetch(&ftp, &cfg, &state, &remote_paths, chunk, workers, true)
     } else {
         HashMap::new()
     };
@@ -256,93 +256,6 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     }
 
     Ok(())
-}
-
-/// Targets are prefetched and then pulled this many at a time, which bounds
-/// how many downloaded files are held in memory at once.
-const PREFETCH_CHUNK: usize = 200;
-
-
-/// Fetch remote hashes (and bytes) for the remote files in `chunk` that the
-/// session listing cannot prove unchanged, using `workers` connections of
-/// their own. Best effort: a file a worker fails on is simply absent from the
-/// result, and the sequential loop handles it the ordinary way.
-fn prefetch_remote_hashes(
-    ftp: &Ftp,
-    cfg: &Config,
-    state: &StateFile,
-    remote_paths: &BTreeSet<String>,
-    chunk: &[String],
-    workers: usize,
-) -> HashMap<String, RemoteHash> {
-    // Each worker gets a private state holding just the records it needs.
-    let mut records = std::collections::BTreeMap::new();
-    let mut todo: Vec<&String> = Vec::new();
-    for rel in chunk {
-        if !remote_paths.contains(rel) {
-            continue;
-        }
-        if let Some(known) = state.files.get(rel) {
-            // The main connection's listing already proves this one: the
-            // sequential loop settles it with no network traffic at all.
-            let remote_path = remote_join(&cfg.paths.remote_root, rel);
-            if let Some((size, mtime)) = ftp.listed_meta(&remote_path)
-                && remote_hash::listing_proves_unchanged(known, size, mtime)
-            {
-                continue;
-            }
-            records.insert(rel.clone(), known.clone());
-        }
-        todo.push(rel);
-    }
-    if todo.len() < 2 {
-        return HashMap::new();
-    }
-    let supports_mdtm = state.server_supports_mdtm;
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let results = std::sync::Mutex::new(HashMap::new());
-    std::thread::scope(|scope| {
-        for _ in 0..workers.min(todo.len()) {
-            scope.spawn(|| {
-                let Ok(mut ftp) = Ftp::connect(
-                    &cfg.connection.host,
-                    cfg.connection.port,
-                    &cfg.connection.user,
-                    &cfg.connection.password,
-                    cfg.connection.passive,
-                ) else {
-                    return;
-                };
-                let mut local = StateFile {
-                    files: records.clone(),
-                    server_supports_mdtm: supports_mdtm,
-                    ..StateFile::default()
-                };
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(rel) = todo.get(i) else { break };
-                    let remote_path = remote_join(&cfg.paths.remote_root, rel);
-                    for attempt in 0..2 {
-                        match remote_hash::compute(&mut ftp, &mut local, rel, &remote_path, true) {
-                            Ok(rh) => {
-                                if !rh.from_cache {
-                                    results.lock().unwrap().insert((*rel).clone(), rh);
-                                }
-                                break;
-                            }
-                            Err(_) if attempt == 0 => {
-                                if ftp.reconnect().is_err() {
-                                    return;
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                }
-            });
-        }
-    });
-    results.into_inner().unwrap_or_default()
 }
 
 /// Classify one target and pull it if appropriate. Returns `Ok(true)` when

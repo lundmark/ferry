@@ -10,6 +10,7 @@ use crate::commands::file_transfer::{
     TransferStatus, probe_remote_file,
 };
 use crate::commands::remote_hash;
+use crate::commands::remote_hash::RemoteHash;
 use crate::commands::sync::commit::{CommitDecision, CommitGate, UnconditionalCommitGate};
 use crate::commands::transfer_temp::fresh_remote_candidate;
 use crate::commands::walk::{
@@ -103,118 +104,57 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
 
     let mut had_conflict = false;
 
-    for rel in &targets {
-        // Refuse before classification. Deliberately not overridable by
-        // `--force`: that flag means "overwrite remote edits", never "write
-        // through a link to somewhere outside the remote root".
-        if remote_symlinks.contains(rel) {
-            eprintln!("refusing {rel}: the remote path is a symlink, not a file");
-            had_conflict = true;
-            continue;
-        }
+    let mut last_save = std::time::Instant::now();
 
-        let on_local = local_paths.contains(rel);
-        let on_remote = remote_paths.contains(rel);
-
-        if !on_local && !on_remote {
-            // Stale state entry or path that exists on neither side. Nothing
-            // to push.
-            eprintln!("skip (not on local or remote): {rel}");
-            continue;
-        }
-
-        // Read local bytes once (we need them for both hashing and upload),
-        // but only when there's actually a local file to consider.
-        let local_bytes = if on_local {
-            Some(
-                std::fs::read(local_root.join(rel))
-                    .with_context(|| format!("reading local {}", local_root.join(rel).display()))?,
-            )
-        } else {
-            None
-        };
-        let local_hash = local_bytes.as_deref().map(hash_bytes);
-
-        let remote_path = remote_join(&cfg.paths.remote_root, rel);
-        // Hash the remote, using the MDTM/SIZE fast path when possible.
-        // Push only needs the hash for classification — never the bytes —
-        // so request `want_bytes=false`.
-        let remote_hash = if on_remote {
-            Some(remote_hash::compute(&mut ftp, &mut state, rel, &remote_path, false)?.sha256)
-        } else {
-            None
-        };
-
-        let known = state.files.get(rel).map(|r| r.sha256.as_str());
-        let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
-
-        match st {
-            FileState::InSync => {
-                // Nothing to upload. Local matches remote.
-            }
-            FileState::RemoteOnly => {
-                // Push is one-way: don't delete the remote file just because
-                // the local mirror is missing it. The user can `rm` deliberately.
-            }
-            FileState::LocalOnly | FileState::LocalChanged => {
-                let bytes = local_bytes
-                    .as_deref()
-                    .expect("local_bytes set when on_local is true");
-                let new_hash = local_hash
-                    .as_deref()
-                    .expect("local_hash matches local_bytes");
-                upload_one(
-                    &mut ftp,
-                    &mut state,
-                    rel,
-                    &remote_path,
-                    bytes,
-                    new_hash,
-                    mode,
-                )?;
-                println!(
-                    "{} {rel}",
-                    if mode.is_dry_run() {
-                        "would push"
-                    } else {
-                        "pushed"
-                    }
-                );
-            }
-            FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
-                // Untracked = both sides have a file but no record of a prior sync.
-                // Design action matrix treats this as "as if both-changed": refuse
-                // without --force so the user makes an explicit choice.
-                if force {
-                    let bytes = local_bytes
-                        .as_deref()
-                        .expect("local_bytes set when on_local is true");
-                    let new_hash = local_hash
-                        .as_deref()
-                        .expect("local_hash matches local_bytes");
-                    if mode.is_dry_run() {
-                        eprintln!("would overwrite remote with local (--force): {rel}");
-                    } else {
-                        eprintln!("overwriting remote with local (--force): {rel}");
-                    }
-                    upload_one(
-                        &mut ftp,
-                        &mut state,
-                        rel,
-                        &remote_path,
-                        bytes,
-                        new_hash,
-                        mode,
-                    )?;
-                } else {
-                    eprintln!(
-                        "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
-                        st
-                    );
-                    had_conflict = true;
+    let workers = crate::ftp::parallel_workers();
+    for chunk in targets.chunks(remote_hash::PREFETCH_CHUNK) {
+    // Hash, in parallel, the remote files the listing cannot vouch for;
+    // classification and every upload below stay sequential and in order.
+    let mut prefetched = if workers > 1 {
+        remote_hash::prefetch(&ftp, &cfg, &state, &remote_paths, chunk, workers, false)
+    } else {
+        std::collections::HashMap::new()
+    };
+    for rel in chunk {
+        let mut pre = prefetched.remove(rel);
+        // A dropped or timed-out connection fails only the current file:
+        // reconnect and try it again, up to three attempts in all. Each
+        // attempt re-classifies first, so an upload that did land before the
+        // error is seen as in sync rather than pushed twice.
+        let mut attempt = 0;
+        let conflict = loop {
+            attempt += 1;
+            match push_target(
+                &mut ftp,
+                &mut state,
+                &local_root,
+                &cfg.paths.remote_root,
+                &local_paths,
+                &remote_paths,
+                &remote_symlinks,
+                rel,
+                force,
+                mode,
+                pre.take(),
+            ) {
+                Ok(conflict) => break conflict,
+                Err(e) if attempt < 3 => {
+                    eprintln!("retrying {rel} after error: {e:#}");
+                    ftp.reconnect()
+                        .with_context(|| format!("reconnecting after error on {rel}"))?;
                 }
+                Err(e) => return Err(e),
             }
+        };
+        had_conflict |= conflict;
+
+        // Persist progress every few seconds, so a run that is killed or
+        // fails part-way keeps the records of what it already pushed.
+        if mode.should_apply() && last_save.elapsed() >= std::time::Duration::from_secs(5) {
+            state.save(&state_path)?;
+            last_save = std::time::Instant::now();
         }
+    }
     }
 
     // Save state even if we hit a conflict — partial progress is still
@@ -238,6 +178,159 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
 
     Ok(())
 }
+
+/// Classify one target and push it if appropriate. Returns `Ok(true)` when
+/// the file is refused: a conflict that needs `--force`, or a remote symlink.
+#[allow(clippy::too_many_arguments)]
+fn push_target(
+    ftp: &mut Ftp,
+    state: &mut StateFile,
+    local_root: &Path,
+    remote_root: &str,
+    local_paths: &BTreeSet<String>,
+    remote_paths: &BTreeSet<String>,
+    remote_symlinks: &BTreeSet<String>,
+    rel: &String,
+    force: bool,
+    mode: ExecutionMode,
+    prefetched: Option<RemoteHash>,
+) -> Result<bool> {
+    // Refuse before classification. Deliberately not overridable by
+    // `--force`: that flag means "overwrite remote edits", never "write
+    // through a link to somewhere outside the remote root".
+    if remote_symlinks.contains(rel) {
+        eprintln!("refusing {rel}: the remote path is a symlink, not a file");
+        return Ok(true);
+    }
+
+    let on_local = local_paths.contains(rel);
+    let on_remote = remote_paths.contains(rel);
+
+    if !on_local && !on_remote {
+        // Stale state entry or path that exists on neither side. Nothing
+        // to push.
+        eprintln!("skip (not on local or remote): {rel}");
+        return Ok(false);
+    }
+
+    // Read local bytes once (we need them for both hashing and upload),
+    // but only when there's actually a local file to consider.
+    let local_bytes = if on_local {
+        Some(
+            std::fs::read(local_root.join(rel))
+                .with_context(|| format!("reading local {}", local_root.join(rel).display()))?,
+        )
+    } else {
+        None
+    };
+    let local_hash = local_bytes.as_deref().map(hash_bytes);
+
+    let remote_path = remote_join(remote_root, rel);
+    // Hash the remote, using the MDTM/SIZE fast path when possible.
+    // Push only needs the hash for classification — never the bytes —
+    // so request `want_bytes=false`.
+    let rh = if on_remote {
+        Some(match prefetched {
+            Some(rh) => rh,
+            None => remote_hash::compute(ftp, state, rel, &remote_path, false)?,
+        })
+    } else {
+        None
+    };
+    let remote_hash = rh.as_ref().map(|r| r.sha256.clone());
+
+    let known = state.files.get(rel).map(|r| r.sha256.as_str());
+    let st = classify(local_hash.as_deref(), remote_hash.as_deref(), known);
+
+    match st {
+        FileState::InSync => {
+            // Nothing to upload. Local matches remote. As in pull: note when
+            // the record was just confirmed, and refresh a stale record
+            // instead of re-checking the same file on every run.
+            if let Some(r) = rh.as_ref() {
+                if r.from_cache {
+                    if let Some(record) = state.files.get_mut(rel.as_str()) {
+                        record.last_synced = record.last_synced.max(Utc::now());
+                    }
+                } else if r.metadata_stable && mode.should_apply() {
+                    state.files.insert(
+                        rel.clone(),
+                        FileRecord {
+                            sha256: r.sha256.clone(),
+                            size: r.size,
+                            remote_mtime: r.mtime,
+                            last_synced: Utc::now(),
+                        },
+                    );
+                }
+            }
+        }
+        FileState::RemoteOnly => {
+            // Push is one-way: don't delete the remote file just because
+            // the local mirror is missing it. The user can `rm` deliberately.
+        }
+        FileState::LocalOnly | FileState::LocalChanged => {
+            let bytes = local_bytes
+                .as_deref()
+                .expect("local_bytes set when on_local is true");
+            let new_hash = local_hash
+                .as_deref()
+                .expect("local_hash matches local_bytes");
+            upload_one(
+                ftp,
+                state,
+                rel,
+                &remote_path,
+                bytes,
+                new_hash,
+                mode,
+            )?;
+            println!(
+                "{} {rel}",
+                if mode.is_dry_run() {
+                    "would push"
+                } else {
+                    "pushed"
+                }
+            );
+        }
+        FileState::RemoteChanged | FileState::BothChanged | FileState::Untracked => {
+            // Untracked = both sides have a file but no record of a prior sync.
+            // Design action matrix treats this as "as if both-changed": refuse
+            // without --force so the user makes an explicit choice.
+            if force {
+                let bytes = local_bytes
+                    .as_deref()
+                    .expect("local_bytes set when on_local is true");
+                let new_hash = local_hash
+                    .as_deref()
+                    .expect("local_hash matches local_bytes");
+                if mode.is_dry_run() {
+                    eprintln!("would overwrite remote with local (--force): {rel}");
+                } else {
+                    eprintln!("overwriting remote with local (--force): {rel}");
+                }
+                upload_one(
+                    ftp,
+                    state,
+                    rel,
+                    &remote_path,
+                    bytes,
+                    new_hash,
+                    mode,
+                )?;
+            } else {
+                eprintln!(
+                    "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
+                    st
+                );
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 
 /// Fast single-file push that bypasses the local + remote tree walks used by
 /// [`run`]. It returns structured data and leaves all reporting to its caller.

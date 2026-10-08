@@ -12,7 +12,10 @@
 //! fallback decision is cached in `state.server_supports_mdtm` so we don't
 //! re-probe every run.
 
+use crate::commands::walk::remote_join;
+use crate::config::Config;
 use crate::ftp::Ftp;
+use std::collections::{BTreeSet, HashMap};
 use crate::hash::hash_bytes;
 use crate::state::StateFile;
 use crate::state::FileRecord;
@@ -291,6 +294,93 @@ fn hash_download(
         bytes: if want_bytes { Some(bytes) } else { None },
         pre_download: None,
     }
+}
+
+/// Targets are prefetched and then pulled this many at a time, which bounds
+/// how many downloaded files are held in memory at once.
+pub(crate) const PREFETCH_CHUNK: usize = 200;
+
+
+/// Compute remote hashes (and, with `want_bytes`, fetch the bytes) for the
+/// remote files in `chunk` that the session listing cannot prove unchanged,
+/// using `workers` connections of their own. Shared by pull and push. Best effort: a file a worker fails on is simply absent from the
+/// result, and the sequential loop handles it the ordinary way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefetch(
+    ftp: &Ftp,
+    cfg: &Config,
+    state: &StateFile,
+    remote_paths: &BTreeSet<String>,
+    chunk: &[String],
+    workers: usize,
+    want_bytes: bool,
+) -> HashMap<String, RemoteHash> {
+    // Each worker gets a private state holding just the records it needs.
+    let mut records = std::collections::BTreeMap::new();
+    let mut todo: Vec<&String> = Vec::new();
+    for rel in chunk {
+        if !remote_paths.contains(rel) {
+            continue;
+        }
+        if let Some(known) = state.files.get(rel) {
+            // The main connection's listing already proves this one: the
+            // sequential loop settles it with no network traffic at all.
+            let remote_path = remote_join(&cfg.paths.remote_root, rel);
+            if let Some((size, mtime)) = ftp.listed_meta(&remote_path)
+                && listing_proves_unchanged(known, size, mtime)
+            {
+                continue;
+            }
+            records.insert(rel.clone(), known.clone());
+        }
+        todo.push(rel);
+    }
+    if todo.len() < 2 {
+        return HashMap::new();
+    }
+    let supports_mdtm = state.server_supports_mdtm;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(HashMap::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(todo.len()) {
+            scope.spawn(|| {
+                let Ok(mut ftp) = Ftp::connect(
+                    &cfg.connection.host,
+                    cfg.connection.port,
+                    &cfg.connection.user,
+                    &cfg.connection.password,
+                    cfg.connection.passive,
+                ) else {
+                    return;
+                };
+                let mut local = StateFile {
+                    files: records.clone(),
+                    server_supports_mdtm: supports_mdtm,
+                    ..StateFile::default()
+                };
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(rel) = todo.get(i) else { break };
+                    let remote_path = remote_join(&cfg.paths.remote_root, rel);
+                    for attempt in 0..2 {
+                        match compute(&mut ftp, &mut local, rel, &remote_path, want_bytes) {
+                            Ok(rh) => {
+                                results.lock().unwrap().insert((*rel).clone(), rh);
+                                break;
+                            }
+                            Err(_) if attempt == 0 => {
+                                if ftp.reconnect().is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_default()
 }
 
 #[cfg(test)]
