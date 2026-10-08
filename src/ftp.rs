@@ -98,6 +98,12 @@ pub trait Remote {
     /// symlinks to `out` and `symlinks` exactly as the sequential walk would.
     /// Directories it does not finish stay in `pending` for the caller. The
     /// default walks nothing, so fakes and plain remotes stay sequential.
+    /// Reopen the session after a failure, so the next request is not sent
+    /// down a connection that has died. Returns false when this remote
+    /// cannot (fakes) or the reconnect failed.
+    fn try_reconnect(&mut self) -> bool {
+        false
+    }
     /// A listing of `dir` that may come from earlier in the same session.
     /// Only for the single-leaf symlink probe, which would otherwise list a
     /// path argument's parent a second time. Defaults to a fresh listing.
@@ -143,6 +149,9 @@ impl Remote for Ftp {
     }
     fn list_dir_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
         self.list_reuse(dir)
+    }
+    fn try_reconnect(&mut self) -> bool {
+        self.reconnect().is_ok()
     }
     fn walk_dirs_parallel(
         &mut self,

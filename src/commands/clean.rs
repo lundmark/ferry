@@ -62,7 +62,14 @@ fn clean_dir(
     let mut pending = vec![dir.trim_end_matches('/').to_string()];
     let mut top = true;
     while let Some(current) = pending.pop() {
-        let entries = match ftp.list(if current.is_empty() { "/" } else { &current }) {
+        let target = if current.is_empty() { "/" } else { current.as_str() };
+        let mut listed = ftp.list(target);
+        // Retry once on a fresh session: a dead one would fail every
+        // directory after it (see walk.rs).
+        if listed.is_err() && ftp.reconnect().is_ok() {
+            listed = ftp.list(target);
+        }
+        let entries = match listed {
             Ok(entries) => entries,
             Err(e) if top => return Err(e),
             Err(e) => {

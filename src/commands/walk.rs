@@ -312,7 +312,15 @@ fn walk_remote_inner<R: Remote + ?Sized>(
     };
     ftp.walk_dirs_parallel(root, &mut pending, out, symlinks);
     while let Some((child_sub, child_dir)) = pending.pop() {
-        match walk_one_dir(ftp, root, &child_sub, &child_dir, out, symlinks, false) {
+        let mut listed = walk_one_dir(ftp, root, &child_sub, &child_dir, out, symlinks, false);
+        // A failure is often the session dying (a timeout, the server's idle
+        // close). Retry once on a fresh one; without this every directory
+        // after the failure was "skipped" on the dead connection, and push
+        // took their files for absent.
+        if listed.is_err() && ftp.try_reconnect() {
+            listed = walk_one_dir(ftp, root, &child_sub, &child_dir, out, symlinks, false);
+        }
+        match listed {
             Ok(more) => pending.extend(more),
             Err(e) => eprintln!("warning: skipping remote dir {child_dir}: {e:#}"),
         }
