@@ -36,6 +36,10 @@ enum Cmd {
         #[arg(long, default_value_t = 3600)]
         cooldown: i64,
     },
+    /// Keeps one FTP session logged in for `ferry hook` (started by the hook
+    /// itself; exits after 15 idle minutes).
+    #[command(hide = true)]
+    Hookd,
     /// Show per-file sync state vs remote.
     Status,
     /// Download remote -> local.
@@ -135,6 +139,7 @@ fn run() -> i32 {
         Cmd::Init { no_validate } => ferry::commands::init::run(&cfg, no_validate, mode),
         Cmd::Ls { path } => ferry::commands::ls::run(&cfg, path.as_deref()),
         Cmd::Hook { cooldown } => ferry::commands::hook::run(cooldown, mode),
+        Cmd::Hookd => ferry::commands::hookd::run(&cfg),
         Cmd::Status => ferry::commands::status::run(&cfg, mode),
         Cmd::Pull { paths, force } => ferry::commands::pull::run(&cfg, &paths, force, mode),
         Cmd::Push { paths, force } => ferry::commands::push::run(&cfg, &paths, force, mode),

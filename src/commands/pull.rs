@@ -9,7 +9,7 @@ mod prepared;
 
 pub use prepared::{
     LocalIdentity, PreparedPull, RemoteFile, apply_prepared_pull, apply_prepared_pull_if,
-    fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one,
+    fetch_remote_one, prepare_force_pull_one, prepare_pull_one, pull_one, pull_one_on,
 };
 
 use crate::commands::file_transfer::LocalPathExpectation;

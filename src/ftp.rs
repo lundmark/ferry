@@ -8,8 +8,15 @@ use suppaftp::FtpStream;
 
 /// How long a connect, read or write may stall before it fails. Without it a
 /// data connection the server drops can leave ferry waiting forever (the
-/// socket sits in CLOSE-WAIT). Override with `FERRY_TIMEOUT_SECS`.
-const DEFAULT_IO_TIMEOUT_SECS: u64 = 30;
+/// socket sits in CLOSE-WAIT). It limits each stall, not a whole transfer, so
+/// a slow but moving download is unaffected. Override with
+/// `FERRY_TIMEOUT_SECS`.
+const DEFAULT_IO_TIMEOUT_SECS: u64 = 15;
+
+/// Pauses between reconnect attempts after a failure. A refused login (the
+/// server's per-host connection cap, a restart) is usually gone within
+/// seconds; retrying turns it into a short wait instead of a failed run.
+const RECONNECT_BACKOFF_SECS: [u64; 2] = [1, 3];
 
 fn io_timeout() -> Duration {
     let secs = std::env::var("FERRY_TIMEOUT_SECS")
@@ -184,7 +191,15 @@ impl Ftp {
         self.known_dirs.clear();
         self.recent_lists.clear();
         let _ = self.inner.quit();
-        self.inner = Self::open(&self.params)?;
+        let mut result = Self::open(&self.params);
+        for pause in RECONNECT_BACKOFF_SECS {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(pause));
+            result = Self::open(&self.params);
+        }
+        self.inner = result?;
         Ok(())
     }
 
@@ -237,6 +252,22 @@ impl Ftp {
             suppaftp::Mode::Active
         });
         Ok(s)
+    }
+
+    /// Keep an idle session alive (and find out whether it still is).
+    pub fn noop(&mut self) -> Result<()> {
+        self.inner.noop().context("ftp noop")?;
+        Ok(())
+    }
+
+    /// Forget everything remembered from earlier listings. For a session that
+    /// outlives one command (the hook helper): a listing from minutes ago
+    /// must not vouch for a file now.
+    pub fn forget_session_caches(&mut self) {
+        self.listed.clear();
+        self.known_dirs.clear();
+        self.recent_lists.clear();
+        self.symlink_targets.clear();
     }
 
     /// Size and modification time of `path` as the last LIST of its parent
