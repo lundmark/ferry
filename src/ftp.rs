@@ -2,10 +2,42 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::Duration;
 use suppaftp::FtpStream;
+
+/// How long a connect, read or write may stall before it fails. Without it a
+/// data connection the server drops can leave ferry waiting forever (the
+/// socket sits in CLOSE-WAIT). Override with `FERRY_TIMEOUT_SECS`.
+const DEFAULT_IO_TIMEOUT_SECS: u64 = 30;
+
+fn io_timeout() -> Duration {
+    let secs = std::env::var("FERRY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_IO_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Everything needed to open the session again after a transport failure.
+#[derive(Clone)]
+struct ConnectParams {
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+    passive: bool,
+}
 
 pub struct Ftp {
     inner: FtpStream,
+    params: ConnectParams,
+    // Size and modification time of every plain file seen in a LIST during
+    // this session, keyed by full remote path. Lets the hash step skip the
+    // per-file MDTM/SIZE round trips when the listing already proves a file
+    // unchanged (see `remote_hash::listing_proves_unchanged`).
+    listed: HashMap<String, (u64, DateTime<Utc>)>,
     // Explicit pull arguments may ask about several files in one directory.
     // A symlink check only needs the parent LIST, so retain the result for the
     // lifetime of this command and avoid repeating the same network round-trip.
@@ -72,11 +104,71 @@ impl StrictRemote for Ftp {
 
 impl Ftp {
     pub fn connect(host: &str, port: u16, user: &str, pass: &str, passive: bool) -> Result<Self> {
+        let params = ConnectParams {
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            pass: pass.to_string(),
+            passive,
+        };
+        let inner = Self::open(&params)?;
+        Ok(Self {
+            inner,
+            params,
+            listed: HashMap::new(),
+            symlink_targets: HashMap::new(),
+        })
+    }
+
+    /// Drop the current session and log in again with the same settings.
+    /// Used to recover from a timed-out or broken connection; the listing
+    /// and symlink caches stay valid because they describe the server, not
+    /// the session.
+    pub fn reconnect(&mut self) -> Result<()> {
+        let _ = self.inner.quit();
+        self.inner = Self::open(&self.params)?;
+        Ok(())
+    }
+
+    fn open(params: &ConnectParams) -> Result<FtpStream> {
+        let ConnectParams {
+            host,
+            port,
+            user,
+            pass,
+            passive,
+        } = params;
+        let (host, port, passive) = (host.as_str(), *port, *passive);
+        let timeout = io_timeout();
         // Connect + login failures become `Exit::Auth` so the process exits 3
         // (config/auth) rather than 1. The underlying suppaftp message is
         // preserved in the payload so the user still sees the real cause.
-        let mut s = FtpStream::connect((host, port))
+        let addr: SocketAddr = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| crate::error::Exit::Auth(format!("ftp connect {host}:{port}: {e}")))?
+            .next()
+            .ok_or_else(|| {
+                crate::error::Exit::Auth(format!("ftp connect {host}:{port}: no address"))
+            })?;
+        let s = FtpStream::connect_timeout(addr, timeout)
             .map_err(|e| crate::error::Exit::Auth(format!("ftp connect {host}:{port}: {e}")))?;
+        s.get_ref()
+            .set_read_timeout(Some(timeout))
+            .context("ftp set control read timeout")?;
+        s.get_ref()
+            .set_write_timeout(Some(timeout))
+            .context("ftp set control write timeout")?;
+        // Data connections (LIST/RETR/STOR) get the same limits, so a transfer
+        // the server abandons fails instead of hanging.
+        let mut s = s.passive_stream_builder(move |addr| {
+            let data = TcpStream::connect_timeout(&addr, timeout)
+                .map_err(suppaftp::FtpError::ConnectionError)?;
+            data.set_read_timeout(Some(timeout))
+                .map_err(suppaftp::FtpError::ConnectionError)?;
+            data.set_write_timeout(Some(timeout))
+                .map_err(suppaftp::FtpError::ConnectionError)?;
+            Ok(data)
+        });
         s.login(user, pass)
             .map_err(|e| crate::error::Exit::Auth(format!("ftp login as {user}: {e}")))?;
         s.transfer_type(suppaftp::types::FileType::Binary)
@@ -86,10 +178,24 @@ impl Ftp {
         } else {
             suppaftp::Mode::Active
         });
-        Ok(Self {
-            inner: s,
-            symlink_targets: HashMap::new(),
-        })
+        Ok(s)
+    }
+
+    /// Size and modification time of `path` as the last LIST of its parent
+    /// directory reported them, if this session listed it.
+    pub fn listed_meta(&self, path: &str) -> Option<(u64, DateTime<Utc>)> {
+        self.listed.get(path.trim_end_matches('/')).copied()
+    }
+
+    fn remember_listing(&mut self, dir: &str, entries: &[Entry]) {
+        let dir = dir.trim_end_matches('/');
+        for entry in entries {
+            if entry.is_dir || entry.is_symlink || entry.name.contains('/') {
+                continue;
+            }
+            self.listed
+                .insert(format!("{dir}/{}", entry.name), (entry.size, entry.modified));
+        }
     }
 
     /// Raw LIST response for `dir`, including dotfiles: the 3k FTP server
@@ -111,7 +217,9 @@ impl Ftp {
 
     pub fn list(&mut self, dir: &str) -> Result<Vec<Entry>> {
         let lines = self.list_lines(dir)?;
-        Ok(parse_listing_tolerant(&lines))
+        let entries = parse_listing_tolerant(&lines);
+        self.remember_listing(dir, &entries);
+        Ok(entries)
     }
 
     pub fn list_strict(&mut self, dir: &str) -> Result<Vec<Entry>> {
@@ -119,7 +227,9 @@ impl Ftp {
             .list_lines(dir)
             .map_err(|error| strict_list_transport_error(dir, error))?;
 
-        parse_listing_strict(dir, &lines)
+        let entries = parse_listing_strict(dir, &lines)?;
+        self.remember_listing(dir, &entries);
+        Ok(entries)
     }
 
     /// Resolve a symlink leaf from one parent LIST response. This is used only

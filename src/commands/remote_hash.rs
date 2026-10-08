@@ -15,13 +15,19 @@
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
 use crate::state::StateFile;
+use crate::state::FileRecord;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 
 pub(crate) trait RemoteFileRetrieval {
     fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>>;
     fn size(&mut self, remote_path: &str) -> Result<u64>;
     fn download(&mut self, remote_path: &str) -> Result<Vec<u8>>;
+    /// Size and mtime from a directory listing already fetched this session,
+    /// if any. Fakes and other remotes without a listing cache keep `None`.
+    fn listed(&self, _remote_path: &str) -> Option<(u64, DateTime<Utc>)> {
+        None
+    }
 }
 
 impl RemoteFileRetrieval for Ftp {
@@ -36,6 +42,44 @@ impl RemoteFileRetrieval for Ftp {
     fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
         Ftp::download(self, remote_path)
     }
+
+    fn listed(&self, remote_path: &str) -> Option<(u64, DateTime<Utc>)> {
+        self.listed_meta(remote_path)
+    }
+}
+
+/// True when a LIST entry alone proves the remote file is the one `known`
+/// recorded, so the MDTM/SIZE round trips can be skipped.
+///
+/// LIST is coarser than MDTM: recent files show HH:MM, older ones only a
+/// date (parsed as midnight). So the listing time names a period, a minute or
+/// a whole day, and the entry is trusted only when:
+/// - the size matches the record;
+/// - the recorded MDTM falls inside that same period;
+/// - the record was last verified after the period ended, so no later edit
+///   inside the period could be hiding behind an identical size and time.
+///
+/// A midnight time is read as date-only: stricter for the rare recent file
+/// saved at exactly 00:00, never looser. Anything else falls back to MDTM.
+pub(crate) fn listing_proves_unchanged(
+    known: &FileRecord,
+    listed_size: u64,
+    listed_mtime: DateTime<Utc>,
+) -> bool {
+    let date_only = listed_mtime.hour() == 0 && listed_mtime.minute() == 0;
+    let period = if date_only {
+        Duration::days(1)
+    } else {
+        Duration::minutes(1)
+    };
+    let Some(start) = listed_mtime.with_second(0).and_then(|t| t.with_nanosecond(0)) else {
+        return false;
+    };
+    let end = start + period;
+    listed_size == known.size
+        && known.remote_mtime >= start
+        && known.remote_mtime < end
+        && known.last_synced >= end
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +136,27 @@ pub(crate) fn compute_with<R: RemoteFileRetrieval>(
     remote_path: &str,
     want_bytes: bool,
 ) -> Result<RemoteHash> {
+    // Listing fast path: no round trips at all when this session's LIST
+    // already proves the file unchanged since the recorded sync.
+    if let Some(known) = state.files.get(rel)
+        && let Some((listed_size, listed_mtime)) = remote.listed(remote_path)
+        && listing_proves_unchanged(known, listed_size, listed_mtime)
+    {
+        let observed = RemoteMetadata {
+            mtime: known.remote_mtime,
+            size: Some(known.size),
+        };
+        return Ok(RemoteHash {
+            sha256: known.sha256.clone(),
+            size: known.size,
+            mtime: known.remote_mtime,
+            from_cache: true,
+            metadata_stable: true,
+            bytes: None,
+            pre_download: Some(observed),
+        });
+    }
+
     let pre_download = if state.server_supports_mdtm.unwrap_or(true) {
         match remote.mtime(remote_path) {
             Ok(mtime) => {
@@ -230,6 +295,67 @@ fn hash_download(
 
 #[cfg(test)]
 mod tests {
+    mod listing_fast_path {
+        use super::super::listing_proves_unchanged;
+        use crate::state::FileRecord;
+        use chrono::{DateTime, TimeZone, Utc};
+
+        fn at(h: u32, m: u32, sec: u32) -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 10, 8, h, m, sec).unwrap()
+        }
+
+        fn rec(mtime: DateTime<Utc>, synced: DateTime<Utc>) -> FileRecord {
+            FileRecord {
+                sha256: "x".into(),
+                size: 100,
+                remote_mtime: mtime,
+                last_synced: synced,
+            }
+        }
+
+        #[test]
+        fn same_minute_same_size_synced_after_the_minute_is_trusted() {
+            let r = rec(at(11, 30, 48), at(11, 35, 0));
+            assert!(listing_proves_unchanged(&r, 100, at(11, 30, 0)));
+        }
+
+        #[test]
+        fn size_change_is_not_trusted() {
+            let r = rec(at(11, 30, 48), at(11, 35, 0));
+            assert!(!listing_proves_unchanged(&r, 101, at(11, 30, 0)));
+        }
+
+        #[test]
+        fn different_minute_is_not_trusted() {
+            let r = rec(at(11, 30, 48), at(11, 35, 0));
+            assert!(!listing_proves_unchanged(&r, 100, at(11, 31, 0)));
+        }
+
+        #[test]
+        fn date_only_listing_needs_verification_after_that_day() {
+            let day = Utc.with_ymd_and_hms(2004, 5, 24, 0, 0, 0).unwrap();
+            let mtime = Utc.with_ymd_and_hms(2004, 5, 24, 17, 44, 31).unwrap();
+            let same_day = Utc.with_ymd_and_hms(2004, 5, 24, 20, 0, 0).unwrap();
+            let later = Utc.with_ymd_and_hms(2026, 10, 8, 9, 0, 0).unwrap();
+            assert!(listing_proves_unchanged(&rec(mtime, later), 100, day));
+            assert!(!listing_proves_unchanged(&rec(mtime, same_day), 100, day));
+        }
+
+        #[test]
+        fn recorded_mtime_outside_the_listed_day_is_not_trusted() {
+            let day = Utc.with_ymd_and_hms(2004, 5, 24, 0, 0, 0).unwrap();
+            let mtime = Utc.with_ymd_and_hms(2004, 5, 25, 1, 0, 0).unwrap();
+            assert!(!listing_proves_unchanged(&rec(mtime, at(9, 0, 0)), 100, day));
+        }
+
+        #[test]
+        fn sync_inside_the_same_minute_is_not_trusted() {
+            // A second same-size edit later in 11:30 would look identical.
+            let r = rec(at(11, 30, 10), at(11, 30, 40));
+            assert!(!listing_proves_unchanged(&r, 100, at(11, 30, 0)));
+        }
+    }
+
     use super::*;
     use crate::state::FileRecord;
     use chrono::TimeZone;
