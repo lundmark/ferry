@@ -107,54 +107,64 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     let mut last_save = std::time::Instant::now();
 
     let workers = crate::ftp::parallel_workers();
+    let mut pool: Vec<Option<Ftp>> = Vec::new();
     for chunk in targets.chunks(remote_hash::PREFETCH_CHUNK) {
-    // Hash, in parallel, the remote files the listing cannot vouch for;
-    // classification and every upload below stay sequential and in order.
-    let mut prefetched = if workers > 1 {
-        remote_hash::prefetch(&ftp, &cfg, &state, &remote_paths, chunk, workers, false)
-    } else {
-        std::collections::HashMap::new()
-    };
-    for rel in chunk {
-        let mut pre = prefetched.remove(rel);
-        // A dropped or timed-out connection fails only the current file:
-        // reconnect and try it again, up to three attempts in all. Each
-        // attempt re-classifies first, so an upload that did land before the
-        // error is seen as in sync rather than pushed twice.
-        let mut attempt = 0;
-        let conflict = loop {
-            attempt += 1;
-            match push_target(
-                &mut ftp,
-                &mut state,
-                &local_root,
-                &cfg.paths.remote_root,
-                &local_paths,
+        // Hash, in parallel, the remote files the listing cannot vouch for;
+        // classification and every upload below stay sequential and in order.
+        let mut prefetched = if workers > 1 {
+            remote_hash::prefetch(
+                &ftp,
+                &cfg,
+                &state,
                 &remote_paths,
-                &remote_symlinks,
-                rel,
-                force,
-                mode,
-                pre.take(),
-            ) {
-                Ok(conflict) => break conflict,
-                Err(e) if attempt < 3 => {
-                    eprintln!("retrying {rel} after error: {e:#}");
-                    ftp.reconnect()
-                        .with_context(|| format!("reconnecting after error on {rel}"))?;
-                }
-                Err(e) => return Err(e),
-            }
+                chunk,
+                workers,
+                false,
+                &mut pool,
+            )
+        } else {
+            std::collections::HashMap::new()
         };
-        had_conflict |= conflict;
+        for rel in chunk {
+            let mut pre = prefetched.remove(rel);
+            // A dropped or timed-out connection fails only the current file:
+            // reconnect and try it again, up to three attempts in all. Each
+            // attempt re-classifies first, so an upload that did land before the
+            // error is seen as in sync rather than pushed twice.
+            let mut attempt = 0;
+            let conflict = loop {
+                attempt += 1;
+                match push_target(
+                    &mut ftp,
+                    &mut state,
+                    &local_root,
+                    &cfg.paths.remote_root,
+                    &local_paths,
+                    &remote_paths,
+                    &remote_symlinks,
+                    rel,
+                    force,
+                    mode,
+                    pre.take(),
+                ) {
+                    Ok(conflict) => break conflict,
+                    Err(e) if attempt < 3 => {
+                        eprintln!("retrying {rel} after error: {e:#}");
+                        ftp.reconnect()
+                            .with_context(|| format!("reconnecting after error on {rel}"))?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            had_conflict |= conflict;
 
-        // Persist progress every few seconds, so a run that is killed or
-        // fails part-way keeps the records of what it already pushed.
-        if mode.should_apply() && last_save.elapsed() >= std::time::Duration::from_secs(5) {
-            state.save(&state_path)?;
-            last_save = std::time::Instant::now();
+            // Persist progress every few seconds, so a run that is killed or
+            // fails part-way keeps the records of what it already pushed.
+            if mode.should_apply() && last_save.elapsed() >= std::time::Duration::from_secs(5) {
+                state.save(&state_path)?;
+                last_save = std::time::Instant::now();
+            }
         }
-    }
     }
 
     // Save state even if we hit a conflict — partial progress is still
@@ -276,15 +286,7 @@ fn push_target(
             let new_hash = local_hash
                 .as_deref()
                 .expect("local_hash matches local_bytes");
-            upload_one(
-                ftp,
-                state,
-                rel,
-                &remote_path,
-                bytes,
-                new_hash,
-                mode,
-            )?;
+            upload_one(ftp, state, rel, &remote_path, bytes, new_hash, mode)?;
             println!(
                 "{} {rel}",
                 if mode.is_dry_run() {
@@ -310,15 +312,7 @@ fn push_target(
                 } else {
                     eprintln!("overwriting remote with local (--force): {rel}");
                 }
-                upload_one(
-                    ftp,
-                    state,
-                    rel,
-                    &remote_path,
-                    bytes,
-                    new_hash,
-                    mode,
-                )?;
+                upload_one(ftp, state, rel, &remote_path, bytes, new_hash, mode)?;
             } else {
                 eprintln!(
                     "conflict ({:?}, would overwrite remote edits): {rel} — pass --force to override",
@@ -330,7 +324,6 @@ fn push_target(
     }
     Ok(false)
 }
-
 
 /// Fast single-file push that bypasses the local + remote tree walks used by
 /// [`run`]. It returns structured data and leaves all reporting to its caller.
@@ -821,7 +814,14 @@ fn ensure_remote_parents(ftp: &mut Ftp, remote_path: &str) -> Result<()> {
             acc.push('/');
         }
         acc.push_str(seg);
+        // Each MKD of an existing directory fails and is then confirmed with
+        // a listing of its parent: skip both for directories this session
+        // already knows exist.
+        if ftp.dir_known(&acc) {
+            continue;
+        }
         ftp.mkdir(&acc)?;
+        ftp.note_dir(&acc);
     }
     Ok(())
 }

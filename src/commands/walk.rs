@@ -195,7 +195,7 @@ pub fn leaf_is_symlink<R: Remote + ?Sized>(ftp: &mut R, root: &str, dir: &str) -
         return None;
     }
     let parent = if parent.is_empty() { "/" } else { parent };
-    let entries = ftp.list_dir(parent).ok()?;
+    let entries = ftp.list_dir_reuse(parent).ok()?;
     for entry in entries {
         if child_name(root, parent, &entry.name) == Some(leaf) {
             return Some(entry.is_symlink);

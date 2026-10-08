@@ -15,12 +15,12 @@
 use crate::commands::walk::remote_join;
 use crate::config::Config;
 use crate::ftp::Ftp;
-use std::collections::{BTreeSet, HashMap};
 use crate::hash::hash_bytes;
-use crate::state::StateFile;
 use crate::state::FileRecord;
+use crate::state::StateFile;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Timelike, Utc};
+use std::collections::{BTreeSet, HashMap};
 
 pub(crate) trait RemoteFileRetrieval {
     fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>>;
@@ -75,7 +75,10 @@ pub(crate) fn listing_proves_unchanged(
     } else {
         Duration::minutes(1)
     };
-    let Some(start) = listed_mtime.with_second(0).and_then(|t| t.with_nanosecond(0)) else {
+    let Some(start) = listed_mtime
+        .with_second(0)
+        .and_then(|t| t.with_nanosecond(0))
+    else {
         return false;
     };
     let end = start + period;
@@ -300,7 +303,6 @@ fn hash_download(
 /// how many downloaded files are held in memory at once.
 pub(crate) const PREFETCH_CHUNK: usize = 200;
 
-
 /// Compute remote hashes (and, with `want_bytes`, fetch the bytes) for the
 /// remote files in `chunk` that the session listing cannot prove unchanged,
 /// using `workers` connections of their own. Shared by pull and push. Best effort: a file a worker fails on is simply absent from the
@@ -314,6 +316,7 @@ pub(crate) fn prefetch(
     chunk: &[String],
     workers: usize,
     want_bytes: bool,
+    pool: &mut Vec<Option<Ftp>>,
 ) -> HashMap<String, RemoteHash> {
     // Each worker gets a private state holding just the records it needs.
     let mut records = std::collections::BTreeMap::new();
@@ -341,45 +344,58 @@ pub(crate) fn prefetch(
     let supports_mdtm = state.server_supports_mdtm;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(HashMap::new());
-    std::thread::scope(|scope| {
-        for _ in 0..workers.min(todo.len()) {
-            scope.spawn(|| {
-                let Ok(mut ftp) = Ftp::connect(
-                    &cfg.connection.host,
-                    cfg.connection.port,
-                    &cfg.connection.user,
-                    &cfg.connection.password,
-                    cfg.connection.passive,
-                ) else {
-                    return;
-                };
-                let mut local = StateFile {
-                    files: records.clone(),
-                    server_supports_mdtm: supports_mdtm,
-                    ..StateFile::default()
-                };
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(rel) = todo.get(i) else { break };
-                    let remote_path = remote_join(&cfg.paths.remote_root, rel);
-                    for attempt in 0..2 {
-                        match compute(&mut ftp, &mut local, rel, &remote_path, want_bytes) {
-                            Ok(rh) => {
-                                results.lock().unwrap().insert((*rel).clone(), rh);
-                                break;
-                            }
-                            Err(_) if attempt == 0 => {
-                                if ftp.reconnect().is_err() {
-                                    return;
+    // Worker connections live in `pool` and are reused by later chunks; a
+    // slot is (re)connected only when empty.
+    let wanted = workers.min(todo.len());
+    while pool.len() < wanted {
+        pool.push(None);
+    }
+    {
+        let (records, todo, next, results) = (&records, &todo, &next, &results);
+        std::thread::scope(|scope| {
+            for slot in pool.iter_mut().take(wanted) {
+                scope.spawn(move || {
+                    if slot.is_none() {
+                        *slot = Ftp::connect(
+                            &cfg.connection.host,
+                            cfg.connection.port,
+                            &cfg.connection.user,
+                            &cfg.connection.password,
+                            cfg.connection.passive,
+                        )
+                        .ok();
+                    }
+                    let Some(ftp) = slot.as_mut() else {
+                        return;
+                    };
+                    let mut local = StateFile {
+                        files: records.clone(),
+                        server_supports_mdtm: supports_mdtm,
+                        ..StateFile::default()
+                    };
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(rel) = todo.get(i) else { break };
+                        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+                        for attempt in 0..2 {
+                            match compute(ftp, &mut local, rel, &remote_path, want_bytes) {
+                                Ok(rh) => {
+                                    results.lock().unwrap().insert((*rel).clone(), rh);
+                                    break;
                                 }
+                                Err(_) if attempt == 0 => {
+                                    if ftp.reconnect().is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
                     }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
+    }
     results.into_inner().unwrap_or_default()
 }
 
@@ -435,7 +451,11 @@ mod tests {
         fn recorded_mtime_outside_the_listed_day_is_not_trusted() {
             let day = Utc.with_ymd_and_hms(2004, 5, 24, 0, 0, 0).unwrap();
             let mtime = Utc.with_ymd_and_hms(2004, 5, 25, 1, 0, 0).unwrap();
-            assert!(!listing_proves_unchanged(&rec(mtime, at(9, 0, 0)), 100, day));
+            assert!(!listing_proves_unchanged(
+                &rec(mtime, at(9, 0, 0)),
+                100,
+                day
+            ));
         }
 
         #[test]

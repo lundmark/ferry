@@ -190,52 +190,62 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
     let mut last_save = std::time::Instant::now();
 
     let workers = crate::ftp::parallel_workers();
+    let mut pool: Vec<Option<Ftp>> = Vec::new();
     for chunk in targets.chunks(remote_hash::PREFETCH_CHUNK) {
-    // Fetch and hash, in parallel, the files the listing cannot vouch for;
-    // classification and local writes below stay sequential and in order.
-    let mut prefetched = if workers > 1 {
-        remote_hash::prefetch(&ftp, &cfg, &state, &remote_paths, chunk, workers, true)
-    } else {
-        HashMap::new()
-    };
-    for rel in chunk {
-        let mut pre = prefetched.remove(rel);
-        // A dropped or timed-out connection fails only the current file:
-        // reconnect and try it again, up to three attempts in all.
-        let mut attempt = 0;
-        let conflict = loop {
-            attempt += 1;
-            match pull_target(
-                &mut ftp,
-                &mut state,
-                &local_root,
-                &cfg.paths.remote_root,
-                &local_paths,
+        // Fetch and hash, in parallel, the files the listing cannot vouch for;
+        // classification and local writes below stay sequential and in order.
+        let mut prefetched = if workers > 1 {
+            remote_hash::prefetch(
+                &ftp,
+                &cfg,
+                &state,
                 &remote_paths,
-                rel,
-                force,
-                mode,
-                pre.take(),
-            ) {
-                Ok(conflict) => break conflict,
-                Err(e) if attempt < 3 => {
-                    eprintln!("retrying {rel} after error: {e:#}");
-                    ftp.reconnect()
-                        .with_context(|| format!("reconnecting after error on {rel}"))?;
-                }
-                Err(e) => return Err(e),
-            }
+                chunk,
+                workers,
+                true,
+                &mut pool,
+            )
+        } else {
+            HashMap::new()
         };
-        had_conflict |= conflict;
+        for rel in chunk {
+            let mut pre = prefetched.remove(rel);
+            // A dropped or timed-out connection fails only the current file:
+            // reconnect and try it again, up to three attempts in all.
+            let mut attempt = 0;
+            let conflict = loop {
+                attempt += 1;
+                match pull_target(
+                    &mut ftp,
+                    &mut state,
+                    &local_root,
+                    &cfg.paths.remote_root,
+                    &local_paths,
+                    &remote_paths,
+                    rel,
+                    force,
+                    mode,
+                    pre.take(),
+                ) {
+                    Ok(conflict) => break conflict,
+                    Err(e) if attempt < 3 => {
+                        eprintln!("retrying {rel} after error: {e:#}");
+                        ftp.reconnect()
+                            .with_context(|| format!("reconnecting after error on {rel}"))?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            had_conflict |= conflict;
 
-        // Persist progress every few seconds, so a run that is killed or
-        // fails part-way keeps the records of what it already pulled instead
-        // of leaving those files looking untracked to the next run.
-        if mode.should_apply() && last_save.elapsed() >= std::time::Duration::from_secs(5) {
-            state.save(&state_path)?;
-            last_save = std::time::Instant::now();
+            // Persist progress every few seconds, so a run that is killed or
+            // fails part-way keeps the records of what it already pulled instead
+            // of leaving those files looking untracked to the next run.
+            if mode.should_apply() && last_save.elapsed() >= std::time::Duration::from_secs(5) {
+                state.save(&state_path)?;
+                last_save = std::time::Instant::now();
+            }
         }
-    }
     }
 
     // Save state even if we hit a conflict — partial progress is still

@@ -38,6 +38,14 @@ pub struct Ftp {
     // per-file MDTM/SIZE round trips when the listing already proves a file
     // unchanged (see `remote_hash::listing_proves_unchanged`).
     listed: HashMap<String, (u64, DateTime<Utc>)>,
+    // Directories this session has seen exist (listed, or seen as a
+    // directory entry in a listing, or created). Lets uploads skip the
+    // MKD-and-confirm round trips for parents that are already there.
+    known_dirs: std::collections::HashSet<String>,
+    // The most recent listing of each directory this session, reused only by
+    // the single-leaf symlink probe (`Remote::list_dir_reuse`) so one path
+    // argument does not list its parent twice.
+    recent_lists: HashMap<String, Vec<Entry>>,
     // Explicit pull arguments may ask about several files in one directory.
     // A symlink check only needs the parent LIST, so retain the result for the
     // lifetime of this command and avoid repeating the same network round-trip.
@@ -83,6 +91,12 @@ pub trait Remote {
     /// symlinks to `out` and `symlinks` exactly as the sequential walk would.
     /// Directories it does not finish stay in `pending` for the caller. The
     /// default walks nothing, so fakes and plain remotes stay sequential.
+    /// A listing of `dir` that may come from earlier in the same session.
+    /// Only for the single-leaf symlink probe, which would otherwise list a
+    /// path argument's parent a second time. Defaults to a fresh listing.
+    fn list_dir_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list_dir(dir)
+    }
     fn walk_dirs_parallel(
         &mut self,
         _root: &str,
@@ -118,6 +132,9 @@ impl Remote for Ftp {
     fn exact_file_presence(&mut self, path: &str) -> Result<ExactFilePresence> {
         self.exact_file_presence(path)
     }
+    fn list_dir_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        self.list_reuse(dir)
+    }
     fn walk_dirs_parallel(
         &mut self,
         root: &str,
@@ -149,6 +166,8 @@ impl Ftp {
             inner,
             params,
             listed: HashMap::new(),
+            known_dirs: std::collections::HashSet::new(),
+            recent_lists: HashMap::new(),
             symlink_targets: HashMap::new(),
         })
     }
@@ -158,6 +177,10 @@ impl Ftp {
     /// and symlink caches stay valid because they describe the server, not
     /// the session.
     pub fn reconnect(&mut self) -> Result<()> {
+        // After a failure, trust nothing remembered about directories: the
+        // retry re-checks parents and re-lists, exactly as a fresh run would.
+        self.known_dirs.clear();
+        self.recent_lists.clear();
         let _ = self.inner.quit();
         self.inner = Self::open(&self.params)?;
         Ok(())
@@ -221,14 +244,44 @@ impl Ftp {
     }
 
     fn remember_listing(&mut self, dir: &str, entries: &[Entry]) {
+        let key = dir_key(dir);
         let dir = dir.trim_end_matches('/');
+        self.known_dirs.insert(key.clone());
         for entry in entries {
-            if entry.is_dir || entry.is_symlink || entry.name.contains('/') {
+            if entry.is_symlink || entry.name.contains('/') {
                 continue;
             }
-            self.listed
-                .insert(format!("{dir}/{}", entry.name), (entry.size, entry.modified));
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            if entry.is_dir {
+                self.known_dirs.insert(format!("{dir}/{}", entry.name));
+                continue;
+            }
+            self.listed.insert(
+                format!("{dir}/{}", entry.name),
+                (entry.size, entry.modified),
+            );
         }
+        self.recent_lists.insert(key, entries.to_vec());
+    }
+
+    /// True when this session has seen `path` exist as a directory.
+    pub fn dir_known(&self, path: &str) -> bool {
+        self.known_dirs.contains(&dir_key(path))
+    }
+
+    /// Record that `path` exists as a directory (e.g. just created).
+    pub fn note_dir(&mut self, path: &str) {
+        self.known_dirs.insert(dir_key(path));
+    }
+
+    /// The listing of `dir` from earlier in this session, or a fresh one.
+    pub fn list_reuse(&mut self, dir: &str) -> Result<Vec<Entry>> {
+        if let Some(entries) = self.recent_lists.get(&dir_key(dir)) {
+            return Ok(entries.clone());
+        }
+        self.list(dir)
     }
 
     /// Raw LIST response for `dir`, including dotfiles: the 3k FTP server
@@ -276,6 +329,8 @@ impl Ftp {
         let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("/", trimmed));
         let parent = if parent.is_empty() { "/" } else { parent };
         let lines = self.list_lines(parent)?;
+        let entries = parse_listing_tolerant(&lines);
+        self.remember_listing(parent, &entries);
         let target = lines.into_iter().find_map(|line| {
             let file = match suppaftp::list::File::from_posix_line(&line) {
                 Ok(file) => file,
@@ -348,10 +403,11 @@ impl Ftp {
                 .filter_map(|h| h.join().ok().flatten())
                 .collect::<Vec<_>>()
         });
-        for (worker_out, worker_syms, listed) in results {
+        for (worker_out, worker_syms, listed, dirs) in results {
             out.extend(worker_out);
             symlinks.extend(worker_syms);
             self.listed.extend(listed);
+            self.known_dirs.extend(dirs);
         }
         // Anything no worker got to (all failed to connect) goes back.
         if let Ok(q) = queue.into_inner() {
@@ -364,6 +420,7 @@ type WalkResult = (
     std::collections::BTreeSet<String>,
     std::collections::BTreeSet<String>,
     HashMap<String, (u64, DateTime<Utc>)>,
+    std::collections::HashSet<String>,
 );
 
 /// One parallel walk session: take directories off the queue, list them,
@@ -378,6 +435,8 @@ fn walk_worker(
         inner: Ftp::open(params).ok()?,
         params: params.clone(),
         listed: HashMap::new(),
+        known_dirs: std::collections::HashSet::new(),
+        recent_lists: HashMap::new(),
         symlink_targets: HashMap::new(),
     };
     let mut out = std::collections::BTreeSet::new();
@@ -419,7 +478,7 @@ fn walk_worker(
     }
     // Wake any worker still waiting so it can see the walk is finished.
     wake.notify_all();
-    Some((out, syms, ftp.listed))
+    Some((out, syms, ftp.listed, ftp.known_dirs))
 }
 
 fn strict_list_transport_error(dir: &str, _error: anyhow::Error) -> anyhow::Error {
@@ -536,6 +595,17 @@ fn entry_from_posix_file(file: &suppaftp::list::File) -> Entry {
         is_symlink: file.is_symlink(),
         size: u64::try_from(file.size()).unwrap_or(0),
         modified: DateTime::<Utc>::from(file.modified()),
+    }
+}
+
+/// Canonical cache key for a remote directory: no trailing slash, except
+/// that the root stays "/".
+fn dir_key(dir: &str) -> String {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
