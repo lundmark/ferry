@@ -170,7 +170,7 @@ impl Ftp {
             pass: pass.to_string(),
             passive,
         };
-        let inner = Self::open(&params)?;
+        let inner = Self::open_retrying(&params)?;
         Ok(Self {
             inner,
             params,
@@ -191,16 +191,25 @@ impl Ftp {
         self.known_dirs.clear();
         self.recent_lists.clear();
         let _ = self.inner.quit();
-        let mut result = Self::open(&self.params);
-        for pause in RECONNECT_BACKOFF_SECS {
-            if result.is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(pause));
-            result = Self::open(&self.params);
-        }
-        self.inner = result?;
+        self.inner = Self::open_retrying(&self.params)?;
         Ok(())
+    }
+
+    /// `open`, retried after the `RECONNECT_BACKOFF_SECS` pauses while the
+    /// failure is the server's (refused, dropped). A config or credential
+    /// problem (`Exit::Auth`) is returned at once: waiting will not fix it.
+    fn open_retrying(params: &ConnectParams) -> Result<FtpStream> {
+        let mut result = Self::open(params);
+        for pause in RECONNECT_BACKOFF_SECS {
+            match &result {
+                Err(e) if e.downcast_ref::<crate::error::Exit>().is_none() => {
+                    std::thread::sleep(Duration::from_secs(pause));
+                    result = Self::open(params);
+                }
+                _ => break,
+            }
+        }
+        result
     }
 
     fn open(params: &ConnectParams) -> Result<FtpStream> {
@@ -223,8 +232,15 @@ impl Ftp {
             .ok_or_else(|| {
                 crate::error::Exit::Auth(format!("ftp connect {host}:{port}: no address"))
             })?;
-        let s = FtpStream::connect_timeout(addr, timeout)
-            .map_err(|e| crate::error::Exit::Auth(format!("ftp connect {host}:{port}: {e}")))?;
+        // A refused, dropped or garbled greeting is the server being busy (its
+        // per-host connection cap) or restarting -- not a config problem, so
+        // it is an ordinary error, which `connect` and `reconnect` retry.
+        let s = FtpStream::connect_timeout(addr, timeout).map_err(|e| {
+            anyhow::anyhow!(
+                "ftp connect {host}:{port}: the server refused or dropped the connection \
+                 (busy, at its connection limit, or restarting): {e}"
+            )
+        })?;
         s.get_ref()
             .set_read_timeout(Some(timeout))
             .context("ftp set control read timeout")?;
@@ -242,8 +258,16 @@ impl Ftp {
                 .map_err(suppaftp::FtpError::ConnectionError)?;
             Ok(data)
         });
-        s.login(user, pass)
-            .map_err(|e| crate::error::Exit::Auth(format!("ftp login as {user}: {e}")))?;
+        // Only a real rejection of the credentials (530) is an auth problem;
+        // a session dropped during login is the server again.
+        s.login(user, pass).map_err(|e| match &e {
+            suppaftp::FtpError::UnexpectedResponse(r)
+                if r.status == suppaftp::Status::NotLoggedIn =>
+            {
+                anyhow::Error::from(crate::error::Exit::Auth(format!("ftp login as {user}: {e}")))
+            }
+            _ => anyhow::anyhow!("ftp login as {user}: the server dropped the session: {e}"),
+        })?;
         s.transfer_type(suppaftp::types::FileType::Binary)
             .context("ftp set binary transfer type")?;
         s.set_mode(if passive {

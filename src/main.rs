@@ -70,6 +70,13 @@ enum Cmd {
         #[arg(long)]
         recursive: bool,
     },
+    /// Remove ferry's own leftover upload temps (`ferry-tmp.<hex>`) under the
+    /// given remote paths, if older than --hours. Nothing else is touched.
+    Clean {
+        paths: Vec<String>,
+        #[arg(long, default_value_t = ferry::commands::clean::DEFAULT_MIN_AGE_HOURS)]
+        hours: i64,
+    },
     /// Check-compile files on the MUD via the UDP compile service. Prints
     /// per-file OK/FAIL and diagnostics; exits non-zero if any failed.
     #[command(alias = "check")]
@@ -150,6 +157,7 @@ fn run() -> i32 {
         } => ferry::commands::sync::run_cli(&cfg, path.as_deref(), select, force, mode),
         Cmd::Rm { paths, recursive } => ferry::commands::rm::run(&cfg, &paths, recursive, mode),
         Cmd::Cc { paths } => ferry::commands::cc::run(&cfg, &paths),
+        Cmd::Clean { paths, hours } => ferry::commands::clean::run(&cfg, &paths, hours, mode),
     };
     finish(result)
 }

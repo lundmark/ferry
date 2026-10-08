@@ -105,8 +105,11 @@ pub struct StateFile {
     /// the editor hook, another session's push) no longer overwrite each
     /// other's records. `None` for a state that was never loaded: then every
     /// entry counts as this process's own.
+    /// Public only so callers outside the crate (the integration tests) can
+    /// still build a state with `..Default::default()`; not meant to be set.
     #[serde(skip)]
-    pub(crate) baseline: RefCell<Option<BTreeMap<String, FileRecord>>>,
+    #[doc(hidden)]
+    pub baseline: RefCell<Option<BTreeMap<String, FileRecord>>>,
 }
 
 impl PartialEq for StateFile {
