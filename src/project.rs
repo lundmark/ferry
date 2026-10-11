@@ -22,6 +22,21 @@ pub struct ResolvedFile {
     pub relative_path: String,
 }
 
+/// Test guard: a test that needs "no ferry project here" can only mean it if
+/// no config sits above its temp directory. A stray `.ferry.toml` in /tmp
+/// once made three tests fail with nothing pointing at the cause; this names
+/// the file instead.
+#[cfg(test)]
+pub(crate) fn assert_no_config_above(dir: &Path) {
+    if let Some(found) = find_config_upward(dir) {
+        panic!(
+            "a stray ferry config at {} sits above the test's temp directory; \
+             remove it (or set TMPDIR elsewhere) and rerun",
+            found.config_path.display()
+        );
+    }
+}
+
 pub fn find_config_upward(start: &Path) -> Option<ProjectLocation> {
     let mut dir = if start.is_dir() {
         start.to_path_buf()
@@ -256,6 +271,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("file.c");
         std::fs::write(&file, "").unwrap();
+        assert_no_config_above(tmp.path());
 
         assert!(resolve_file(&file, false).unwrap().is_none());
     }

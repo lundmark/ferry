@@ -80,7 +80,22 @@ pub fn fetch_remote_one(config_path: &Path, rel: &str) -> Result<RemoteFile> {
 }
 
 pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<PreparedPull> {
+    prepare_pull_one_on(None, None, config_path, rel, force)
+}
+
+/// [`prepare_pull_one`] on an already open connection (`Some`), or on a new
+/// one opened here (`None`). The hook helper uses the first form to keep one
+/// logged-in session across requests.
+fn prepare_pull_one_on(
+    session: Option<&mut Ftp>,
+    held_state: Option<&mut StateFile>,
+    config_path: &Path,
+    rel: &str,
+    force: bool,
+) -> Result<PreparedPull> {
     let rel = safe_rel(rel).with_context(|| format!("pull {rel}"))?;
+    let mut session = session;
+    let mut held_state = held_state;
     (|| {
         let cfg = Config::load(config_path)?;
         let local_root = cfg.paths.local_root.clone();
@@ -91,19 +106,33 @@ pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<Pr
             LocalIdentity::Present(hash) => Some(hash.as_str()),
         };
         let state_path = state_path_for(&local_root, ExecutionMode::Apply);
-        let mut state = StateFile::load_or_default(&state_path)?;
-        let mut ftp = connect(&cfg)?;
+        let mut loaded;
+        let state: &mut StateFile = match held_state.as_deref_mut() {
+            Some(held) => held,
+            None => {
+                loaded = StateFile::load_or_default(&state_path)?;
+                &mut loaded
+            }
+        };
+        let mut owned;
+        let ftp: &mut Ftp = match session.as_deref_mut() {
+            Some(open) => open,
+            None => {
+                owned = connect(&cfg)?;
+                &mut owned
+            }
+        };
         let remote_path = remote_join(&cfg.paths.remote_root, &rel);
         let remote_exists =
-            probe_remote_file(&mut ftp, &remote_path)? == RemotePresence::Present;
+            probe_remote_file(ftp, &remote_path)? == RemotePresence::Present;
         if !remote_exists && local_hash.is_none() {
             anyhow::bail!("neither local nor remote has {rel}");
         }
 
         let remote_hash = if remote_exists {
             Some(remote_hash::compute(
-                &mut ftp,
-                &mut state,
+                ftp,
+                state,
                 &rel,
                 &remote_path,
                 true,
@@ -114,12 +143,17 @@ pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<Pr
         let remote_hash_str = remote_hash.as_ref().map(|remote| remote.sha256.as_str());
         let known = state.files.get(&rel).map(|record| record.sha256.as_str());
         let file_state = classify(local_hash, remote_hash_str, known);
+        if file_state == FileState::InSync
+            && let Some(remote) = remote_hash.as_ref()
+        {
+            refresh_in_sync_record(state, &state_path, &rel, remote)?;
+        }
         let action = match file_state {
             FileState::InSync => PreparedAction::Noop(TransferStatus::Unchanged),
             FileState::LocalOnly => PreparedAction::Noop(TransferStatus::SkippedMissingSource),
             FileState::RemoteOnly | FileState::RemoteChanged => PreparedAction::Install(
                 remote_file_for_install(
-                    &mut ftp,
+                    ftp,
                     &remote_path,
                     remote_hash.expect("remote hash set when remote exists"),
                 )?,
@@ -132,7 +166,7 @@ pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<Pr
                     .into());
                 }
                 PreparedAction::Install(remote_file_for_install(
-                    &mut ftp,
+                    ftp,
                     &remote_path,
                     remote_hash.expect("remote hash set when remote exists"),
                 )?)
@@ -257,6 +291,52 @@ pub fn pull_one(
     mode: ExecutionMode,
 ) -> Result<TransferOutcome> {
     apply_prepared_pull(prepare_pull_one(config_path, rel, force)?, mode)
+}
+
+/// [`pull_one`] on an already open connection and an already loaded state
+/// (the hook helper keeps both between requests).
+pub fn pull_one_on(
+    ftp: &mut Ftp,
+    state: &mut StateFile,
+    config_path: &Path,
+    rel: &str,
+    force: bool,
+    mode: ExecutionMode,
+) -> Result<TransferOutcome> {
+    let prepared = prepare_pull_one_on(Some(ftp), Some(state), config_path, rel, force)?;
+    apply_prepared_pull(prepared, mode)
+}
+
+/// For a file found in sync, keep its record useful, as the full pull does:
+/// a record confirmed from the server (MDTM or listing) gets its verification
+/// time refreshed, and a stale or missing record is replaced when the file was
+/// hashed and found identical, so the next check is cheap instead of another
+/// download. Saved (merged) only when something changed.
+fn refresh_in_sync_record(
+    state: &mut StateFile,
+    state_path: &Path,
+    rel: &str,
+    remote: &RemoteHash,
+) -> Result<()> {
+    let now = Utc::now();
+    let changed = if remote.from_cache {
+        match state.files.get_mut(rel) {
+            Some(record) if record.last_synced < now => {
+                record.last_synced = now;
+                true
+            }
+            _ => false,
+        }
+    } else if remote.metadata_stable {
+        record_download(state, rel, &remote.sha256, remote.size, remote.mtime);
+        true
+    } else {
+        false
+    };
+    if changed {
+        state.save(state_path)?;
+    }
+    Ok(())
 }
 
 fn retrieve_remote_file<R: RemoteFileRetrieval>(

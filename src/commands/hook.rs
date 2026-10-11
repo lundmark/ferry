@@ -82,6 +82,28 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     let state_path = state_path_for(&resolved.config.paths.local_root, mode);
     let rel = resolved.relative_path;
 
+    // Hand the request to the project's helper, which keeps a session logged
+    // in and the state in memory (see hookd.rs), and checks the cooldown
+    // itself. With no helper answering, start one for next time and do the
+    // work here the usual way. Dry runs never involve the helper.
+    let tool = input.tool_name.as_deref().unwrap_or("<unknown>");
+    if mode.should_apply() {
+        let local_root = &resolved.config.paths.local_root;
+        match crate::commands::hookd::request(local_root, &rel, true, cooldown_secs) {
+            Some(crate::commands::hookd::Answer::Cooled) => {
+                eprintln!("ferry hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull");
+                return Ok(());
+            }
+            Some(crate::commands::hookd::Answer::Done(msg)) => {
+                if !msg.is_empty() {
+                    eprintln!("ferry hook: {msg}");
+                }
+                return Ok(());
+            }
+            None => crate::commands::hookd::spawn(&config_path),
+        }
+    }
+
     // Cooldown check. If the state entry's last_synced is within the
     // cooldown window, skip the pull. Apply mode keeps config loading deferred
     // until we know we're going to act; dry-run loaded it above only to resolve
@@ -91,7 +113,6 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     {
         let elapsed = Utc::now().signed_duration_since(record.last_synced);
         if elapsed.num_seconds() >= 0 && elapsed.num_seconds() < cooldown_secs {
-            let tool = input.tool_name.as_deref().unwrap_or("<unknown>");
             eprintln!("ferry hook: {tool} {rel} — within {cooldown_secs}s cooldown, skipping pull");
             return Ok(());
         }

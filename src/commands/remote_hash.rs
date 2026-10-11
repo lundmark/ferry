@@ -12,16 +12,25 @@
 //! fallback decision is cached in `state.server_supports_mdtm` so we don't
 //! re-probe every run.
 
+use crate::commands::walk::remote_join;
+use crate::config::Config;
 use crate::ftp::Ftp;
 use crate::hash::hash_bytes;
+use crate::state::FileRecord;
 use crate::state::StateFile;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
+use std::collections::{BTreeSet, HashMap};
 
 pub(crate) trait RemoteFileRetrieval {
     fn mtime(&mut self, remote_path: &str) -> Result<DateTime<Utc>>;
     fn size(&mut self, remote_path: &str) -> Result<u64>;
     fn download(&mut self, remote_path: &str) -> Result<Vec<u8>>;
+    /// Size and mtime from a directory listing already fetched this session,
+    /// if any. Fakes and other remotes without a listing cache keep `None`.
+    fn listed(&self, _remote_path: &str) -> Option<(u64, DateTime<Utc>)> {
+        None
+    }
 }
 
 impl RemoteFileRetrieval for Ftp {
@@ -36,6 +45,47 @@ impl RemoteFileRetrieval for Ftp {
     fn download(&mut self, remote_path: &str) -> Result<Vec<u8>> {
         Ftp::download(self, remote_path)
     }
+
+    fn listed(&self, remote_path: &str) -> Option<(u64, DateTime<Utc>)> {
+        self.listed_meta(remote_path)
+    }
+}
+
+/// True when a LIST entry alone proves the remote file is the one `known`
+/// recorded, so the MDTM/SIZE round trips can be skipped.
+///
+/// LIST is coarser than MDTM: recent files show HH:MM, older ones only a
+/// date (parsed as midnight). So the listing time names a period, a minute or
+/// a whole day, and the entry is trusted only when:
+/// - the size matches the record;
+/// - the recorded MDTM falls inside that same period;
+/// - the record was last verified after the period ended, so no later edit
+///   inside the period could be hiding behind an identical size and time.
+///
+/// A midnight time is read as date-only: stricter for the rare recent file
+/// saved at exactly 00:00, never looser. Anything else falls back to MDTM.
+pub(crate) fn listing_proves_unchanged(
+    known: &FileRecord,
+    listed_size: u64,
+    listed_mtime: DateTime<Utc>,
+) -> bool {
+    let date_only = listed_mtime.hour() == 0 && listed_mtime.minute() == 0;
+    let period = if date_only {
+        Duration::days(1)
+    } else {
+        Duration::minutes(1)
+    };
+    let Some(start) = listed_mtime
+        .with_second(0)
+        .and_then(|t| t.with_nanosecond(0))
+    else {
+        return false;
+    };
+    let end = start + period;
+    listed_size == known.size
+        && known.remote_mtime >= start
+        && known.remote_mtime < end
+        && known.last_synced >= end
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +142,27 @@ pub(crate) fn compute_with<R: RemoteFileRetrieval>(
     remote_path: &str,
     want_bytes: bool,
 ) -> Result<RemoteHash> {
+    // Listing fast path: no round trips at all when this session's LIST
+    // already proves the file unchanged since the recorded sync.
+    if let Some(known) = state.files.get(rel)
+        && let Some((listed_size, listed_mtime)) = remote.listed(remote_path)
+        && listing_proves_unchanged(known, listed_size, listed_mtime)
+    {
+        let observed = RemoteMetadata {
+            mtime: known.remote_mtime,
+            size: Some(known.size),
+        };
+        return Ok(RemoteHash {
+            sha256: known.sha256.clone(),
+            size: known.size,
+            mtime: known.remote_mtime,
+            from_cache: true,
+            metadata_stable: true,
+            bytes: None,
+            pre_download: Some(observed),
+        });
+    }
+
     let pre_download = if state.server_supports_mdtm.unwrap_or(true) {
         match remote.mtime(remote_path) {
             Ok(mtime) => {
@@ -228,8 +299,173 @@ fn hash_download(
     }
 }
 
+/// Targets are prefetched and then pulled this many at a time, which bounds
+/// how many downloaded files are held in memory at once.
+pub(crate) const PREFETCH_CHUNK: usize = 200;
+
+/// Compute remote hashes (and, with `want_bytes`, fetch the bytes) for the
+/// remote files in `chunk` that the session listing cannot prove unchanged,
+/// using `workers` connections of their own. Shared by pull and push. Best effort: a file a worker fails on is simply absent from the
+/// result, and the sequential loop handles it the ordinary way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefetch(
+    ftp: &Ftp,
+    cfg: &Config,
+    state: &StateFile,
+    remote_paths: &BTreeSet<String>,
+    chunk: &[String],
+    workers: usize,
+    want_bytes: bool,
+    pool: &mut Vec<Option<Ftp>>,
+) -> HashMap<String, RemoteHash> {
+    // Each worker gets a private state holding just the records it needs.
+    let mut records = std::collections::BTreeMap::new();
+    let mut todo: Vec<&String> = Vec::new();
+    for rel in chunk {
+        if !remote_paths.contains(rel) {
+            continue;
+        }
+        if let Some(known) = state.files.get(rel) {
+            // The main connection's listing already proves this one: the
+            // sequential loop settles it with no network traffic at all.
+            let remote_path = remote_join(&cfg.paths.remote_root, rel);
+            if let Some((size, mtime)) = ftp.listed_meta(&remote_path)
+                && listing_proves_unchanged(known, size, mtime)
+            {
+                continue;
+            }
+            records.insert(rel.clone(), known.clone());
+        }
+        todo.push(rel);
+    }
+    if todo.len() < 2 {
+        return HashMap::new();
+    }
+    let supports_mdtm = state.server_supports_mdtm;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results = std::sync::Mutex::new(HashMap::new());
+    // Worker connections live in `pool` and are reused by later chunks; a
+    // slot is (re)connected only when empty.
+    let wanted = workers.min(todo.len());
+    while pool.len() < wanted {
+        pool.push(None);
+    }
+    {
+        let (records, todo, next, results) = (&records, &todo, &next, &results);
+        std::thread::scope(|scope| {
+            for slot in pool.iter_mut().take(wanted) {
+                scope.spawn(move || {
+                    if slot.is_none() {
+                        *slot = Ftp::connect(
+                            &cfg.connection.host,
+                            cfg.connection.port,
+                            &cfg.connection.user,
+                            &cfg.connection.password,
+                            cfg.connection.passive,
+                        )
+                        .ok();
+                    }
+                    let Some(ftp) = slot.as_mut() else {
+                        return;
+                    };
+                    let mut local = StateFile {
+                        files: records.clone(),
+                        server_supports_mdtm: supports_mdtm,
+                        ..StateFile::default()
+                    };
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(rel) = todo.get(i) else { break };
+                        let remote_path = remote_join(&cfg.paths.remote_root, rel);
+                        for attempt in 0..2 {
+                            match compute(ftp, &mut local, rel, &remote_path, want_bytes) {
+                                Ok(rh) => {
+                                    results.lock().unwrap().insert((*rel).clone(), rh);
+                                    break;
+                                }
+                                Err(_) if attempt == 0 => {
+                                    if ftp.reconnect().is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    results.into_inner().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
+    mod listing_fast_path {
+        use super::super::listing_proves_unchanged;
+        use crate::state::FileRecord;
+        use chrono::{DateTime, TimeZone, Utc};
+
+        fn at(h: u32, m: u32, sec: u32) -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 10, 8, h, m, sec).unwrap()
+        }
+
+        fn rec(mtime: DateTime<Utc>, synced: DateTime<Utc>) -> FileRecord {
+            FileRecord {
+                sha256: "x".into(),
+                size: 100,
+                remote_mtime: mtime,
+                last_synced: synced,
+            }
+        }
+
+        #[test]
+        fn same_minute_same_size_synced_after_the_minute_is_trusted() {
+            let r = rec(at(11, 30, 48), at(11, 35, 0));
+            assert!(listing_proves_unchanged(&r, 100, at(11, 30, 0)));
+        }
+
+        #[test]
+        fn size_change_is_not_trusted() {
+            let r = rec(at(11, 30, 48), at(11, 35, 0));
+            assert!(!listing_proves_unchanged(&r, 101, at(11, 30, 0)));
+        }
+
+        #[test]
+        fn different_minute_is_not_trusted() {
+            let r = rec(at(11, 30, 48), at(11, 35, 0));
+            assert!(!listing_proves_unchanged(&r, 100, at(11, 31, 0)));
+        }
+
+        #[test]
+        fn date_only_listing_needs_verification_after_that_day() {
+            let day = Utc.with_ymd_and_hms(2004, 5, 24, 0, 0, 0).unwrap();
+            let mtime = Utc.with_ymd_and_hms(2004, 5, 24, 17, 44, 31).unwrap();
+            let same_day = Utc.with_ymd_and_hms(2004, 5, 24, 20, 0, 0).unwrap();
+            let later = Utc.with_ymd_and_hms(2026, 10, 8, 9, 0, 0).unwrap();
+            assert!(listing_proves_unchanged(&rec(mtime, later), 100, day));
+            assert!(!listing_proves_unchanged(&rec(mtime, same_day), 100, day));
+        }
+
+        #[test]
+        fn recorded_mtime_outside_the_listed_day_is_not_trusted() {
+            let day = Utc.with_ymd_and_hms(2004, 5, 24, 0, 0, 0).unwrap();
+            let mtime = Utc.with_ymd_and_hms(2004, 5, 25, 1, 0, 0).unwrap();
+            assert!(!listing_proves_unchanged(
+                &rec(mtime, at(9, 0, 0)),
+                100,
+                day
+            ));
+        }
+
+        #[test]
+        fn sync_inside_the_same_minute_is_not_trusted() {
+            // A second same-size edit later in 11:30 would look identical.
+            let r = rec(at(11, 30, 10), at(11, 30, 40));
+            assert!(!listing_proves_unchanged(&r, 100, at(11, 30, 0)));
+        }
+    }
+
     use super::*;
     use crate::state::FileRecord;
     use chrono::TimeZone;

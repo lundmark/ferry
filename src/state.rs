@@ -84,19 +84,40 @@ mod tests {
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const STATE_VERSION: u32 = 1;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StateFile {
     pub version: u32,
     #[serde(default)]
     pub files: BTreeMap<String, FileRecord>,
     #[serde(default)]
     pub server_supports_mdtm: Option<bool>,
+    /// This process's view of `files` as of its load or last save. `save`
+    /// writes only the entries that differ from it, merged into whatever is
+    /// on disk at that moment, so concurrent ferry processes (a long pull,
+    /// the editor hook, another session's push) no longer overwrite each
+    /// other's records. `None` for a state that was never loaded: then every
+    /// entry counts as this process's own.
+    /// Public only so callers outside the crate (the integration tests) can
+    /// still build a state with `..Default::default()`; not meant to be set.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub baseline: RefCell<Option<BTreeMap<String, FileRecord>>>,
+}
+
+impl PartialEq for StateFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.files == other.files
+            && self.server_supports_mdtm == other.server_supports_mdtm
+    }
 }
 
 impl Default for StateFile {
@@ -105,6 +126,7 @@ impl Default for StateFile {
             version: STATE_VERSION,
             files: BTreeMap::new(),
             server_supports_mdtm: None,
+            baseline: RefCell::new(None),
         }
     }
 }
@@ -130,6 +152,7 @@ impl StateFile {
         };
         let parsed: Self = serde_json::from_str(&text)
             .with_context(|| format!("parsing state file {}", path.display()))?;
+        parsed.baseline.replace(Some(parsed.files.clone()));
         if parsed.version != STATE_VERSION {
             anyhow::bail!(
                 "state file {} has version {} but this binary only understands version {}",
@@ -141,23 +164,106 @@ impl StateFile {
         Ok(parsed)
     }
 
+    /// Write this process's changes since its load (or last save) into the
+    /// state file, under an exclusive lock, on top of what is on disk now.
+    /// Entries other processes changed meanwhile are kept; for an entry both
+    /// changed, this process's value wins.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating state dir {}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(self)?;
+        let lock_path = path.with_extension("json.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening state lock {}", lock_path.display()))?;
+        FileExt::lock_exclusive(&lock)
+            .with_context(|| format!("locking state file {}", path.display()))?;
+
+        // An unreadable file is replaced, as the unmerged save always did.
+        let mut merged = Self::load_or_default(path).unwrap_or_default();
+        {
+            let baseline = self.baseline.borrow();
+            for (rel, record) in &self.files {
+                let unchanged = baseline
+                    .as_ref()
+                    .is_some_and(|base| base.get(rel) == Some(record));
+                if !unchanged {
+                    merged.files.insert(rel.clone(), record.clone());
+                }
+            }
+            if let Some(base) = baseline.as_ref() {
+                for rel in base.keys() {
+                    if !self.files.contains_key(rel) {
+                        merged.files.remove(rel);
+                    }
+                }
+            }
+        }
+        if self.server_supports_mdtm.is_some() {
+            merged.server_supports_mdtm = self.server_supports_mdtm;
+        }
+
+        let text = serde_json::to_string_pretty(&merged)?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, text)
             .with_context(|| format!("writing state file temp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("renaming state file into place at {}", path.display()))?;
+        self.baseline.replace(Some(self.files.clone()));
+        FileExt::unlock(&lock).ok();
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod state_file_tests {
+
+    fn record(hash: &str) -> FileRecord {
+        FileRecord {
+            sha256: hash.into(),
+            size: 1,
+            remote_mtime: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            last_synced: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn concurrent_saves_keep_each_others_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut seed = StateFile::default();
+        seed.files.insert("a".into(), record("a0"));
+        seed.files.insert("b".into(), record("b0"));
+        seed.files.insert("gone".into(), record("g0"));
+        seed.save(&path).unwrap();
+
+        // Two processes load the same file, then change different entries.
+        let mut one = StateFile::load_or_default(&path).unwrap();
+        let mut two = StateFile::load_or_default(&path).unwrap();
+        one.files.insert("a".into(), record("a1"));
+        one.files.remove("gone");
+        two.files.insert("b".into(), record("b1"));
+        two.files.insert("c".into(), record("c1"));
+        one.save(&path).unwrap();
+        two.save(&path).unwrap();
+
+        let disk = StateFile::load_or_default(&path).unwrap();
+        assert_eq!(disk.files["a"], record("a1"));
+        assert_eq!(disk.files["b"], record("b1"));
+        assert_eq!(disk.files["c"], record("c1"));
+        assert!(!disk.files.contains_key("gone"));
+
+        // A later save from `one` must not revert what `two` wrote.
+        one.files.insert("d".into(), record("d1"));
+        one.save(&path).unwrap();
+        let disk = StateFile::load_or_default(&path).unwrap();
+        assert_eq!(disk.files["b"], record("b1"));
+        assert_eq!(disk.files["d"], record("d1"));
+    }
     use super::*;
     use chrono::TimeZone;
 
