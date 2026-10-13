@@ -109,6 +109,23 @@ impl Ftp {
     }
 }
 
+/// True when `error` carries a 450/550 reply whose text says the path does
+/// not exist (as opposed to e.g. "Permission denied", which shares 550).
+pub(crate) fn is_no_such_file(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<suppaftp::FtpError>(),
+            Some(suppaftp::FtpError::UnexpectedResponse(response))
+                if matches!(
+                    response.status,
+                    suppaftp::Status::RequestFileActionIgnored | suppaftp::Status::FileUnavailable
+                ) && String::from_utf8_lossy(&response.body)
+                    .to_ascii_lowercase()
+                    .contains("no such file")
+        )
+    })
+}
+
 fn strict_list_transport_error(dir: &str, _error: suppaftp::FtpError) -> anyhow::Error {
     anyhow::anyhow!(
         "ftp list {}: remote listing failed",

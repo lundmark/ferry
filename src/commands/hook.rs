@@ -134,9 +134,26 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
                  local copy kept; run 'ferry push {rel}' or an explicit \
                  'ferry pull {rel}' to reconcile"
             );
+            // stderr from an exit-0 PreToolUse hook never reaches the agent,
+            // so on its own the tool call goes ahead on a possibly stale copy
+            // with no sign anything was wrong. additionalContext does.
+            println!("{}", agent_notice(&rel, &error));
         }
     }
     Ok(())
+}
+
+/// Claude Code PreToolUse output carrying `error` into the agent's context.
+fn agent_notice(rel: &str, error: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": format!(
+                "ferry did NOT refresh {rel} from the server, so the local copy \
+                 you are about to use may not match it: {error:#}"
+            ),
+        }
+    })
 }
 
 #[cfg(test)]

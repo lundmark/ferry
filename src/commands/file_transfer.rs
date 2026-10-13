@@ -569,6 +569,15 @@ pub fn probe_remote_file<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Resu
             match remote.exact_file_presence(path) {
                 Ok(ExactFilePresence::Present) => Ok(RemotePresence::Present),
                 Ok(ExactFilePresence::Missing) => Ok(RemotePresence::Missing),
+                // Two independent commands both naming the path as nonexistent
+                // is authoritative absence. Anything weaker (a bare 550, which
+                // also means "permission denied") stays indeterminate.
+                Err(exact_error)
+                    if crate::ftp::is_no_such_file(&size_error)
+                        && crate::ftp::is_no_such_file(&exact_error) =>
+                {
+                    Ok(RemotePresence::Missing)
+                }
                 Err(exact_error) => Err(size_error).with_context(|| {
                     format!(
                         "remote presence for {path} is indeterminate after exact lookup: {exact_error:#}"
@@ -822,5 +831,49 @@ mod tests {
         let error = probe_remote_file(&mut remote, "/home/test/target.txt").unwrap_err();
 
         assert!(format!("{error:#}").contains("NLST malformed response"));
+    }
+
+    fn reply(code: u32, body: &str) -> anyhow::Error {
+        anyhow::Error::new(suppaftp::FtpError::UnexpectedResponse(
+            suppaftp::types::Response::new(suppaftp::Status::from(code), body.as_bytes().to_vec()),
+        ))
+        .context("ftp probe")
+    }
+
+    // proftpd on 3k.org answers a deleted file with exactly these two replies.
+    #[test]
+    fn size_and_nlst_both_saying_no_such_file_prove_absence() {
+        let mut remote = ScriptedRemote {
+            size: Some(Err(reply(550, "550 /t/x.c: No such file or directory"))),
+            listing: None,
+            exact: Some(Err(reply(450, "450 /t/x.c: No such file or directory"))),
+        };
+
+        assert_eq!(
+            probe_remote_file(&mut remote, "/t/x.c").unwrap(),
+            RemotePresence::Missing
+        );
+    }
+
+    #[test]
+    fn a_550_that_is_not_no_such_file_stays_indeterminate() {
+        let mut remote = ScriptedRemote {
+            size: Some(Err(reply(550, "550 /t/x.c: Permission denied"))),
+            listing: None,
+            exact: Some(Err(reply(550, "550 /t/x.c: Permission denied"))),
+        };
+
+        assert!(probe_remote_file(&mut remote, "/t/x.c").is_err());
+    }
+
+    #[test]
+    fn only_one_side_saying_no_such_file_stays_indeterminate() {
+        let mut remote = ScriptedRemote {
+            size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
+            listing: None,
+            exact: Some(Err(reply(450, "450 /t/x.c: No such file or directory"))),
+        };
+
+        assert!(probe_remote_file(&mut remote, "/t/x.c").is_err());
     }
 }

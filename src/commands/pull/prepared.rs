@@ -51,6 +51,13 @@ pub struct RemoteFile {
 #[derive(Clone, Debug)]
 enum PreparedAction {
     Noop(TransferStatus),
+    /// Local and remote are byte-identical but untracked: record the state
+    /// entry without touching the file.
+    Adopt {
+        sha256: String,
+        size: u64,
+        mtime: DateTime<Utc>,
+    },
     Install(RemoteFile),
 }
 
@@ -124,6 +131,21 @@ pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<Pr
                     remote_hash.expect("remote hash set when remote exists"),
                 )?,
             ),
+            FileState::Untracked if local_hash == remote_hash_str => {
+                let remote = remote_hash.expect("remote hash set when remote exists");
+                PreparedAction::Adopt {
+                    sha256: remote.sha256,
+                    size: remote.size,
+                    mtime: remote.mtime,
+                }
+            }
+            FileState::Untracked if !force => {
+                let local_size = std::fs::metadata(&local_path)
+                    .with_context(|| format!("reading {}", local_path.display()))?
+                    .len();
+                let remote_size = remote_hash.as_ref().map_or(0, |remote| remote.size);
+                return Err(super::untracked_conflict(&rel, local_size, remote_size).into());
+            }
             FileState::LocalChanged | FileState::BothChanged | FileState::Untracked => {
                 if !force {
                     return Err(crate::error::Exit::Conflict(format!(
@@ -210,8 +232,18 @@ where
 
         let state_path = state_path_for(&local_root, mode);
         let mut state = StateFile::load_or_default(&state_path)?;
+        let mut adopted = false;
         let (status, staged) = match action {
             PreparedAction::Noop(status) => (status, None),
+            PreparedAction::Adopt {
+                sha256,
+                size,
+                mtime,
+            } => {
+                record_download(&mut state, &relative_path, &sha256, size, mtime);
+                adopted = mode.should_apply();
+                (TransferStatus::Unchanged, None)
+            }
             PreparedAction::Install(remote) => {
                 record_download(
                     &mut state,
@@ -243,6 +275,8 @@ where
 
         if let Some(staged) = staged {
             staged.commit()?;
+            state.save(&state_path)?;
+        } else if adopted {
             state.save(&state_path)?;
         }
         Ok(outcome)
