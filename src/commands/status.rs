@@ -1,4 +1,4 @@
-use crate::commands::walk::{remote_join, walk_local, walk_remote};
+use crate::commands::walk::{collect_remote_arg, remote_join, safe_arg, walk_local, walk_remote};
 use crate::commands::{ExecutionMode, remote_hash, state_path_for};
 use crate::config::Config;
 use crate::ftp::Ftp;
@@ -9,9 +9,21 @@ use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
+/// `paths` limits the report to those files and directory subtrees (relative
+/// to the project root, or absolute inside it); empty reports everything.
+pub fn run(config_path: &Path, paths: &[String], mode: ExecutionMode) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
+    let scopes: Vec<String> = paths
+        .iter()
+        .map(|path| safe_arg(&local_root, path))
+        .collect::<Result<_>>()?;
+    let in_scope = |rel: &str| {
+        scopes.is_empty()
+            || scopes
+                .iter()
+                .any(|scope| rel == scope || rel.starts_with(&format!("{scope}/")))
+    };
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
@@ -27,16 +39,28 @@ pub fn run(config_path: &Path, mode: ExecutionMode) -> Result<()> {
 
     // Build sets so we know existence without downloading.
     let mut local_paths: BTreeSet<String> = BTreeSet::new();
-    walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
     let mut remote_paths: BTreeSet<String> = BTreeSet::new();
-    walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+    if scopes.is_empty() {
+        walk_local(&local_root, &local_root, &matcher, &mut local_paths)?;
+        walk_remote(&mut ftp, &cfg.paths.remote_root, "", &mut remote_paths)?;
+    } else {
+        for scope in &scopes {
+            let local_full = local_root.join(scope);
+            if local_full.is_dir() {
+                walk_local(&local_root, &local_full, &matcher, &mut local_paths)?;
+            } else if local_full.is_file() && !matcher.is_ignored(&local_full, false) {
+                local_paths.insert(scope.clone());
+            }
+            collect_remote_arg(&mut ftp, &cfg.paths.remote_root, scope, &mut remote_paths);
+        }
+    }
 
     // Collect into owned Strings so we can mutably borrow `state` inside
     // the loop (the MDTM cache lives there).
     let mut all: BTreeSet<String> = BTreeSet::new();
     all.extend(local_paths.iter().cloned());
     all.extend(remote_paths.iter().cloned());
-    for k in state.files.keys() {
+    for k in state.files.keys().filter(|k| in_scope(k)) {
         all.insert(k.clone());
     }
 
