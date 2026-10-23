@@ -1,6 +1,6 @@
 use super::{record_download, stage_local_write};
 use crate::commands::file_transfer::{
-    RemotePresence, TransferOutcome, TransferStatus, probe_remote_file,
+    ProbedRemote, RemotePresence, TransferOutcome, TransferStatus, probe_remote, probe_remote_file,
 };
 use crate::commands::remote_hash::{self, RemoteFileRetrieval, RemoteHash};
 use crate::commands::walk::{remote_join, safe_rel};
@@ -87,6 +87,17 @@ pub fn fetch_remote_one(config_path: &Path, rel: &str) -> Result<RemoteFile> {
 }
 
 pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<PreparedPull> {
+    prepare_pull_one_from(config_path, rel, force, None)
+}
+
+/// [`prepare_pull_one`] reusing a state file the caller has already loaded
+/// from this project (`None` loads it here).
+fn prepare_pull_one_from(
+    config_path: &Path,
+    rel: &str,
+    force: bool,
+    loaded_state: Option<StateFile>,
+) -> Result<PreparedPull> {
     let rel = safe_rel(rel).with_context(|| format!("pull {rel}"))?;
     (|| {
         let cfg = Config::load(config_path)?;
@@ -97,23 +108,30 @@ pub fn prepare_pull_one(config_path: &Path, rel: &str, force: bool) -> Result<Pr
             LocalIdentity::Missing => None,
             LocalIdentity::Present(hash) => Some(hash.as_str()),
         };
-        let state_path = state_path_for(&local_root, ExecutionMode::Apply);
-        let mut state = StateFile::load_or_default(&state_path)?;
+        let mut state = match loaded_state {
+            Some(state) => state,
+            None => StateFile::load_or_default(&state_path_for(&local_root, ExecutionMode::Apply))?,
+        };
         let mut ftp = connect(&cfg)?;
         let remote_path = remote_join(&cfg.paths.remote_root, &rel);
-        let remote_exists =
-            probe_remote_file(&mut ftp, &remote_path)? == RemotePresence::Present;
+        let probed = probe_remote(&mut ftp, &remote_path)?;
+        let remote_exists = probed != ProbedRemote::Missing;
+        let probed_size = match probed {
+            ProbedRemote::Present { size } => size,
+            ProbedRemote::Missing => None,
+        };
         if !remote_exists && local_hash.is_none() {
             anyhow::bail!("neither local nor remote has {rel}");
         }
 
         let remote_hash = if remote_exists {
-            Some(remote_hash::compute(
+            Some(remote_hash::compute_after_probe(
                 &mut ftp,
                 &mut state,
                 &rel,
                 &remote_path,
                 true,
+                probed_size,
             )?)
         } else {
             None
@@ -230,35 +248,37 @@ where
             return Err(local_identity_conflict(&relative_path));
         }
 
+        // The state file is loaded only when there is a record to write: on
+        // a large mirror each load costs ~10 ms, and the hook runs this for
+        // every Read and Edit, almost always as a no-op.
         let state_path = state_path_for(&local_root, mode);
-        let mut state = StateFile::load_or_default(&state_path)?;
-        let mut adopted = false;
-        let (status, staged) = match action {
-            PreparedAction::Noop(status) => (status, None),
+        let recorded = |sha256: &str, size: u64, mtime: DateTime<Utc>| -> Result<StateFile> {
+            let mut state = StateFile::load_or_default(&state_path)?;
+            record_download(&mut state, &relative_path, sha256, size, mtime);
+            Ok(state)
+        };
+        let (status, staged, updated_state) = match action {
+            PreparedAction::Noop(status) => (status, None, None),
+            PreparedAction::Adopt { .. } if !mode.should_apply() => {
+                (TransferStatus::Unchanged, None, None)
+            }
             PreparedAction::Adopt {
                 sha256,
                 size,
                 mtime,
-            } => {
-                record_download(&mut state, &relative_path, &sha256, size, mtime);
-                adopted = mode.should_apply();
-                (TransferStatus::Unchanged, None)
+            } => (
+                TransferStatus::Unchanged,
+                None,
+                Some(recorded(&sha256, size, mtime)?),
+            ),
+            PreparedAction::Install(_) if !mode.should_apply() => {
+                (TransferStatus::Transferred, None, None)
             }
-            PreparedAction::Install(remote) => {
-                record_download(
-                    &mut state,
-                    &relative_path,
-                    &remote.sha256,
-                    remote.size,
-                    remote.mtime,
-                );
-                let staged = if mode.should_apply() {
-                    Some(stage_local_write(&local_path, &remote.bytes)?)
-                } else {
-                    None
-                };
-                (TransferStatus::Transferred, staged)
-            }
+            PreparedAction::Install(remote) => (
+                TransferStatus::Transferred,
+                Some(stage_local_write(&local_path, &remote.bytes)?),
+                Some(recorded(&remote.sha256, remote.size, remote.mtime)?),
+            ),
         };
         let outcome = TransferOutcome::new(&relative_path, status);
 
@@ -275,8 +295,8 @@ where
 
         if let Some(staged) = staged {
             staged.commit()?;
-            state.save(&state_path)?;
-        } else if adopted {
+        }
+        if let Some(state) = updated_state {
             state.save(&state_path)?;
         }
         Ok(outcome)
@@ -291,6 +311,21 @@ pub fn pull_one(
     mode: ExecutionMode,
 ) -> Result<TransferOutcome> {
     apply_prepared_pull(prepare_pull_one(config_path, rel, force)?, mode)
+}
+
+/// [`pull_one`] for a caller that has already loaded this project's state
+/// file, so it is not parsed a second time.
+pub fn pull_one_with_state(
+    config_path: &Path,
+    rel: &str,
+    force: bool,
+    mode: ExecutionMode,
+    state: StateFile,
+) -> Result<TransferOutcome> {
+    apply_prepared_pull(
+        prepare_pull_one_from(config_path, rel, force, Some(state))?,
+        mode,
+    )
 }
 
 fn retrieve_remote_file<R: RemoteFileRetrieval>(
@@ -565,6 +600,34 @@ remote_root = "/remote"
         assert_eq!(std::fs::read(&local_path).unwrap(), original_local);
         assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
         assert!(!super::super::tmp_path(&local_path).exists());
+    }
+
+    // A no-op has nothing to record, so it must not pay for parsing the state
+    // file (~10 ms per load on a 16k-entry mirror, on every hook call). An
+    // unparseable state file makes any read observable.
+    #[test]
+    fn noop_apply_does_not_read_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let local_root = dir.path().join("site");
+        let local_path = local_root.join("page.txt");
+        let config_path = dir.path().join("ferry.toml");
+        let state_path = local_root.join(crate::names::STATE_DIR).join("state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(&local_path, b"unchanged local bytes").unwrap();
+        std::fs::write(&state_path, b"not json").unwrap();
+        write_config(&config_path, &local_root);
+        let prepared = PreparedPull {
+            config_path,
+            local_root,
+            local_path: local_path.clone(),
+            relative_path: "page.txt".to_string(),
+            expected_local: LocalIdentity::capture(&local_path).unwrap(),
+            action: PreparedAction::Noop(TransferStatus::Unchanged),
+        };
+
+        let outcome = apply_prepared_pull(prepared, ExecutionMode::Apply).unwrap();
+
+        assert_eq!(outcome.status, TransferStatus::Unchanged);
     }
 
     #[test]

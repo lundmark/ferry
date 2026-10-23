@@ -564,6 +564,14 @@ pub enum RemotePresence {
     Missing,
 }
 
+/// [`RemotePresence`] plus the `SIZE` that proved it, when the server gave
+/// one -- so callers about to hash the file need not ask for it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbedRemote {
+    Present { size: Option<u64> },
+    Missing,
+}
+
 /// Determine whether `path` names a remote file without failing open.
 ///
 /// A successful `SIZE` proves presence. Servers that do not support `SIZE`
@@ -571,12 +579,20 @@ pub enum RemotePresence {
 /// authoritative exact lookup proves either presence or absence; when neither
 /// operation succeeds we preserve both errors and make no transfer decision.
 pub fn probe_remote_file<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Result<RemotePresence> {
+    Ok(match probe_remote(remote, path)? {
+        ProbedRemote::Present { .. } => RemotePresence::Present,
+        ProbedRemote::Missing => RemotePresence::Missing,
+    })
+}
+
+/// [`probe_remote_file`], also returning the size `SIZE` reported.
+pub fn probe_remote<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Result<ProbedRemote> {
     match remote.file_size(path) {
-        Ok(_) => Ok(RemotePresence::Present),
+        Ok(size) => Ok(ProbedRemote::Present { size: Some(size) }),
         Err(size_error) => {
             match remote.exact_file_presence(path) {
-                Ok(ExactFilePresence::Present) => Ok(RemotePresence::Present),
-                Ok(ExactFilePresence::Missing) => Ok(RemotePresence::Missing),
+                Ok(ExactFilePresence::Present) => Ok(ProbedRemote::Present { size: None }),
+                Ok(ExactFilePresence::Missing) => Ok(ProbedRemote::Missing),
                 // Two independent commands both naming the path as nonexistent
                 // is authoritative absence. Anything weaker (a bare 550, which
                 // also means "permission denied") stays indeterminate.
@@ -584,7 +600,7 @@ pub fn probe_remote_file<R: Remote + ?Sized>(remote: &mut R, path: &str) -> Resu
                     if crate::ftp::is_no_such_file(&size_error)
                         && crate::ftp::is_no_such_file(&exact_error) =>
                 {
-                    Ok(RemotePresence::Missing)
+                    Ok(ProbedRemote::Missing)
                 }
                 Err(exact_error) => Err(size_error).with_context(|| {
                     format!(
@@ -939,5 +955,31 @@ mod tests {
         };
 
         assert!(probe_remote_file(&mut remote, "/t/x.c").is_err());
+    }
+
+    #[test]
+    fn probe_reports_the_size_it_read() {
+        let mut remote = ScriptedRemote {
+            size: Some(Ok(509)),
+            listing: None,
+            exact: None,
+        };
+        assert_eq!(
+            super::probe_remote(&mut remote, "/NEWS").unwrap(),
+            super::ProbedRemote::Present { size: Some(509) }
+        );
+    }
+
+    #[test]
+    fn probe_without_size_support_reports_presence_only() {
+        let mut remote = ScriptedRemote {
+            size: Some(Err(anyhow::anyhow!("SIZE unsupported"))),
+            listing: None,
+            exact: Some(Ok(ExactFilePresence::Present)),
+        };
+        assert_eq!(
+            super::probe_remote(&mut remote, "/NEWS").unwrap(),
+            super::ProbedRemote::Present { size: None }
+        );
     }
 }

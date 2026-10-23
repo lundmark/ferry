@@ -86,9 +86,10 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // cooldown window, skip the pull. Apply mode keeps config loading deferred
     // until we know we're going to act; dry-run loaded it above only to resolve
     // the configured local root for read-through state selection.
-    if let Ok(state) = StateFile::load_or_default(&state_path)
-        && let Some(record) = state.files.get(&rel)
-    {
+    // The state loaded here is handed on to the pull rather than parsed
+    // again: on a large mirror each load is ~10 ms of every hook call.
+    let state = StateFile::load_or_default(&state_path).ok();
+    if let Some(record) = state.as_ref().and_then(|state| state.files.get(&rel)) {
         let elapsed = Utc::now().signed_duration_since(record.last_synced);
         if elapsed.num_seconds() >= 0 && elapsed.num_seconds() < cooldown_secs {
             let tool = input.tool_name.as_deref().unwrap_or("<unknown>");
@@ -116,7 +117,18 @@ pub fn run(cooldown_secs: i64, mode: ExecutionMode) -> Result<()> {
     // subcommand already applies, so a diverged file is reported instead of
     // clobbered. Recovering staleness costs an explicit `ferry pull`;
     // recovering a clobbered edit may cost the edit.
-    match crate::commands::pull::pull_one(&config_path, &rel, /* force = */ false, mode) {
+    let pulled = match state {
+        Some(state) => crate::commands::pull::pull_one_with_state(
+            &config_path,
+            &rel,
+            /* force = */ false,
+            mode,
+            state,
+        ),
+        // Unreadable here: let the pull load it and report why.
+        None => crate::commands::pull::pull_one(&config_path, &rel, /* force = */ false, mode),
+    };
+    match pulled {
         Ok(outcome) if outcome.status == TransferStatus::Transferred => {
             if mode.is_dry_run() {
                 eprintln!("ferry hook: would pull {}", outcome.path);
