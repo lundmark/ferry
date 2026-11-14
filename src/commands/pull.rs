@@ -32,13 +32,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMode) -> Result<()> {
+pub fn run(
+    config_path: &Path,
+    paths: &[String],
+    force: bool,
+    prune: bool,
+    mode: ExecutionMode,
+) -> Result<()> {
     let cfg = Config::load(config_path)?;
     let local_root = cfg.paths.local_root.clone();
     let paths: Vec<String> = paths
         .iter()
         .map(|path| safe_arg(&local_root, path))
         .collect::<Result<_>>()?;
+    if prune {
+        crate::commands::prune::check_args(&paths, &local_root, false)?;
+    }
     let state_path = state_path_for(&local_root, mode);
     let mut state = StateFile::load_or_default(&state_path)?;
 
@@ -160,8 +169,20 @@ pub fn run(config_path: &Path, paths: &[String], force: bool, mode: ExecutionMod
                 // Nothing to write. Local matches remote.
             }
             FileState::LocalOnly => {
-                // Pull is one-way: we don't delete local files because the
-                // remote is missing them. Skip.
+                // Pull is one-way: it never deletes a local file just because
+                // the remote lacks it -- unless --prune asked, and then only an
+                // untouched copy the remote provably no longer has.
+                if prune && let Some(h) = local_hash.as_deref() {
+                    crate::commands::prune::prune_local(
+                        &mut ftp,
+                        &mut state,
+                        &local_root,
+                        &cfg.paths.remote_root,
+                        rel,
+                        h,
+                        mode,
+                    )?;
+                }
             }
             FileState::RemoteOnly | FileState::RemoteChanged => {
                 // We need the actual remote bytes to write locally. If the
